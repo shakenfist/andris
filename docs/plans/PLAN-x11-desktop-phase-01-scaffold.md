@@ -309,7 +309,9 @@ Then:
   the comment wording.
 - `ci.yml` has these jobs:
   - `check_paths` (static runner, dorny/paths-filter). Code changed
-    unless every file matches `docs/**`, `**/*.md` or `LICENSE`.
+    unless every file matches `docs/**` or `LICENSE`. (This brief
+    first excluded `**/*.md` too; that was dropped so skillsaw
+    still gates changes to `AGENTS.md` and the root documents.)
     Mirror ryll's filter and comments; andris has no `REVIEWS.md` or
     `.vscode` review files.
   - **Smoke tier** (`pull_request`, `workflow_dispatch`; skipped on
@@ -389,7 +391,8 @@ describe what exists, with no phase numbers outside `docs/plans/`.
 - `ARCHITECTURE.md`: the "repository today" table gains the
   workspace and the `andris` crate, and its prose stops saying there
   is no build CI. The intended-shape section is unchanged.
-- Do not change `README.md`.
+- `README.md` changes only its Status section and documentation
+  links; see decision 11.
 - Run `pre-commit run --all-files` and the audit.
 
 Commit subject: `Document building, testing and CI.`
@@ -471,6 +474,19 @@ Found in neighbours, out of scope here:
 - Development's ci-review-automation check matches the literal
   `review-pr-with-claude@main` string. Its specification says that
   calling the reusable `pr-auto-review.yml` satisfies it.
+
+The automated reviewer on pull request #1 raised nine items. Fixed:
+the phase number in a `deny.toml` comment (1), briefs 5 and 7
+contradicting what was built (4, 5), the merge-tier example in
+`docs/development.md` naming advisories that the merge tier never
+checks (6), and redundant assertions in the CLI test (7). Declined:
+
+- CodeQL on the static runner (2): `Analyze` succeeded and detected
+  Rust, so decision 9's pin is not needed.
+- The reviewer running on `workflow_dispatch` retests (3): the
+  shared `pr-auto-review.yml` already runs only on `pull_request`.
+- Lint and build-test compiling twice (9): decision 4 accepts this,
+  and the cost should be looked at again when dependencies arrive.
 
 ## Risks and mitigations
 

@@ -207,8 +207,9 @@ pass. The sequence is:
    ejected and the failure is in the `merge_group` run's log.
 
 A failure on the merge tier is not necessarily the pull request's
-fault: a flaky runner or an advisory published since the smoke tier
-ran can cause one. Re-enqueue before assuming otherwise.
+fault: a flaky runner can cause one, so re-enqueue before assuming
+otherwise. A semantic conflict with something merged to `develop`
+since the smoke tier ran fails it too, and needs a rebase.
 
 ## Retesting and re-reviewing a pull request
 

@@ -64,5 +64,5 @@ unknown-git = "deny"
 # branch or tag that can move under the lockfile's feet.
 required-git-spec = "rev"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# Phase 3 may pin ryll by git revision.
+# ryll's shared crates may be pinned by git revision.
 allow-git = ["https://github.com/shakenfist/ryll"]

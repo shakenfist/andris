@@ -43,11 +43,14 @@ confidence-threshold = 0.93
 
 [bans]
 multiple-versions = "warn"
-# Intra-workspace path dependencies without a version register as
-# wildcard deps. Allow them explicitly; real wildcard deps on external
-# crates would still be flagged because they would appear in the
-# lockfile as such.
-wildcards = "allow"
+# Deny wildcard version requirements (`version = "*"`), which accept
+# whatever a registry serves next. The workspace has no path
+# dependencies yet. A path dependency without a version also counts as
+# a wildcard, so when the first one arrives, set
+# `allow-wildcard-paths = true` here and mark the workspace crates
+# `publish = false`: cargo-deny then allows wildcard path dependencies
+# between private crates while still denying registry wildcards.
+wildcards = "deny"
 highlight = "all"
 allow = []
 deny = []
@@ -57,6 +60,9 @@ skip-tree = []
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+# Git sources must be pinned to a revision (`rev = "<sha>"`), not a
+# branch or tag that can move under the lockfile's feet.
+required-git-spec = "rev"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # Phase 3 may pin ryll by git revision.
 allow-git = ["https://github.com/shakenfist/ryll"]

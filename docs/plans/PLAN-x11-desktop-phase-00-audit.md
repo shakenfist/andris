@@ -45,11 +45,11 @@ tooling (`.vscode/review-scope.toml`, `REVIEWS.md`,
 
 | Step | Effort | Model | Isolation | Status | Brief for sub-agent |
 |------|--------|-------|-----------|--------|---------------------|
-| 1 | high | opus | none | Not started | Agent and human documentation. See brief 1. |
-| 2 | medium | sonnet | none | Not started | Repository tooling. See brief 2. |
-| 3 | medium | opus | none | Not started | Re-run the audit and close what it newly reports. See brief 3. |
-| 4 | low | sonnet | none | Not started | Add andris to development's audit scope. See brief 4. |
-| 5 | low | management | none | Not started | Push, apply the branch ruleset, close out. See brief 5. |
+| 1 | high | opus | none | Complete | Agent and human documentation. See brief 1. |
+| 2 | medium | sonnet | none | Complete | Repository tooling. See brief 2. |
+| 3 | medium | opus | none | Complete | Re-run the audit and close what it newly reports. See brief 3. |
+| 4 | low | sonnet | none | Complete | Add andris to development's audit scope. See brief 4. |
+| 5 | low | management | none | Complete | Push, apply the branch ruleset, close out. See brief 5. |
 
 Steps 1 to 3 land directly on andris `develop`, one commit per
 step: there is no CI and no ruleset yet, so a pull request would
@@ -170,4 +170,30 @@ Commit nothing.
 
 ## Result
 
-Not yet run.
+Phase 0 landed directly on andris `develop` as `60c0c4d..e89539f`
+(the master plan, this plan, the documentation, and the tooling), and
+on development `main` as `066d639` (andris in the audit matrix and
+in-scope list). The `Develop branch` ruleset was applied afterwards,
+so later phases land by pull request.
+
+The final local audit run gave 30 pass, 2 fail, 28 not applicable
+and 0 errors. The two failures are the ones the Situation table
+assigns to phase 1:
+
+- github-security: no CodeQL workflow;
+- ci-review-automation: no re-review or retest workflows, and no
+  reviewer job.
+
+Departures from the briefs:
+
+- Step 2 also added `.github/workflows/ci.yml`, a lint-only job
+  running every pre-commit hook, and `.github/workflows/secret-scan.yml`
+  (gitleaks, copied from development's). Two checks needed them:
+  llm-context-lint-ci needs skillsaw in CI, and secret-scanning-ci
+  needs gitleaks in CI. Phase 1 replaces the lint-only `ci.yml` with
+  the two-stage workflow.
+- Secret scanning, push protection and Dependabot security updates
+  were enabled on the repository to match ryll. The github-security
+  audit asks for all three.
+- The first `Secret scan` run on `develop` succeeded, which confirms
+  the org's self-hosted runners serve andris.

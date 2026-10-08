@@ -8,6 +8,7 @@
 self-hosted-runner:
   labels:
     - static
+    - claude-code
     - vm
     - debian-13
     - debian-13-docker

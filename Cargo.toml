@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["andris"]
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+authors = ["Michael Still <mikal@stillhq.com>"]
+repository = "https://github.com/shakenfist/andris"
+
+# Debug builds keep line tables but drop full DWARF variable info. The default
+# `debug = true` links complete debuginfo into every artifact, which makes
+# debug binaries and target/ directories very large. Line tables still give
+# file:line in panics, `RUST_BACKTRACE=1` and tracing spans. If you need to
+# inspect variables in gdb or lldb, build that session with
+# `RUSTFLAGS="-C debuginfo=2"` rather than committing a change here.
+# `profile.test` inherits this.
+[profile.dev]
+debug = "line-tables-only"

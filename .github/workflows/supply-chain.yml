@@ -21,14 +21,8 @@ on:
     - cron: '0 9 * * 1'
   workflow_dispatch:
 
-# rustsec/audit-check creates a check run to report findings, which
-# needs `checks: write`; on scheduled runs it files issues instead,
-# hence `issues: write`.
 permissions:
   contents: read
-  checks: write
-  issues: write
-  pull-requests: write
 
 jobs:
   # cargo-audit needs cargo on PATH. The static runner is minimal
@@ -38,6 +32,15 @@ jobs:
     name: cargo audit
     runs-on: [self-hosted, vm, debian-13, s]
     timeout-minutes: 15
+    # rustsec/audit-check creates a check run to report findings, which
+    # needs `checks: write`; on scheduled runs it files issues instead,
+    # hence `issues: write`. Job-level permissions replace the
+    # workflow-level block rather than extending it, so this restates
+    # the `contents: read` the checkout needs.
+    permissions:
+      contents: read
+      checks: write
+      issues: write
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}-cargo-audit
       cancel-in-progress: true

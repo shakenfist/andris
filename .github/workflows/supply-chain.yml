@@ -37,6 +37,7 @@ jobs:
   cargo-audit:
     name: cargo audit
     runs-on: [self-hosted, vm, debian-13, s]
+    timeout-minutes: 15
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}-cargo-audit
       cancel-in-progress: true
@@ -54,6 +55,7 @@ jobs:
   cargo-deny:
     name: cargo deny
     runs-on: [self-hosted, vm, debian-13-docker, s]
+    timeout-minutes: 15
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}-cargo-deny
       cancel-in-progress: true

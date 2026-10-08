@@ -9,14 +9,15 @@ name: CI
 # `gh workflow run ci.yml` is a full retest of a pull request.
 #
 # Changes that cannot affect the build or the lint -- documentation
-# under docs/, and the licence -- are skipped by the check_paths job
-# below. Markdown elsewhere is not skipped: AGENTS.md and the other
-# root documents are agent context, which the lint job's skillsaw hook
-# checks. The gates still pass: their jq treats a skipped dependency
-# as success. This is deliberately job-level filtering, not trigger-
-# level `paths-ignore:`: the gates are required status checks, and a
-# required check in a workflow that never started never reports, which
-# blocks the merge forever.
+# under docs/, and the licence -- are skipped on a pull request by the
+# check_paths job below; the merge tier always runs. Markdown elsewhere
+# is not skipped: AGENTS.md and the other root documents are agent
+# context, which the lint job's skillsaw hook checks. The gates still
+# pass: their jq treats a skipped dependency as success. This is
+# deliberately job-level filtering, not trigger-level `paths-ignore:`:
+# the gates are required status checks, and a required check in a
+# workflow that never started never reports, which blocks the merge
+# forever.
 #
 # The secret scanner is not here. It lives in secret-scan.yml, which
 # also runs on pushes to develop, and it deliberately does not consume
@@ -33,20 +34,30 @@ permissions:
 
 jobs:
   # Detect documentation-only changes so the tier jobs can skip them.
-  # For workflow_dispatch the filter step is skipped and the output
-  # defaults to code_changed=true so everything runs.
+  # The filter step runs only on pull_request. For every other event it
+  # is skipped and the output defaults to code_changed=true, so
+  # everything runs: workflow_dispatch has no pull request to diff, and
+  # the merge tier rebuilds whatever the queue hands it.
   check_paths:
     name: "Check paths"
     runs-on: [self-hosted, static]
     timeout-minutes: 10
+    # paths-filter reads the changed-file list from pulls.listFiles
+    # rather than from the working tree, and the top-level permissions
+    # block sets every scope it does not name to none.
+    permissions:
+      pull-requests: read
     outputs:
       code_changed: ${{ steps.filter.outputs.code || 'true' }}
     steps:
-      - uses: actions/checkout@v7
-        if: github.event_name != 'workflow_dispatch'
+      # There is deliberately no checkout step. On a pull_request event
+      # paths-filter asks the API for the changed files and never looks
+      # at the working tree, so a fork's content never reaches the
+      # static runner -- which is why this job, unlike the smoke jobs
+      # below, carries no fork guard.
       - uses: dorny/paths-filter@v4
         id: filter
-        if: github.event_name != 'workflow_dispatch'
+        if: github.event_name == 'pull_request'
         with:
           # By default a file matches the filter if it matches ANY listed
           # pattern, which makes '**' match everything and silently
@@ -68,6 +79,19 @@ jobs:
   # the run it supersedes. The merge-group-cancellation audit leaves
   # jobs whose `if:` excludes merge_group out of scope for exactly this
   # reason.
+  #
+  # None of them runs for a pull request from a fork either. Each checks
+  # out the pull request's own code and executes it -- its build scripts
+  # and tests, and the hooks its .pre-commit-config.yaml names -- on a
+  # self-hosted vm runner holding the key that reaches every node in the
+  # CI mesh, and opening a fork pull request needs no permission at all.
+  # GitHub's approval prompt is no substitute: on a public repository it
+  # covers only first-time contributors. A skipped job satisfies "Can
+  # enqueue", so the guard wedges nothing, but a fork pull request
+  # arrives untested: push its branch to this repository to test it.
+  # The guard keeps out outsiders, not someone with write access, who
+  # can edit it on their own branch; branch protection covers that.
+  # This mirrors shakenfist/actions' docs/ci.md and pr-auto-review.yml.
 
   # Every pre-commit hook, so CI and a developer's commit run the same
   # checks and cannot drift apart. That includes the rust-check hook,
@@ -87,6 +111,8 @@ jobs:
     if: >-
       github.event_name != 'merge_group'
       && needs.check_paths.outputs.code_changed != 'false'
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}-lint
       cancel-in-progress: true
@@ -120,6 +146,8 @@ jobs:
     if: >-
       github.event_name != 'merge_group'
       && needs.check_paths.outputs.code_changed != 'false'
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}-build-test
       cancel-in-progress: true
@@ -163,6 +191,8 @@ jobs:
     if: >-
       github.event_name != 'merge_group'
       && needs.check_paths.outputs.code_changed != 'false'
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}-cargo-audit
       cancel-in-progress: true
@@ -186,6 +216,8 @@ jobs:
     if: >-
       github.event_name != 'merge_group'
       && needs.check_paths.outputs.code_changed != 'false'
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}-cargo-deny
       cancel-in-progress: true
@@ -201,6 +233,12 @@ jobs:
   # merge". It rebuilds and retests the merge-group commit, which is
   # what would actually land, rather than the pull request head the
   # smoke tier tested.
+  #
+  # It cannot carry the smoke tier's fork guard: a merge_group event has
+  # no pull_request head to compare, so enqueueing a fork pull request
+  # runs that fork's code here, on the same runners. The guard upstream
+  # only means the smoke tier never ran it. Maintainers must therefore
+  # enqueue a fork pull request only after reviewing its code.
   #
   # Its concurrency group is the one place in this file where the key
   # matters on merge_group. There github.ref is the per-attempt queue

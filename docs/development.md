@@ -142,6 +142,13 @@ An `Automated reviewer` job runs after these four through the shared
 workflow in shakenfist/actions and posts a review on the pull
 request. It does not gate anything.
 
+None of the four runs for a pull request from a fork, since each
+would execute the fork's code on runners that hold the CI mesh key:
+they are skipped, which `Can enqueue` accepts, so push a fork's
+branch to this repository to test it. The merge tier cannot be
+guarded this way, so only enqueue a fork pull request after
+reviewing its code.
+
 ### The merge tier
 
 Runs only on `merge_group` and gates `Can merge`. The single job,

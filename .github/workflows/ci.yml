@@ -1,39 +1,332 @@
 name: CI
 
-# Runs every pre-commit hook, so skillsaw and the secret scanner gate
-# pull requests even for a clone that never ran `pre-commit install`.
-# Phase 1 adds the build and test jobs.
+# CI runs in two tiers. The smoke tier (lint, build and test, and the
+# supply-chain scanners) runs on pull_request and gates the "Can
+# enqueue" status check. The merge tier rebuilds and retests the
+# merge-group commit -- what would actually land, rather than the pull
+# request head the smoke tier tested -- and gates "Can merge".
+# workflow_dispatch runs the smoke tier, so pr-retest.yml's
+# `gh workflow run ci.yml` is a full retest of a pull request.
+#
+# Changes that cannot affect the build or the lint -- documentation
+# under docs/, and the licence -- are skipped by the check_paths job
+# below. Markdown elsewhere is not skipped: AGENTS.md and the other
+# root documents are agent context, which the lint job's skillsaw hook
+# checks. The gates still pass: their jq treats a skipped dependency
+# as success. This is deliberately job-level filtering, not trigger-
+# level `paths-ignore:`: the gates are required status checks, and a
+# required check in a workflow that never started never reports, which
+# blocks the merge forever.
+#
+# The secret scanner is not here. It lives in secret-scan.yml, which
+# also runs on pushes to develop, and it deliberately does not consume
+# check_paths: a credential lands in documentation as easily as in
+# code.
 on:
   pull_request:
     branches: [develop]
+  merge_group:
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
+  # Detect documentation-only changes so the tier jobs can skip them.
+  # For workflow_dispatch the filter step is skipped and the output
+  # defaults to code_changed=true so everything runs.
+  check_paths:
+    name: "Check paths"
+    runs-on: [self-hosted, static]
+    timeout-minutes: 10
+    outputs:
+      code_changed: ${{ steps.filter.outputs.code || 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+        if: github.event_name != 'workflow_dispatch'
+      - uses: dorny/paths-filter@v4
+        id: filter
+        if: github.event_name != 'workflow_dispatch'
+        with:
+          # By default a file matches the filter if it matches ANY listed
+          # pattern, which makes '**' match everything and silently
+          # defeats the '!docs/**' style exclusions. 'every' requires a
+          # file to match ALL patterns, which is the correct semantics for
+          # an "everything except documentation" filter.
+          predicate-quantifier: 'every'
+          filters: |
+            code:
+              - '**'
+              - '!docs/**'
+              - '!LICENSE'
+
+  # Smoke tier: everything below here, up to the merge tier, runs on
+  # pull_request (and on workflow_dispatch) and gates "Can enqueue".
+  #
+  # None of these jobs runs on merge_group, so github.ref in their
+  # concurrency groups is the pull request's ref and a new push cancels
+  # the run it supersedes. The merge-group-cancellation audit leaves
+  # jobs whose `if:` excludes merge_group out of scope for exactly this
+  # reason.
+
+  # Every pre-commit hook, so CI and a developer's commit run the same
+  # checks and cannot drift apart. That includes the rust-check hook,
+  # which runs `make lint` in the devcontainer image -- hence a docker
+  # runner rather than a static one -- and skillsaw over the agent
+  # context.
+  #
+  # The l pool is the scarcest resource on the fleet, so the jobs that
+  # hold one carry the concurrency block anything a pull request can
+  # trigger needs: without it a superseded run holds an l slot while
+  # its replacement queues behind it.
   lint:
     name: Lint
-    runs-on: [self-hosted, static]
-    timeout-minutes: 15
+    runs-on: [self-hosted, vm, debian-13-docker, l]
+    timeout-minutes: 45
+    needs: [check_paths]
+    if: >-
+      github.event_name != 'merge_group'
+      && needs.check_paths.outputs.code_changed != 'false'
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}-lint
       cancel-in-progress: true
     steps:
       - uses: actions/checkout@v7
 
-      # A venv because the runners enforce PEP 668.
+      # Must stay directly after checkout; see the action for why.
+      - uses: ./.github/actions/cargo-cache
+
+      # Into a venv, not the system python: the runners enforce PEP
+      # 668, so a bare `pip install` is refused with "error:
+      # externally-managed-environment". pre-commit then builds each
+      # hook its own environment from the pinned rev.
       - name: Install pre-commit
         run: |
-          python3 -m venv /tmp/venv-lint
-          /tmp/venv-lint/bin/pip install --quiet --disable-pip-version-check \
-              pre-commit
+          python3 -m venv "${RUNNER_TEMP}/venv-lint"
+          "${RUNNER_TEMP}/venv-lint/bin/pip" install --quiet \
+              --disable-pip-version-check pre-commit
+          echo "${RUNNER_TEMP}/venv-lint/bin" >> "${GITHUB_PATH}"
 
       - name: Run pre-commit hooks
-        run: |
-          /tmp/venv-lint/bin/pre-commit run --all-files \
-              --show-diff-on-failure
+        run: pre-commit run --all-files --show-diff-on-failure
 
-      - name: Clean up
-        if: always()
-        run: rm -rf /tmp/venv-lint
+  # Builds and tests the pull request head inside the devcontainer, via
+  # the Makefile, offline once `make fetch` has populated the cache.
+  build-test:
+    name: Build and test
+    runs-on: [self-hosted, vm, debian-13-docker, l]
+    timeout-minutes: 45
+    needs: [check_paths]
+    if: >-
+      github.event_name != 'merge_group'
+      && needs.check_paths.outputs.code_changed != 'false'
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-build-test
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v7
+
+      # Must stay directly after checkout; see the action for why.
+      - uses: ./.github/actions/cargo-cache
+
+      - name: Build and run the tests
+        run: make build test
+
+  # The two scanner jobs below are the pull-request half of the
+  # supply-chain checks (see deny.toml for the cargo-deny policy).
+  # supply-chain.yml runs the same two on a weekly cron to catch
+  # advisory drift against develop between pull requests. Both run on
+  # self-hosted VM runners (the `vm` label excludes bare-metal runners,
+  # which have different operating systems and no passwordless sudo) at
+  # size `s` -- these scanners are I/O-bound and gain nothing from a
+  # larger runner.
+
+  # cargo-audit needs cargo on PATH. The static runner is minimal (git
+  # only), so this runs on debian-13 and installs the stable toolchain
+  # into $HOME via dtolnay/rust-toolchain, which needs no sudo.
+  #
+  # rustsec/audit-check reports its findings by creating a check run,
+  # which needs `checks: write`. The workflow-level permissions above do
+  # not grant it, and job-level permissions replace rather than extend
+  # them, so this job restates the `contents: read` it needs for the
+  # checkout. Without this the action fails with "Resource not
+  # accessible by integration" -- but only on runs where it has
+  # something to report, so a clean audit hides the problem.
+  cargo-audit:
+    name: cargo audit
+    runs-on: [self-hosted, vm, debian-13, s]
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      checks: write
+    needs: [check_paths]
+    if: >-
+      github.event_name != 'merge_group'
+      && needs.check_paths.outputs.code_changed != 'false'
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-cargo-audit
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # cargo-deny-action runs cargo-deny inside a Docker container, so this
+  # job needs the debian-13-docker image, which ships with docker.io
+  # preinstalled.
+  cargo-deny:
+    name: cargo deny
+    runs-on: [self-hosted, vm, debian-13-docker, s]
+    timeout-minutes: 15
+    needs: [check_paths]
+    if: >-
+      github.event_name != 'merge_group'
+      && needs.check_paths.outputs.code_changed != 'false'
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-cargo-deny
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+
+  # Merge tier: the job below runs on merge_group only and gates "Can
+  # merge". It rebuilds and retests the merge-group commit, which is
+  # what would actually land, rather than the pull request head the
+  # smoke tier tested.
+  #
+  # Its concurrency group is the one place in this file where the key
+  # matters on merge_group. There github.ref is the per-attempt queue
+  # branch, gh-readonly-queue/develop/pr-<N>-<SHA>, and GitHub mints a
+  # fresh SHA every time it rebuilds the group -- which it does on
+  # every push to develop -- so a ref-keyed group is unique per rebuild,
+  # cancel-in-progress never matches, and a superseded merge group runs
+  # to completion on an l runner nobody is waiting on. github.sha is no
+  # better: on merge_group it is the per-attempt merge commit. So on
+  # merge_group the key is the base branch, which every rebuild of every
+  # entry shares. That is safe because the queue builds one entry at a
+  # time (max_entries_to_build: 1), so any other in-flight merge_group
+  # run is by definition superseded. The 'merge_group-' prefix keeps the
+  # key distinct from a workflow_dispatch run on develop, whose
+  # github.ref is refs/heads/develop. This is the fleet pattern from
+  # shakenfist/development's docs/audits/merge-group-cancellation.md.
+  merge-build:
+    name: Build and test the merge commit
+    runs-on: [self-hosted, vm, debian-13-docker, l]
+    timeout-minutes: 45
+    needs: [check_paths]
+    if: >-
+      github.event_name == 'merge_group'
+      && needs.check_paths.outputs.code_changed != 'false'
+    concurrency:
+      group: >-
+        ${{ github.workflow }}-merge-build-${{
+        github.event_name == 'merge_group'
+        && format('merge_group-{0}', github.event.merge_group.base_ref)
+        || github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v7
+
+      # Must stay directly after checkout; see the action for why.
+      - uses: ./.github/actions/cargo-cache
+
+      - name: Build a release and run the tests
+        run: make release test
+
+  automated_reviewer:
+    name: "Automated reviewer"
+    # The needs: list is the "review only once CI has passed" gate: a
+    # job skipped because a dependency failed never starts the reusable
+    # workflow. It lists the smoke tier only -- the merge tier never runs
+    # on a pull_request, so depending on it would leave the reviewer
+    # permanently skipped. Everything else about the reviewer -- runner,
+    # timeout, fork restriction, bot-commit check -- lives in the shared
+    # workflow so it stays in step with the rest of the fleet.
+    #
+    # No "secrets: inherit": the shared workflow reads no secrets and
+    # authenticates with github.token under the permissions: block
+    # below, so inheriting would only hand every secret this repository
+    # holds to a workflow in another repository.
+    needs:
+      - lint
+      - build-test
+      - cargo-audit
+      - cargo-deny
+    # A cross-repository reusable workflow cannot grant itself more
+    # token scope than its caller has, so the permissions go here.
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    uses: shakenfist/actions/.github/workflows/pr-auto-review.yml@main
+
+  # The gates. "Can enqueue" and "Can merge" are the status checks the
+  # branch ruleset requires; "Can see status" proves the ruleset can see
+  # this workflow's checks at all. Each gate uses always() so it still
+  # runs when a dependency failed or was skipped, and its jq maps every
+  # dependency to "success or skipped" and requires all of them. That is
+  # what lets a documentation-only change (where check_paths skips the
+  # whole tier) pass; a cancelled or failed dependency fails the gate.
+  # The ruleset requires these checks by name, so do not rename them.
+  # They are ryll's gates, with the shell variables quoted so that
+  # actionlint's shellcheck pass is clean.
+
+  can_see_status:
+    name: "Can see status"
+    runs-on: [self-hosted, static]
+    # Runs "true", so five minutes is generous even on a busy runner.
+    timeout-minutes: 5
+    steps:
+      - name: "Immediate success"
+        run: true
+
+  can_enqueue:
+    name: "Can enqueue"
+    needs:
+      - check_paths
+      - lint
+      - build-test
+      - cargo-audit
+      - cargo-deny
+    if: always() && github.event_name != 'merge_group'
+    permissions:
+      actions: read
+    runs-on: [self-hosted, static]
+    # A jq expression over the needs context.
+    timeout-minutes: 5
+    steps:
+      - env:
+          NEEDS_JSON: "${{toJSON(needs)}}"
+        name: Transform outcomes
+        run: |
+          echo "ALL_SUCCESS=$(echo "$NEEDS_JSON" | jq '. | to_entries | map([.value.result == "success", .value.result == "skipped"] | any) | all')" >>"$GITHUB_ENV"
+      - name: Check outcomes
+        run: '[ "$ALL_SUCCESS" == true ]'
+
+  can_merge:
+    name: "Can merge"
+    needs:
+      - check_paths
+      - merge-build
+    if: always() && github.event_name == 'merge_group'
+    permissions:
+      actions: read
+    runs-on: [self-hosted, static]
+    # A jq expression over the needs context.
+    timeout-minutes: 5
+    steps:
+      - env:
+          NEEDS_JSON: "${{toJSON(needs)}}"
+        name: Transform outcomes
+        run: |
+          echo "ALL_SUCCESS=$(echo "$NEEDS_JSON" | jq '. | to_entries | map([.value.result == "success", .value.result == "skipped"] | any) | all')" >>"$GITHUB_ENV"
+      - name: Check outcomes
+        run: '[ "$ALL_SUCCESS" == true ]'

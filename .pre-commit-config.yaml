@@ -9,6 +9,14 @@ repos:
         pass_filenames: false
         files: \.rs$|Cargo\.(toml|lock)$
 
+  # GitHub Actions workflow linter. The config declares the self-hosted
+  # runner labels the workflows use.
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.12
+    hooks:
+      - id: actionlint
+        args: ['-config-file', '.github/actionlint.yaml']
+
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:

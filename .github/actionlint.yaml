@@ -1,0 +1,15 @@
+# Configuration for actionlint
+# https://github.com/rhysd/actionlint/blob/main/docs/config.md
+#
+# The self-hosted runner labels this repository's workflows use. Only
+# labels in use are declared, so a label that does not exist on the
+# fleet -- a typo, or a retired image such as debian-12 -- fails here
+# rather than leaving a job queued for a runner that never comes.
+self-hosted-runner:
+  labels:
+    - static
+    - vm
+    - debian-13
+    - debian-13-docker
+    - s
+    - l

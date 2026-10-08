@@ -165,7 +165,7 @@ written with `/next-phase` as each phase comes up.
 | Phase | Plan | Status | Merged |
 |-------|------|--------|--------|
 | 0. Join the consistency audit | PLAN-x11-desktop-phase-00-audit.md | Complete | andris `60c0c4d..e89539f`; development `066d639` |
-| 1. Build and CI scaffold | Not yet written | Not started | |
+| 1. Build and CI scaffold | PLAN-x11-desktop-phase-01-scaffold.md | In progress | |
 | 2. Server-role wire types (ryll) | Not yet written | Not started | |
 | 3. Image encoders (ryll) | Not yet written | Not started | |
 | 4. Server skeleton | Not yet written | Not started | |
@@ -210,12 +210,23 @@ checks come from CI. Phase 1 closes those.
 
 ### Phase 1: Build and CI scaffold
 
-Lay down a Cargo workspace and a `Makefile` that runs cargo inside
-a Docker devcontainer, mirroring ryll's. Add pre-commit with
-rustfmt, clippy `-D warnings` and shellcheck, plus `deny.toml` and
-two-stage CI on ryll's model. Use the remaining phase 0 audit
-failures as the checklist; the phase is done when the local audit
-run is clean apart from the human-review exemption.
+Detail is in
+[PLAN-x11-desktop-phase-01-scaffold.md](PLAN-x11-desktop-phase-01-scaffold.md).
+In outline:
+
+- a Cargo workspace with one zero-dependency stub binary and the
+  fleet's unwrap lint;
+- a `Makefile` that runs cargo offline inside a Docker devcontainer,
+  mirroring ryll's;
+- the Rust pre-commit hook, joining the hooks phase 0 added;
+- `deny.toml` and a weekly supply-chain workflow;
+- two-stage CI with gates and the automated reviewer;
+- the work phase 0 deferred: CodeQL, the re-review and retest
+  workflows, and the merge queue with its required checks.
+
+The phase is done when the local audit run reports no failures. The
+human-review checks report not applicable rather than failing, so
+nothing is exempted.
 
 ### Phase 2: Server-role wire types (ryll)
 

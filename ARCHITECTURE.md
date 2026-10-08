@@ -7,22 +7,26 @@ to grow into. The documentation index is
 
 ## The repository today
 
-Andris holds a design and no code. There is no Cargo workspace, no
-binary, no `Makefile` and no build CI (only lint and secret-scan
-workflows), so there are no components and no data flow to describe
-yet. What exists is:
+Andris holds a design, a stub binary and the build and CI scaffold
+around it. The binary prints its name and version and does nothing
+else, so there are no components and no data flow to describe yet.
+How to build, test and land a change is in
+[`docs/development.md`](docs/development.md). What exists is:
 
 | Path | What it is |
 |------|------------|
 | `docs/plans/PLAN-x11-desktop.md` | The master plan: why andris exists, its design commitments, open questions and the order of work |
 | `docs/plans/` (other files) | Phase plans for that master plan, and `index.md`, which lists every plan with its status |
+| `Cargo.toml`, `andris/` | The Cargo workspace and its one crate, `andris`, a stub binary |
+| `Makefile`, `.devcontainer/` | Build, test and lint targets that run cargo in a container |
 | `docs/index.md` | The documentation index |
+| `docs/development.md` | Building, testing, CI and the merge queue |
 | `README.md` | The pitch and current status |
 | `AGENTS.md` | Conventions for AI coding assistants |
 | `PLAN-TEMPLATE.md`, `PUSH-AUDIT.md` | The planning template and the pre-push audit runbook |
-| `.pre-commit-config.yaml`, `renovate.json`, `.github/workflows/` | Repository tooling: commit-time linters, the CI and secret-scan workflows, dependency updates, and the repository-configuration-export workflow |
+| `.pre-commit-config.yaml`, `deny.toml`, `renovate.json`, `.github/workflows/` | Repository tooling: commit-time linters, dependency policy, the two-tier CI and supply-chain workflows, dependency updates, and the repository-configuration-export workflow |
 
-When code lands, a component inventory replaces this table.
+When the server lands, a component inventory replaces this table.
 
 ## Relationship to ryll and kerbside
 

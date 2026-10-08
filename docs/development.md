@@ -41,12 +41,32 @@ depend on it.
 
 `build`, `release`, `test`, `lint` and `lint-fix` first run
 `make fetch`. `fetch` and `lock` are the only targets allowed
-network access, and neither compiles anything. The compiling targets
-then run with
-`--network none` and the cargo cache mounted read-only, with
-`--frozen`. A dependency's `build.rs` runs arbitrary code at compile
-time, so this stops a compromised crate from reaching the network
-or poisoning the cache for later runs.
+network access, and neither compiles anything. A dependency's
+`build.rs` runs arbitrary code at compile time, so the compiling
+targets pass `--frozen` and run inside a sandbox:
+
+- `--network none`, so a compromised crate cannot reach the network
+  to fetch a payload or send anything out.
+- The cargo cache mounted read-only, so a build script cannot poison
+  the downloaded crates for later runs.
+- For `build`, `release`, `test` and `lint`, the checkout mounted
+  read-only with only `target/` writable. The default cargo cache
+  lives inside the checkout, so a writable checkout would let a
+  build script rewrite `.cargo-cache` (which CI's cache action then
+  saves for every later run) or plant a `core.fsmonitor` or
+  `core.hooksPath` setting in `.git/config`, which would run on the
+  host the next time anything there runs git. Sources, `Cargo.lock`,
+  `.git` and the cache are all out of reach; `target/` is not, so its
+  contents are only as trustworthy as the code compiled into them.
+  The Makefile refuses to run if `target` is a symlink, since
+  mounting one writable would undo the read-only checkout.
+
+`lint-fix` is the exception to the last point. rustfmt and
+`clippy --fix` rewrite sources, so it mounts the checkout writable,
+and clippy compiles the dependency tree to do its work: build
+scripts run with `.git` and an in-checkout cache writable. It is
+still offline with a read-only cache mount, but run it only on code
+you trust. CI never runs it.
 
 The consequence is that `Cargo.lock` is never written by a build.
 After adding or bumping a dependency, run `make lock`, which is the

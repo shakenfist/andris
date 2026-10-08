@@ -4,6 +4,15 @@ This page summarises every planning document in chronological order. Master
 plans decompose work into numbered phases, each with its own detailed plan
 file.
 
+New plans should follow the structure in `PLAN-TEMPLATE.md` at the repo
+root. For pre-push audits of our own work, including the push-audit phase
+that ends every master plan, see `PUSH-AUDIT.md`.
+
+The `Status` column below holds exactly one term from the vocabulary in
+`PLAN-TEMPLATE.md`: `Proposed`, `Not started`, `In progress`, `Blocked`,
+`Complete`, `Abandoned` or `Superseded`. Detail about a plan's state
+belongs in the plan itself rather than in this table.
+
 ## Master plans
 
 | Date | Plan | Intent | Status | Phases |

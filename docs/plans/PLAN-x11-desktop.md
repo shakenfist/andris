@@ -164,7 +164,7 @@ written with `/next-phase` as each phase comes up.
 
 | Phase | Plan | Status | Merged |
 |-------|------|--------|--------|
-| 0. Join the consistency audit | Not yet written | Not started | |
+| 0. Join the consistency audit | PLAN-x11-desktop-phase-00-audit.md | In progress | |
 | 1. Build and CI scaffold | Not yet written | Not started | |
 | 2. Server-role wire types (ryll) | Not yet written | Not started | |
 | 3. Image encoders (ryll) | Not yet written | Not started | |
@@ -186,34 +186,27 @@ reach daily-driver quality in a further five to seven.
 Before there is any code, bring andris into shakenfist/development's
 consistency-audit ecosystem, so that the fleet's conventions answer
 the structural questions rather than this plan guessing at them.
-The operator creates the GitHub repository; this plan file moves in
-as the first commit. Then:
+Detail is in
+[PLAN-x11-desktop-phase-00-audit.md](PLAN-x11-desktop-phase-00-audit.md).
+In outline:
 
-- Add andris to the matrix in development's
-  `.github/workflows/consistency-audit.yml` and to the in-scope
-  list in `docs/audits/README.md`.
-- Run `scripts/audit-check.py --repo-path <andris> --repo-name
-  andris --github-org shakenfist` locally first, and treat its
-  failures as this phase's to-do list.
-- Seed from development's templates and shared blocks whatever that
-  list asks for: `AGENTS.md`, `ARCHITECTURE.md`, a pitch
-  `README.md`, `docs/`, `PLAN-TEMPLATE.md`, `docs/plans/index.md`,
-  `PUSH-AUDIT.md`, renovate, repository settings and the merge
-  queue.
-- **Human review is out of scope for now.** `REPO_OVERRIDES` in
-  development's `scripts/audit/repo.py` has `only_checks` (an
-  allow list) but no way to exclude individual checks. The phase
-  plan must decide between listing every check except
-  `review-coverage` and `review-scope-completeness`, and adding a
-  small exclusion override to development. Prefer the override:
-  an allow list silently stops auditing andris against every
-  criterion added after it is written. Either way, record why
-  andris is exempt in the override's comment, as the existing
-  entries do.
+- Create `shakenfist/andris` on GitHub with `develop` as its default
+  branch, and push this plan as the first commit.
+- Run `scripts/audit-check.py` from development against the clone,
+  and seed whatever its failures ask for from development's
+  templates and shared blocks, using ryll's copies as the nearest
+  Rust example.
+- Add andris to development's audit matrix and in-scope list, once
+  the GitHub repository exists so the daily run can clone it.
+- **Human review is out of scope for now.** The review-coverage and
+  review-scope-completeness checks apply only to a repository that
+  carries `.vscode/review-scope.toml`. Andris does not get the
+  review-tracking tooling, so they report not applicable and
+  development needs no override.
 
-Some checks cannot pass until there is code and CI, for example
-the workflow and Rust lint criteria. Those failures are expected,
-and phase 1 closes them.
+Some checks cannot pass until there is code and CI: CodeQL, the CI
+review automation, and the merge queue, whose required status
+checks come from CI. Phase 1 closes those.
 
 ### Phase 1: Build and CI scaffold
 

@@ -162,8 +162,12 @@ development `066d639`.
     `merge_group` run never starts or the gates misreport, the bypass
     team can merge directly and the rule can be removed. That is
     recorded as a finding, not papered over.
-11. **The README does not change.** There is still nothing to install
-    or run; how to build belongs in `docs/development.md`.
+11. **The README changes only its status and links.** This decision
+    first said the README would not change, but its Status section
+    said there was no code, which became false. The push audit
+    caught it. It now says what exists and links
+    `docs/development.md`. How to build still belongs in the docs,
+    not the README.
 
 ## Execution
 
@@ -173,14 +177,14 @@ the management session after review. Every commit must leave
 
 | Step | Effort | Model | Isolation | Status | Brief for sub-agent |
 |------|--------|-------|-----------|--------|---------------------|
-| 1 | low | sonnet | none | Not started | Cargo workspace and stub crate. See brief 1. |
-| 2 | high | opus | none | Not started | Devcontainer and Makefile. See brief 2. |
-| 3 | medium | sonnet | none | Not started | Rust pre-commit hook. See brief 3. |
-| 4 | medium | sonnet | none | Not started | Supply-chain policy. See brief 4. |
-| 5 | high | opus | none | Not started | Two-stage CI. See brief 5. |
-| 6 | medium | sonnet | none | Not started | CodeQL and CI review automation. See brief 6. |
-| 7 | medium | sonnet | none | Not started | Documentation. See brief 7. |
-| 8 | medium | management | none | Not started | Audit, push, pull request, queue. See brief 8. |
+| 1 | low | sonnet | none | Complete | Cargo workspace and stub crate. See brief 1. |
+| 2 | high | opus | none | Complete | Devcontainer and Makefile. See brief 2. |
+| 3 | medium | sonnet | none | Complete | Rust pre-commit hook. See brief 3. |
+| 4 | medium | sonnet | none | Complete | Supply-chain policy. See brief 4. |
+| 5 | high | opus | none | Complete | Two-stage CI. See brief 5. |
+| 6 | medium | sonnet | none | Complete | CodeQL and CI review automation. See brief 6. |
+| 7 | medium | sonnet | none | Complete | Documentation. See brief 7. |
+| 8 | medium | management | none | In progress | Audit, push, pull request, queue. See brief 8. |
 
 All paths below are relative to the worktree,
 `/srv/kasm_profiles/mikal/vscode/src/shakenfist/andris-wt-p01`; ryll
@@ -413,6 +417,60 @@ Commit subject: `Document building, testing and CI.`
    it merges.
 7. Re-run the audit against `develop`, and record the result in this
    file.
+
+## Push audit
+
+`PUSH-AUDIT.md` ran over `develop...HEAD` before the push. Wave 1
+(`pre-commit run --all-files`, `make lint`, `make test`) passed. In
+wave 2, the style check found nothing. The other four reviewers'
+findings were handled as follows.
+
+Fixed, one commit each:
+
+- **M1, security.** Build scripts could write the in-checkout cargo
+  cache and `.git/config` through the writable workspace mount,
+  despite the offline build. Compiling targets now mount the
+  checkout read-only, with only `target/` writable, and refuse a
+  `target` symlink. The same review added `--allow-no-vcs` to
+  `lint-fix`, which failed in git worktrees.
+- **M2 and L1, security.** No fork guard on the four smoke jobs that
+  run pull-request code on VM runners, and `check_paths` checked out
+  the branch on the static runner. Both now follow hunkydory and
+  `shakenfist/actions/docs/ci.md`. One consequence: `check_paths`
+  filters only on `pull_request`, so the merge tier runs even for a
+  documentation-only change.
+- **L2, security.** `supply-chain.yml` granted `pull-requests: write`
+  and gave both jobs the audit job's scopes.
+- **L3, security.** `deny.toml` had `wildcards = "allow"`, and git
+  sources did not need a pinned revision.
+- **Tests.** The banner test rejected valid pre-release versions,
+  and no test ran the built binary.
+- **Docs.** The README status was stale; see decision 11.
+
+Declined, with reasons:
+
+- Long comments in the `Makefile` (code quality, advisory). They
+  carry the security reasoning, which is the case the
+  comment-proportion block allows.
+- An unpinned stable toolchain and base image in the devcontainer.
+  This matches ryll. Pinning would trade reproducibility for
+  missing clippy's new lints, a trade-off to make fleet-wide.
+- Mutable action references. This is fleet convention, and Renovate
+  digest pinning is a fleet-wide decision.
+- CodeQL autobuild running dependency build scripts on the static
+  runner. This is moot with no dependencies; it is to be revisited
+  when phase 4 adds the first.
+- A root `chown` in `ensure-cache` on an overridden `CARGO_CACHE`.
+  It is not exploitable (`chown -R` does not follow symlinks), and
+  an operator who overrides the path chooses it.
+
+Found in neighbours, out of scope here:
+
+- Ryll's `Makefile` has the same writable-workspace hole as M1, and
+  its `ci.yml` has no fork guards (M2).
+- Development's ci-review-automation check matches the literal
+  `review-pr-with-claude@main` string. Its specification says that
+  calling the reusable `pr-auto-review.yml` satisfies it.
 
 ## Risks and mitigations
 

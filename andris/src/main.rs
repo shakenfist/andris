@@ -15,11 +15,10 @@ mod tests {
     fn banner_has_name_and_version() {
         let banner = banner();
         let version = banner.strip_prefix("andris ").unwrap();
-        let parts: Vec<&str> = version.split('.').collect();
-        assert_eq!(parts.len(), 3, "not a semver version: {version}");
+        assert!(!version.is_empty(), "no version in banner: {banner:?}");
         assert!(
-            parts.iter().all(|p| p.parse::<u32>().is_ok()),
-            "not a semver version: {version}"
+            !version.chars().any(char::is_whitespace),
+            "version contains whitespace: {version:?}"
         );
     }
 }

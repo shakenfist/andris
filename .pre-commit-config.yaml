@@ -1,0 +1,28 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-merge-conflict
+
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.10.0.1
+    hooks:
+      - id: shellcheck
+        files: ^(scripts|tools)/
+        types_or: [sh, bash, shell]
+        args: ['-x']
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+
+  # Lints the agent context (AGENTS.md and anything else an agent is
+  # given) for malformed structure, smuggled instructions and the like.
+  - repo: https://github.com/stbenjam/skillsaw
+    rev: v0.21.0
+    hooks:
+      - id: skillsaw

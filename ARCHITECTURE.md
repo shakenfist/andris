@@ -8,8 +8,9 @@ to grow into. The documentation index is
 ## The repository today
 
 Andris holds a design and no code. There is no Cargo workspace, no
-binary, no `Makefile` and no CI, so there are no components and no
-data flow to describe yet. What exists is:
+binary, no `Makefile` and no build CI (only lint and secret-scan
+workflows), so there are no components and no data flow to describe
+yet. What exists is:
 
 | Path | What it is |
 |------|------------|
@@ -19,6 +20,7 @@ data flow to describe yet. What exists is:
 | `README.md` | The pitch and current status |
 | `AGENTS.md` | Conventions for AI coding assistants |
 | `PLAN-TEMPLATE.md`, `PUSH-AUDIT.md` | The planning template and the pre-push audit runbook |
+| `.pre-commit-config.yaml`, `renovate.json`, `.github/workflows/` | Repository tooling: commit-time linters, the CI and secret-scan workflows, dependency updates, and the repository-configuration-export workflow |
 
 When code lands, a component inventory replaces this table.
 

@@ -1,4 +1,14 @@
 repos:
+  # rustfmt and clippy run in the andris-dev image via `make lint`.
+  - repo: local
+    hooks:
+      - id: rust-check
+        name: rustfmt and clippy
+        entry: ./scripts/check-rust.sh check
+        language: script
+        pass_filenames: false
+        files: \.rs$|Cargo\.(toml|lock)$
+
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:

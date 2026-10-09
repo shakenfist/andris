@@ -184,7 +184,7 @@ the management session after review. Every commit must leave
 | 5 | high | opus | none | Complete | Two-stage CI. See brief 5. |
 | 6 | medium | sonnet | none | Complete | CodeQL and CI review automation. See brief 6. |
 | 7 | medium | sonnet | none | Complete | Documentation. See brief 7. |
-| 8 | medium | management | none | In progress | Audit, push, pull request, queue. See brief 8. |
+| 8 | medium | management | none | Complete | Audit, push, pull request, queue. See brief 8. |
 
 All paths below are relative to the worktree,
 `/srv/kasm_profiles/mikal/vscode/src/shakenfist/andris-wt-p01`; ryll
@@ -487,6 +487,22 @@ checks (6), and redundant assertions in the CLI test (7). Declined:
   shared `pr-auto-review.yml` already runs only on `pull_request`.
 - Lint and build-test compiling twice (9): decision 4 accepts this,
   and the cost should be looked at again when dependencies arrive.
+
+## Result
+
+Pull request #1 passed the smoke tier, went through the merge queue
+it introduced (`merge_group` run 37990388205: `merge-build` and
+`Can merge` succeeded) and merged as `cf34d91` on 2026-10-09.
+
+The audit against `develop` after the merge first reported 33 pass,
+1 fail and 26 not applicable. The failure was
+`scheduled-workflow-health`, a check development added during this
+phase: `renovate.yml` had never succeeded, because the
+`RENOVATE_TOKEN` organisation secret was not granted to andris. That
+gap dates from phase 0, which added Renovate before any audit check
+looked at whether it ran. The operator granted the secret, a manual
+Renovate run succeeded, and the audit then reported 34 pass, 0 fail
+and 26 not applicable.
 
 ## Risks and mitigations
 

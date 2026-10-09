@@ -165,7 +165,7 @@ written with `/next-phase` as each phase comes up.
 | Phase | Plan | Status | Merged |
 |-------|------|--------|--------|
 | 0. Join the consistency audit | PLAN-x11-desktop-phase-00-audit.md | Complete | andris `60c0c4d..e89539f`; development `066d639` |
-| 1. Build and CI scaffold | PLAN-x11-desktop-phase-01-scaffold.md | In progress | |
+| 1. Build and CI scaffold | PLAN-x11-desktop-phase-01-scaffold.md | Complete | andris `cf34d91` (#1) |
 | 2. Server-role wire types (ryll) | Not yet written | Not started | |
 | 3. Image encoders (ryll) | Not yet written | Not started | |
 | 4. Server skeleton | Not yet written | Not started | |

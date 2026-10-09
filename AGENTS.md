@@ -9,9 +9,9 @@ this file points you there rather than restating it.
 Andris is intended to be a Linux-only SPICE *server*, written in
 Rust, that exports an existing X11 desktop (such as an xrdp
 session's Xorg server) to SPICE clients. **Today the repository
-holds plans and no code**: there is no Cargo workspace, no
-`Makefile` and no CI yet. What andris is meant to become is set out
-in the master plan,
+holds plans, a stub binary and the build and CI scaffold around
+it**: a Cargo workspace, a `Makefile` and CI, but no server yet. What
+andris is meant to become is set out in the master plan,
 [`docs/plans/PLAN-x11-desktop.md`](docs/plans/PLAN-x11-desktop.md).
 
 Describe what exists. Every document outside `docs/plans/` states
@@ -33,6 +33,7 @@ Related repositories:
 |----------|----------|
 | What is in the repository, and how does it relate to ryll and kerbside? | [`ARCHITECTURE.md`](ARCHITECTURE.md) |
 | What documentation exists? | [`docs/index.md`](docs/index.md) |
+| How do I build, test and land a change? | [`docs/development.md`](docs/development.md) |
 | What is andris for, and how will it be built? | [`docs/plans/PLAN-x11-desktop.md`](docs/plans/PLAN-x11-desktop.md) |
 | What has been planned, and what is its status? | [`docs/plans/index.md`](docs/plans/index.md) |
 
@@ -80,9 +81,11 @@ locally:
 ## Working conventions
 
 - **Cargo runs through the `Makefile`, inside Docker, never on the
-  host.** When the Cargo workspace exists, use `make build`,
+  host.** Use `make build`,
   `make test` and `make lint`, which wrap cargo in a devcontainer as
   ryll's do. Do not install a Rust toolchain on the host.
+- **No `unwrap()` in production code.** `clippy::unwrap_used` is on
+  for the workspace; tests may unwrap.
 - **Commits go through `pre-commit run --all-files`.** Run it, and
   fix what it reports, before proposing a commit.
 - **Python, if any appears** (tooling under `tools/`, say), uses

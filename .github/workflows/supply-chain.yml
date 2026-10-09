@@ -1,0 +1,71 @@
+# Supply-chain advisory drift scanner.
+#
+# ci.yml's smoke tier scans every pull request. This weekly cron
+# catches advisory drift (new RustSec advisories, cargo-deny policy
+# violations) against develop in the gaps between PRs, when no
+# smoke-tier run would otherwise notice.
+#
+# Both jobs run on self-hosted VM runners (the `vm` label excludes
+# bare-metal runners which have different OSes and no passwordless
+# sudo), targeting `debian-13` with size `s` (2 vCPU, 4 GB RAM) --
+# these scanners are I/O-bound and do not benefit from a larger
+# runner. cargo-deny instead targets `debian-13-docker` because
+# cargo-deny-action runs its check inside a Docker container. See
+# deny.toml for the policy enforced by cargo-deny.
+
+name: Supply chain
+
+on:
+  schedule:
+    # Weekly at 09:00 UTC on Monday.
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # cargo-audit needs cargo on PATH. The static runner is minimal
+  # (git only), so we run on debian-13 and install the stable rust
+  # toolchain into $HOME via dtolnay/rust-toolchain (no sudo needed).
+  cargo-audit:
+    name: cargo audit
+    runs-on: [self-hosted, vm, debian-13, s]
+    timeout-minutes: 15
+    # rustsec/audit-check creates a check run to report findings, which
+    # needs `checks: write`; on scheduled runs it files issues instead,
+    # hence `issues: write`. Job-level permissions replace the
+    # workflow-level block rather than extending it, so this restates
+    # the `contents: read` the checkout needs.
+    permissions:
+      contents: read
+      checks: write
+      issues: write
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-cargo-audit
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # cargo-deny-action runs cargo-deny inside a Docker container, so
+  # this job needs the debian-13-docker image.
+  cargo-deny:
+    name: cargo deny
+    runs-on: [self-hosted, vm, debian-13-docker, s]
+    timeout-minutes: 15
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-cargo-deny
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features

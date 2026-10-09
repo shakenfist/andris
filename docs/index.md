@@ -9,13 +9,16 @@ connection -- so that it can be reached from the
 or through the [kerbside](https://github.com/shakenfist/kerbside)
 SPICE proxy.
 
-Andris has no code yet. Today this documentation consists of the
-plans that describe what andris is meant to become; pages describing
-how to build, configure and run andris will be added here as the
-software that they describe is written.
+Andris has no server yet: the repository holds a stub binary and
+the build and CI scaffold around it. This documentation consists of
+how to build and test andris, and the plans that describe what it
+is meant to become; pages describing how to configure and run it
+will be added here as the software they describe is written.
 
 ## Documentation Index
 
+- [Development](development.md) - Building, testing, pre-commit, CI
+  and the merge queue
 - [Plans index](plans/index.md) - Every planning document, with its
   intent and status
 - [X11 desktop over SPICE](plans/PLAN-x11-desktop.md) - The master

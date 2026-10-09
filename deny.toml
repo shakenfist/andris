@@ -1,0 +1,68 @@
+# cargo-deny policy for andris.
+#
+# Update the license allowlist below when a new permissive licence is
+# pulled in by a dependency. Only add `[[licenses.exceptions]]` entries
+# after confirming that the non-standard license is safe for our
+# redistribution use.
+#
+# The advisories ignore list tracks known issues we have explicitly
+# accepted. Every entry must have a URL and a rationale. There are
+# currently none.
+
+[graph]
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+]
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    "BSL-1.0",
+    "CC0-1.0",
+    "MIT-0",
+    "0BSD",
+    "CDLA-Permissive-2.0",
+    "OFL-1.1",
+    "bzip2-1.0.6",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+# Deny wildcard version requirements (`version = "*"`), which accept
+# whatever a registry serves next. The workspace has no path
+# dependencies yet. A path dependency without a version also counts as
+# a wildcard, so when the first one arrives, set
+# `allow-wildcard-paths = true` here and mark the workspace crates
+# `publish = false`: cargo-deny then allows wildcard path dependencies
+# between private crates while still denying registry wildcards.
+wildcards = "deny"
+highlight = "all"
+allow = []
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# Git sources must be pinned to a revision (`rev = "<sha>"`), not a
+# branch or tag that can move under the lockfile's feet.
+required-git-spec = "rev"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# ryll's shared crates may be pinned by git revision.
+allow-git = ["https://github.com/shakenfist/ryll"]

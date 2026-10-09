@@ -1,0 +1,8 @@
+[
+    {
+        "enforcement": "active",
+        "id": 24700229,
+        "name": "Develop branch",
+        "target": "branch"
+    }
+]

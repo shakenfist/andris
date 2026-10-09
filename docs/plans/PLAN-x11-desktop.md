@@ -55,13 +55,15 @@ Ryll already holds much of a server:
   `send_link_reply`, `generate_ticket_keypair`, `read_auth_ticket`
   / `decrypt_password` and `send_auth_result` in
   `shakenfist-spice-protocol/src/link.rs`.
-- **Wire knowledge, but on the wrong side of a crate boundary.**
-  The display, cursor and main-channel (including vdagent) message
-  structures are parse-only and live in
-  `shakenfist-spice-renderer` (`channels/display.rs`,
-  `channels/main_channel.rs`), the client substrate. A server must
-  not depend on the renderer, so these structures have to move
-  into `shakenfist-spice-protocol` and gain writers.
+- **Wire knowledge, mostly without types.** The protocol crate's
+  `messages.rs` has read-only types for a handful of server
+  messages (`MainInit`, `ChannelsList`, `SurfaceCreate`, `DrawBase`,
+  `ImageDescriptor`, `CursorInit`, `CursorSet`) and write-only ones
+  for the client's inputs messages. Everything else, including
+  the vdagent messages, streams and the DRAW_COPY body, is parsed
+  inline at fixed offsets in `shakenfist-spice-renderer`'s channel
+  code. A server must not depend on the renderer, so these
+  messages need protocol-crate types with readers and writers.
 - **Compression is decode-only.** `shakenfist-spice-compression`
   decodes LZ, GLZ, LZ4, QUIC and JPEG and encodes nothing.
 - **Distribution.** The shared crates are on crates.io at 0.1.7;
@@ -166,7 +168,7 @@ written with `/next-phase` as each phase comes up.
 |-------|------|--------|--------|
 | 0. Join the consistency audit | PLAN-x11-desktop-phase-00-audit.md | Complete | andris `60c0c4d..e89539f`; development `066d639` |
 | 1. Build and CI scaffold | PLAN-x11-desktop-phase-01-scaffold.md | Complete | andris `cf34d91` (#1) |
-| 2. Server-role wire types (ryll) | Not yet written | Not started | |
+| 2. Server-role wire types (ryll) | PLAN-x11-desktop-phase-02-wire-types.md | In progress | |
 | 3. Image encoders (ryll) | Not yet written | Not started | |
 | 4. Server skeleton | Not yet written | Not started | |
 | 5. Damage and flow control | Not yet written | Not started | |
@@ -230,10 +232,14 @@ nothing is exempted.
 
 ### Phase 2: Server-role wire types (ryll)
 
-Move the display, cursor, inputs, main and vdagent message
-structures that andris needs out of `shakenfist-spice-renderer` into
-`shakenfist-spice-protocol`, each with a reader and a writer, and
-re-point the renderer at them. The set to move:
+Detail is in
+[PLAN-x11-desktop-phase-02-wire-types.md](PLAN-x11-desktop-phase-02-wire-types.md).
+Give the display, cursor, inputs, main and vdagent messages that
+andris needs types in `shakenfist-spice-protocol`, each with a
+reader and a writer, and re-point the renderer's inline parsing at
+them. Most of these types do not exist yet. The renderer parses the
+wire inline rather than through structs of its own, so this phase
+mostly creates types rather than moving them. The set:
 
 - **main:** `INIT`, `CHANNELS_LIST`, `MOUSE_MODE`, the `AGENT_*`
   family, and the vdagent messages for monitors config and
@@ -245,8 +251,8 @@ re-point the renderer at them. The set to move:
 - **cursor:** `INIT`, `SET`, `MOVE`, `HIDE`;
 - **inputs:** both directions.
 
-Every moved structure gets a round-trip test (write, then parse
-with the same code ryll's client uses). This is a refactor of
+Every type gets a round-trip test (write, then parse with the
+same code ryll's client uses). This is a refactor of
 ryll's client and must not change its behaviour; kerbside's
 allowlist tests must still pass against the new revision. It is the
 riskiest phase for ryll, so plan it at high effort.
@@ -256,7 +262,16 @@ riskiest phase for ryll, so plan it at high effort.
 Add SPICE-framed LZ4 and JPEG image encoders to
 `shakenfist-spice-compression` behind an `encode` feature. Round-trip
 each against the existing decoders, and add property tests over
-random sizes and strides. Release ryll so andris can depend on
+random sizes and strides.
+
+Ryll's LZ4 decoder does not match spice-server, as phase 2's survey
+found. Ryll reads no `data_size` prefix, decodes independent per-row
+blocks rather than one LZ4 stream over multi-line chunks, and maps
+bitmap format bytes differently from `enums.h`. A round trip against
+that decoder would prove nothing. So this phase opens by settling
+the LZ4 framing against a capture from spice-server and fixing
+ryll's decoder to match (ryll#475), before it writes the encoder. Phase 2
+leaves the LZ4 payload out of the wire types for the same reason. Release ryll so andris can depend on
 crates.io versions; until then, andris uses a Cargo `[patch]`
 against a local ryll worktree.
 
@@ -318,7 +333,11 @@ the session, so it plays the agent itself, with no separate
   client, coexisting with `xrdp-chansrv`, which also owns
   selections.
 
-The phase opens with the spike from open questions 1 and 2.
+The phase opens with the spike from open questions 1 and 2. It
+also depends on ryll reassembling agent data that spans several
+`AGENT_DATA` messages, which ryll does not do today (ryll#474,
+found in phase 2). Without that, clipboard text over about 2 KB from andris
+arrives truncated.
 
 ### Phase 8: Video streams
 

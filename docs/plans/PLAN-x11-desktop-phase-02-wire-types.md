@@ -341,10 +341,10 @@ runs only through the `Makefile`, never on the host.
 | 4 | low | sonnet | none | Complete | Fix the `VD_AGENT_REPLY` success value. See brief 4. |
 | 5 | high | opus | none | Complete | Cursor and inputs types; re-point those channels. See brief 5. |
 | 6a | high | opus | none | Complete | Display streams, surfaces and simple messages. See brief 6. |
-| 6b | high | opus | none | In progress | Images and DRAW_COPY. See brief 6, as amended under "Departures from the briefs". |
-| 7 | medium | sonnet | none | Not started | Two fuzz targets with the round-trip property. See brief 7. |
-| 8 | low | sonnet | none | Not started | Ryll documentation. See brief 8. |
-| 9 | medium | management | none | Not started | Push audit, kerbside check, pull request, queue. See brief 9. |
+| 6b | high | opus | none | Complete | Images and DRAW_COPY. See brief 6, as amended under "Departures from the briefs". |
+| 7 | medium | sonnet | none | Complete | Two fuzz targets with the round-trip property. See brief 7. |
+| 8 | low | sonnet | none | Complete | Ryll documentation. See brief 8. |
+| 9 | medium | management | none | Complete | Push audit, kerbside check, pull request, queue. See brief 9. |
 
 Steps 2, 3, 5 and 6 are high effort because each one removes inline
 parsing from a channel that ryll runs, and each must keep that
@@ -734,9 +734,86 @@ Commit subject: `Document the protocol crate's server role.`
 - **Ryll's checks pass.** The ryll pull request passed its smoke
   tier and merge queue.
 
+## Push audit
+
+Ryll's `PUSH-AUDIT.md` was run over the branch. Wave 1 passed: its
+only advisory was a 123-character format string. The wave 2 reviews
+found:
+
+- Style: clean.
+- Documentation: one blocking finding, a plan citation in a code
+  comment, which the step 2 brief had asked for. It was removed.
+- Code quality: nothing blocking.
+- Tests: no test pinned the renderer's failure policies, and some
+  senders' bytes were unpinned.
+- Security: nothing critical, high or medium in the branch.
+
+All were fixed in "Address the phase 2 push audit.". That commit:
+
+- added signed and count-check helpers to `BoundedReader`;
+- moved the mouse mask mapping into the protocol crate;
+- gave the renderer borrowed readers for stream frames and cursor
+  shapes;
+- bounded `set_capability`;
+- pinned every re-pointed call site's failure policy with a small
+  loopback harness, including a new one for the main channel;
+- pinned the main channel's mouse-mode and clipboard bytes;
+- added DRAW_COPY aliasing and boundary tests.
+
+Declined:
+
+- Making `MessageHeader::write` infallible. Kerbside calls it, and
+  decision 2 keeps kerbside's imports unchanged.
+- Sharing the NOTIFY handler that seven channels copy, and
+  deduplicating the fuzz targets' helpers. The duplication predates
+  this phase.
+- Moving the OPAQUE, TRANSPARENT and ALPHA_BLEND draws onto the new
+  pointer checks. That belongs with ryll#136.
+
+Found, out of scope:
+
+- The display channel fans out one sub-image per DRAW_COPY clip
+  rectangle with no cap. A single message with a million rectangles
+  freezes the channel. This predates the phase; it is ryll#476.
+- The security review's notes for andris (validate client values;
+  cap agent reassembly) are recorded in the master plan's phase 4
+  and phase 7 sections.
+
 ## Result
 
-Not yet run.
+- `make lint` and `make test` pass: 1165 tests, against 1044 at the
+  base.
+- `logging.rs` is byte-identical to `develop`. The round-trip
+  coverage loop prints nothing.
+- Each fuzz target ran for five minutes, about 90 million inputs
+  each, with no failures.
+- A headless ryll against `make test-qemu` linked every channel,
+  parsed INIT, CHANNELS_LIST, SURFACE_CREATE, MONITORS_CONFIG and
+  NOTIFY, and drew.
+- Kerbside, with its ryll pin moved, passed `make test` (76 passed)
+  and `make lint`, both at ryll `develop` (`4d5f9e9`) and at this
+  branch (`2a20cad`).
+- The automated reviewer on ryll#477 raised one action item and six
+  suggestions. "Address the automated review of the wire types."
+  took the action item: historical plans linking to the deleted
+  `messages.rs` now link to it at the pre-split commit. It also took
+  four of the suggestions:
+  - a CLIPBOARD_REQUEST missing its type is answered NONE again,
+    when its selection header is readable;
+  - malformed STREAM_CREATE and STREAM_DATA raise a `warn_once`;
+  - `Ping::write` debug-asserts that its padding fits a `u32`;
+  - the fuzz comment says what andris is.
+- Declined:
+  - common constants in `inputs_client`: every other channel module
+    already defines its own;
+  - `REVIEWS.md`: it is generated;
+  - the other draw ops' image path: that is ryll#136.
+- The same commit reformatted the two new fuzz targets, which failed
+  `make fuzz-fmt-check`. Only the scheduled fuzz workflow runs that
+  check, and only as a warning, which is why the pull request's checks
+  did not catch it. After the fixes, 1166 tests pass.
+- Ryll#477 merged as ryll `3763158`, and this plan's andris pull
+  request as andris `a9e79cf` (#5).
 
 ## Back brief
 

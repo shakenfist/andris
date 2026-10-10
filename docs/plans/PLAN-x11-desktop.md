@@ -169,7 +169,7 @@ written with `/next-phase` as each phase comes up.
 | 0. Join the consistency audit | PLAN-x11-desktop-phase-00-audit.md | Complete | andris `60c0c4d..e89539f`; development `066d639` |
 | 1. Build and CI scaffold | PLAN-x11-desktop-phase-01-scaffold.md | Complete | andris `cf34d91` (#1) |
 | 2. Server-role wire types (ryll) | PLAN-x11-desktop-phase-02-wire-types.md | Complete | ryll `3763158` (#477); andris `a9e79cf` (#5) |
-| 3. Image encoders (ryll) | Not yet written | Not started | |
+| 3. Image encoders (ryll) | PLAN-x11-desktop-phase-03-encoders.md | In progress | |
 | 4. Server skeleton | Not yet written | Not started | |
 | 5. Damage and flow control | Not yet written | Not started | |
 | 6. Sharing the xrdp session | Not yet written | Not started | |
@@ -259,10 +259,12 @@ riskiest phase for ryll, so plan it at high effort.
 
 ### Phase 3: Image encoders (ryll)
 
+Detail is in
+[PLAN-x11-desktop-phase-03-encoders.md](PLAN-x11-desktop-phase-03-encoders.md).
 Add SPICE-framed LZ4 and JPEG image encoders to
 `shakenfist-spice-compression` behind an `encode` feature. Round-trip
-each against the existing decoders, and add property tests over
-random sizes and strides.
+each against ryll's decoders, and add property tests over random
+sizes and strides.
 
 Ryll's LZ4 decoder does not match spice-server, as phase 2's survey
 found. Ryll reads no `data_size` prefix, decodes independent per-row
@@ -270,10 +272,20 @@ blocks rather than one LZ4 stream over multi-line chunks, and maps
 bitmap format bytes differently from `enums.h`. A round trip against
 that decoder would prove nothing. So this phase opens by settling
 the LZ4 framing against a capture from spice-server and fixing
-ryll's decoder to match (ryll#475), before it writes the encoder. Phase 2
-leaves the LZ4 payload out of the wire types for the same reason. Release ryll so andris can depend on
-crates.io versions; until then, andris uses a Cargo `[patch]`
-against a local ryll worktree.
+ryll's decoder to match (ryll#475), before it writes the encoder.
+Ryll has never received LZ4: spice-server sends it only to a client
+that asks for it, and ryll asks for `AUTO_GLZ`. So the capture needs
+a ryll option to ask for LZ4.
+
+This phase does not release ryll. Ryll 0.2.0 is held until this
+phase lands, so that one release carries the breaking changes of
+phases 2 and 3; cutting it is not a step of this plan. From phase 4, andris depends
+on ryll's crates by git revision, as kerbside does, which andris's
+`deny.toml` already allows. A path `[patch]` against a sibling ryll
+worktree would not work, because andris's build container mounts
+only the andris checkout. Andris moves to crates.io versions once a
+release contains what it needs; phase 10 is the latest point at
+which that matters.
 
 ### Phase 4: Server skeleton
 
@@ -295,6 +307,15 @@ Xvfb and drives it with ryll's headless mode, asserting that frames
 arrive and that injected keys reach an X client. A smoke test
 confirms that kerbside's static source can front andris without an
 allowlist termination.
+
+Andris depends on ryll's protocol and compression crates by git
+revision (see phase 3). It sends LZ4 only to a client that
+advertises `SPICE_DISPLAY_CAP_LZ4_COMPRESSION`, and an uncompressed
+`BITMAP` otherwise, or when LZ4 would be larger than the raw pixels.
+It sets each image descriptor's width and height to the bitmap's
+exactly, and sends no `CACHE_ME` flag until it tracks the client's
+pixmap cache. Its `deny.toml` needs an IJG exception for
+`jpeg-encoder`.
 
 Phase 2's readers check a message's structure, not its meaning, so
 andris must validate what clients send before acting on it:
@@ -389,10 +410,12 @@ plans, reviews the actual diffs and commits.
 
 ### Planning effort
 
-This master plan was written at high effort. Phases 2, 4, 5, 7 and
-8 turn on protocol semantics, concurrency or heuristics and should
-be planned at high effort. Phases 0, 1, 3, 6, 9 and 10 follow
-established patterns and can be planned at medium effort.
+This master plan was written at high effort. Phases 2, 3, 4, 5, 7
+and 8 turn on protocol semantics, concurrency or heuristics and
+should be planned at high effort; phase 3 joined them when its
+survey found the LZ4 decoder had to be rewritten first. Phases 0, 1,
+6, 9 and 10 follow established patterns and can be planned at
+medium effort.
 
 ### Management session review checklist
 
@@ -440,9 +463,9 @@ file) and keep its status in step with the Execution table.
 - A Wayland backend: PipeWire screen capture via
   xdg-desktop-portal, and libei for input.
 - Splitting ryll's shared crates (protocol, compression, usbredir)
-  into their own repository. The trigger is phase 3 merging: at
-  that point there are three real consumers (ryll, kerbside,
-  andris) and the shared surface is known.
+  into their own repository. The trigger is phase 4 merging: at
+  that point andris is the third real consumer, beside ryll and
+  kerbside, and the shared surface is known.
 - VA-API H.264 encode; multi-monitor; the record channel
   (microphone); usbredir and webdav; several simultaneous viewers.
 - Kerbside L2 inspection reusing the phase 2 wire types.

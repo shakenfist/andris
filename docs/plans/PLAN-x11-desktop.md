@@ -168,7 +168,7 @@ written with `/next-phase` as each phase comes up.
 |-------|------|--------|--------|
 | 0. Join the consistency audit | PLAN-x11-desktop-phase-00-audit.md | Complete | andris `60c0c4d..e89539f`; development `066d639` |
 | 1. Build and CI scaffold | PLAN-x11-desktop-phase-01-scaffold.md | Complete | andris `cf34d91` (#1) |
-| 2. Server-role wire types (ryll) | PLAN-x11-desktop-phase-02-wire-types.md | In progress | |
+| 2. Server-role wire types (ryll) | PLAN-x11-desktop-phase-02-wire-types.md | Complete | ryll `3763158` (#477); andris `a9e79cf` (#5) |
 | 3. Image encoders (ryll) | Not yet written | Not started | |
 | 4. Server skeleton | Not yet written | Not started | |
 | 5. Damage and flow control | Not yet written | Not started | |
@@ -296,6 +296,14 @@ arrive and that injected keys reach an X client. A smoke test
 confirms that kerbside's static source can front andris without an
 allowlist termination.
 
+Phase 2's readers check a message's structure, not its meaning, so
+andris must validate what clients send before acting on it:
+- the display `INIT` cache sizes, which can be negative or huge;
+- monitor sizes and positions, where `w * h * 4` can overflow;
+- the pointer's display id and coordinates;
+- agent token counts, using saturating arithmetic;
+- codec preferences and `STREAM_REPORT` fields.
+
 ### Phase 5: Damage and flow control
 
 Replace the timer with XDamage-driven updates. Coalesce damage into
@@ -339,7 +347,9 @@ also depends on ryll reassembling agent data that spans several
 found in phase 2). Without that, clipboard text over about 2 KB from andris
 arrives truncated. Phase 2's `ClipboardGrab` type does not model
 the grab serial, so andris must not announce
-`VD_AGENT_CAP_CLIPBOARD_GRAB_SERIAL` until it does.
+`VD_AGENT_CAP_CLIPBOARD_GRAB_SERIAL` until it does. An agent
+message's declared size is a peer-controlled `u32`, so reassembly on
+either side must cap it, rather than allocate what it says.
 
 ### Phase 8: Video streams
 
@@ -440,7 +450,11 @@ file) and keep its status in step with the Execution table.
 
 ### Bugs fixed during this work
 
-None yet.
+- ryll#473: ryll counted every `VD_AGENT_REPLY` as an error, because
+  it took `VD_AGENT_SUCCESS` to be 0 rather than 1. Fixed in phase 2.
+- In phase 2 ryll also learned to read a pixmap with
+  `PAL_FROM_CACHE` after its 8-byte palette id, as spice.proto lays
+  it out.
 
 ### Back brief
 

@@ -337,7 +337,9 @@ The phase opens with the spike from open questions 1 and 2. It
 also depends on ryll reassembling agent data that spans several
 `AGENT_DATA` messages, which ryll does not do today (ryll#474,
 found in phase 2). Without that, clipboard text over about 2 KB from andris
-arrives truncated.
+arrives truncated. Phase 2's `ClipboardGrab` type does not model
+the grab serial, so andris must not announce
+`VD_AGENT_CAP_CLIPBOARD_GRAB_SERIAL` until it does.
 
 ### Phase 8: Video streams
 

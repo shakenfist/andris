@@ -334,13 +334,14 @@ runs only through the `Makefile`, never on the host.
 
 | Step | Effort | Model | Isolation | Status | Brief for sub-agent |
 |------|--------|-------|-----------|--------|---------------------|
-| 0 | low | management | none | Not started | Land this plan; create the ryll worktree; file issues. See brief 0. |
-| 1 | medium | sonnet | none | Not started | Split `messages.rs` into a module; add the `WireType` trait, round-trip helper and constants. See brief 1. |
-| 2 | high | opus | none | Not started | Common and main-channel types; re-point the main channel. See brief 2. |
-| 3 | high | opus | none | Not started | Vdagent types; move the vdagent constants and helpers. See brief 3. |
-| 4 | low | sonnet | none | Not started | Fix the `VD_AGENT_REPLY` success value. See brief 4. |
-| 5 | high | opus | none | Not started | Cursor and inputs types; re-point those channels. See brief 5. |
-| 6 | high | opus | none | Not started | Display types and the DRAW_COPY builder; re-point the display channel. See brief 6. |
+| 0 | low | management | none | Complete | Land this plan; create the ryll worktree; file issues. See brief 0. |
+| 1 | medium | sonnet | none | Complete | Split `messages.rs` into a module; add the `WireType` trait, round-trip helper and constants. See brief 1. |
+| 2 | high | opus | none | Complete | Common and main-channel types; re-point the main channel. See brief 2. |
+| 3 | high | opus | none | Complete | Vdagent types; move the vdagent constants and helpers. See brief 3. |
+| 4 | low | sonnet | none | Complete | Fix the `VD_AGENT_REPLY` success value. See brief 4. |
+| 5 | high | opus | none | Complete | Cursor and inputs types; re-point those channels. See brief 5. |
+| 6a | high | opus | none | Complete | Display streams, surfaces and simple messages. See brief 6. |
+| 6b | high | opus | none | In progress | Images and DRAW_COPY. See brief 6, as amended under "Departures from the briefs". |
 | 7 | medium | sonnet | none | Not started | Two fuzz targets with the round-trip property. See brief 7. |
 | 8 | low | sonnet | none | Not started | Ryll documentation. See brief 8. |
 | 9 | medium | management | none | Not started | Push audit, kerbside check, pull request, queue. See brief 9. |
@@ -656,6 +657,31 @@ Commit subject: `Document the protocol crate's server role.`
 6. Record the ryll merge commit and the kerbside result in this
    file. The master plan's `Merged` cell is filled in by phase 3's
    planning commit.
+
+## Departures from the briefs
+
+- **Step 6 split into 6a and 6b** at brief 6's size check: 6a (streams,
+  surfaces, simple messages) alone was about 1900 diff lines.
+- **DRAW_COPY is stored demarshalled** (6b). Decision 9 described a
+  type that keeps raw offsets. A value read from input laid out
+  differently from the builder would then not survive brief 7's
+  read, write, read property. `DrawCopy` instead holds its images,
+  and the builder and `DrawCopy::write` share one layout function.
+  Image types not modelled are carried as `ImagePayload::Other`,
+  bounded by the next pointee so they never swallow the mask. An
+  offset into the fixed part gets its own `LinkError` variant.
+- **Cursor `INIT` and `SET` are read as a head and then a cursor**
+  (step 5), so that a malformed cursor still leaves the position
+  applied, as before. The cursor's shape bytes sit outside the
+  header's `Option`, because spice.proto puts them outside the flags
+  switch.
+- **`ClipboardGrab` does not model the grab serial** (step 3). The
+  brief's only context was `has_selection`. Phase 7 must not
+  announce `VD_AGENT_CAP_CLIPBOARD_GRAB_SERIAL` until the type is
+  extended.
+- **Fatal parse errors name their message** (step 2). The new
+  readers' `LinkError` does not say which message failed, so each
+  channel-ending decode adds `malformed <MSG>` as context.
 
 ## Risks and mitigations
 

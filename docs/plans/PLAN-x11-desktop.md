@@ -171,7 +171,7 @@ written with `/next-phase` as each phase comes up.
 | 2. Server-role wire types (ryll) | PLAN-x11-desktop-phase-02-wire-types.md | Complete | ryll `3763158` (#477); andris `a9e79cf` (#5) |
 | 3. Image encoders (ryll) | PLAN-x11-desktop-phase-03-encoders.md | Complete | ryll `cd2fe41` (#487); andris `591e062` (#6) |
 | 4. Server skeleton | PLAN-x11-desktop-phase-04-server-skeleton.md | Complete | andris `1950cdb` (#7) |
-| 5. Damage and flow control | Not yet written | Not started | |
+| 5. Damage and flow control | PLAN-x11-desktop-phase-05-damage.md | In progress | |
 | 6. Sharing the xrdp session | Not yet written | Not started | |
 | 7. In-process agent: resize and clipboard | Not yet written | Not started | |
 | 8. Video streams | Not yet written | Not started | |
@@ -338,14 +338,34 @@ andris must validate what clients send before acting on it:
 
 ### Phase 5: Damage and flow control
 
-Replace the timer with XDamage-driven updates. Coalesce damage into
-rectangles and send only those, honouring the client's `SET_ACK` /
-`ACK` window. When the client falls behind, merge stale damage
-instead of queueing it. Choose JPEG for photographic regions and
-LZ4 for the rest, using a measured heuristic. Expose per-client
-metrics (frame rate, bytes out, encode time, ack lag) and record
-PING round-trips. This is the phase that makes andris pleasant
-rather than merely working.
+Detail is in
+[PLAN-x11-desktop-phase-05-damage.md](PLAN-x11-desktop-phase-05-damage.md).
+
+- **Damage drives updates.** XDamage on the root says where to look,
+  and a comparison against the pixels last sent says what changed.
+  XDamage over-reports on `:10`, so its rectangles alone would send
+  far too much.
+- **The frame timer stays as a cap** on the frame rate, not a polling
+  period.
+- **Capture uses MIT-SHM**, falling back to `GetImage`.
+- **A slow scrub** of the whole screen catches damage XDamage missed.
+- **Changed tiles go out as merged rectangles**, honouring the
+  client's `SET_ACK` / `ACK` window. When the client falls behind,
+  stale damage is merged rather than queued.
+- **A `MARK` after each frame**, because ryll's FPS is the rate of
+  `MARK` messages.
+- **JPEG for photographic regions** and LZ4 for the rest, using a
+  measured heuristic. A lossy region is refreshed losslessly once it
+  is still.
+- **Per-client metrics:** frame rate, bytes out, capture and encode
+  time, ack lag, and the ping round trip, which andris has logged at
+  debug since phase 4.
+
+Headless ryll has no frame rate or byte counts that a test can read
+(ryll#512). So the 30 fps criterion is measured with ryll's GUI.
+
+This is the phase that makes andris pleasant rather than merely
+working.
 
 ### Phase 6: Sharing the xrdp session
 
@@ -453,8 +473,8 @@ because the following statements will be true:
 * With a static screen, andris uses under 2% of one core on
   the development host.
 * Scrolling a full-screen terminal at the session's native size
-  sustains at least 30 frames per second on the LAN, measured by
-  ryll's statistics.
+  sustains at least 30 frames per second on the LAN, as ryll's GUI
+  reports it: its FPS is the rate of `MARK` messages.
 * Resizing the ryll window resizes the desktop, and copy and
   paste work in both directions.
 * A video played on the desktop arrives as an H.264 stream with
@@ -486,6 +506,9 @@ file) and keep its status in step with the Execution table.
   beside the encoder's tables, so that encode and decode can be tested
   against each other.
 - A side-by-side comparison against Xspice as a baseline.
+- Scroll detection: send a scrolled region as `COPY_BITS`, which ryll
+  renders, plus the newly exposed strip, rather than as fresh pixels.
+  Phase 5 measures whether scrolling needs it, and sizes it.
 - Pointer position for server mouse mode: send `CURSOR_MOVE`, and the
   real position in `CURSOR_INIT` and `CURSOR_SET`, so that a client in
   server mode draws the pointer where the desktop has it. Phase 4

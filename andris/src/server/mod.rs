@@ -224,6 +224,13 @@ impl ServerHandle {
         self.shared.registry.current_id()
     }
 
+    /// The current session, if a client is connected. Tests use it to
+    /// watch session state such as the mouse mode.
+    pub fn session(&self) -> Option<Arc<session::Session>> {
+        let id = self.shared.registry.current_id()?;
+        self.shared.registry.lookup(id)
+    }
+
     /// Stop accepting connections and end the current session. Idempotent.
     pub fn shutdown(&self) {
         self.shared.shutdown.cancel();

@@ -153,3 +153,16 @@ async fn unknown_opcode_does_not_close_the_channel() {
     let message = client.recv().await;
     assert_eq!(message.header.message_type, main_server::CHANNELS_LIST);
 }
+
+/// A `MOUSE_MODE_REQUEST` too short to decode closes the main channel,
+/// and so ends the session.
+#[tokio::test]
+async fn malformed_mouse_mode_request_closes_the_main_channel() {
+    let server = TestServer::start().await;
+    let (mut client, _) = server.open_main().await;
+    skip_opening(&mut client).await;
+
+    client.send(main_client::MOUSE_MODE_REQUEST, &[1]).await;
+    client.expect_closed().await;
+    server.wait_for_no_session().await;
+}

@@ -11,14 +11,14 @@
 #![allow(clippy::unwrap_used)]
 
 use std::io::Write;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use andris::config::Ticket;
 use andris::platform::Size;
 use andris::platform::synthetic::SyntheticPlatform;
-use andris::server::{Server, ServerHandle, ServerOptions, TlsOptions};
+use andris::server::{HandshakeTimeouts, Server, ServerHandle, ServerOptions, TlsOptions};
 use shakenfist_spice_protocol::link::{
     SpiceLinkMess, SpiceLinkReply, SpiceStream, default_channel_caps, perform_auth,
     perform_link_with_caps,
@@ -27,7 +27,7 @@ use shakenfist_spice_protocol::messages::{ReceivedMessage, make_message, take_me
 use shakenfist_spice_protocol::{ChannelType, SpiceError, capabilities};
 use tempfile::NamedTempFile;
 use tokio::io::AsyncReadExt;
-use tokio::net::TcpStream;
+use tokio::net::{TcpSocket, TcpStream};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
@@ -68,21 +68,33 @@ pub struct TestServer {
 impl TestServer {
     /// A server with only a plain listener.
     pub async fn start() -> Self {
-        Self::start_with(false, FRAME_INTERVAL).await
+        Self::start_with(false, FRAME_INTERVAL, HandshakeTimeouts::default()).await
     }
 
     /// A server with only a plain listener, capturing every
     /// `frame_interval`.
     pub async fn start_with_frame_interval(frame_interval: Duration) -> Self {
-        Self::start_with(false, frame_interval).await
+        Self::start_with(false, frame_interval, HandshakeTimeouts::default()).await
+    }
+
+    /// A server with only a plain listener and the handshake time limits
+    /// `timeouts`.
+    pub async fn start_with_timeouts(timeouts: HandshakeTimeouts) -> Self {
+        Self::start_with(false, FRAME_INTERVAL, timeouts).await
     }
 
     /// A server with a TLS listener, whose plain listener redirects.
     pub async fn start_tls() -> Self {
-        Self::start_with(true, FRAME_INTERVAL).await
+        Self::start_with(true, FRAME_INTERVAL, HandshakeTimeouts::default()).await
     }
 
-    async fn start_with(tls: bool, frame_interval: Duration) -> Self {
+    /// A server with a TLS listener and the handshake time limits
+    /// `timeouts`.
+    pub async fn start_tls_with_timeouts(timeouts: HandshakeTimeouts) -> Self {
+        Self::start_with(true, FRAME_INTERVAL, timeouts).await
+    }
+
+    async fn start_with(tls: bool, frame_interval: Duration, timeouts: HandshakeTimeouts) -> Self {
         init_logging();
         let platform = SyntheticPlatform::new(Size {
             width: 256,
@@ -110,6 +122,7 @@ impl TestServer {
             tls: tls_options,
             ticket: Ticket::new(TICKET).unwrap(),
             frame_interval,
+            timeouts,
         };
         let handle = Server::bind(options, platform.platform())
             .await
@@ -181,6 +194,51 @@ impl TestServer {
     }
 }
 
+/// A TCP connection to `addr` from `source`.
+pub async fn tcp_from(addr: SocketAddr, source: IpAddr) -> TcpStream {
+    let socket = TcpSocket::new_v4().unwrap();
+    socket.bind(SocketAddr::new(source, 0)).unwrap();
+    tokio::time::timeout(WAIT, socket.connect(addr))
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// The loopback address 127.0.0.`n`.
+pub fn loopback(n: u8) -> IpAddr {
+    IpAddr::from([127, 0, 0, n])
+}
+
+/// Whether the server has closed `stream` within `wait`: a read returns
+/// end of file or an error, rather than data or nothing.
+pub async fn closed_within<S>(stream: &mut S, wait: Duration) -> bool
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let mut chunk = [0u8; 1024];
+    tokio::time::timeout(wait, async {
+        loop {
+            match AsyncReadExt::read(stream, &mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await
+    .is_ok()
+}
+
+/// Wait until `check` holds, polling.
+pub async fn wait_until(what: &str, mut check: impl FnMut() -> bool) {
+    tokio::time::timeout(WAIT, async {
+        while !check() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting until {what}"));
+}
+
 fn pem_file(contents: &str) -> NamedTempFile {
     let mut file = NamedTempFile::new().unwrap();
     file.write_all(contents.as_bytes()).unwrap();
@@ -204,6 +262,17 @@ impl TestClient {
             .unwrap();
         Self {
             stream: SpiceStream::Plain(tcp),
+            buf: Vec::new(),
+            last_key: None,
+        }
+    }
+
+    /// Connect over plain TCP from `source`, a loopback address other
+    /// than 127.0.0.1 (all of 127.0.0.0/8 is loopback), so that tests can
+    /// stand in for several peers.
+    pub async fn connect_from(addr: SocketAddr, source: IpAddr) -> Self {
+        Self {
+            stream: SpiceStream::Plain(tcp_from(addr, source).await),
             buf: Vec::new(),
             last_key: None,
         }

@@ -1,5 +1,6 @@
 //! A synthetic platform: a deterministic test pattern, an input sink
-//! that records what it is given, and one cursor shape.
+//! that records the most recent [`RECORDED_EVENTS`] events it is given,
+//! and one cursor shape.
 //!
 //! It backs `--platform synthetic`, for load testing, and the in-process
 //! tests, which drive it through [`SyntheticPlatform`]'s own methods and
@@ -20,6 +21,7 @@
 //! [`STRIDE_PADDING`] bytes of padding, filled with [`PADDING_BYTE`], so
 //! that code which mistakes the stride for `width * 4` shows up.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{Result, anyhow};
@@ -40,6 +42,9 @@ pub const SQUARE_STEP: u32 = 8;
 pub const STRIDE_PADDING: usize = 64;
 /// The value of every padding byte.
 pub const PADDING_BYTE: u8 = 0xAA;
+/// How many of the most recent input events are kept; older ones are
+/// dropped, so a long load test does not grow without limit.
+pub const RECORDED_EVENTS: usize = 4096;
 
 /// The bars' colours, left to right, as (R, G, B).
 const BARS: [(u8, u8, u8); 8] = [
@@ -70,7 +75,7 @@ struct State {
 #[derive(Debug)]
 pub struct SyntheticPlatform {
     state: Mutex<State>,
-    events: Mutex<Vec<InputEvent>>,
+    events: Mutex<VecDeque<InputEvent>>,
     cursor: watch::Sender<Option<Arc<CursorShape>>>,
 }
 
@@ -86,7 +91,7 @@ impl SyntheticPlatform {
                 square_x: 0,
                 locks: LockState::default(),
             }),
-            events: Mutex::new(Vec::new()),
+            events: Mutex::new(VecDeque::new()),
             cursor: watch::Sender::new(Some(Arc::new(default_cursor()))),
         }))
     }
@@ -132,14 +137,16 @@ impl SyntheticPlatform {
         Ok(())
     }
 
-    /// Every event injected so far, oldest first.
+    /// The events injected so far, oldest first: at most the last
+    /// [`RECORDED_EVENTS`].
     pub fn input_events(&self) -> Result<Vec<InputEvent>> {
-        Ok(self.events()?.clone())
+        Ok(self.events()?.iter().copied().collect())
     }
 
-    /// Every event injected so far, oldest first, leaving none recorded.
+    /// The events injected so far, oldest first, leaving none recorded:
+    /// at most the last [`RECORDED_EVENTS`].
     pub fn take_input_events(&self) -> Result<Vec<InputEvent>> {
-        Ok(std::mem::take(&mut *self.events()?))
+        Ok(std::mem::take(&mut *self.events()?).into())
     }
 
     /// Set the lock state directly, as if changed from outside andris.
@@ -159,7 +166,7 @@ impl SyntheticPlatform {
             .map_err(|_| anyhow!("the synthetic platform's state lock is poisoned"))
     }
 
-    fn events(&self) -> Result<MutexGuard<'_, Vec<InputEvent>>> {
+    fn events(&self) -> Result<MutexGuard<'_, VecDeque<InputEvent>>> {
         self.events
             .lock()
             .map_err(|_| anyhow!("the synthetic platform's event lock is poisoned"))
@@ -183,8 +190,9 @@ impl FrameSource for SyntheticPlatform {
 }
 
 impl InputSink for SyntheticPlatform {
-    /// Records the event. A press of a lock key toggles that lock, as an
-    /// X server does.
+    /// Records the event, dropping the oldest once [`RECORDED_EVENTS`]
+    /// are kept. A press of a lock key toggles that lock, as an X server
+    /// does.
     fn inject(&self, event: InputEvent) -> Result<()> {
         if let InputEvent::Key {
             code,
@@ -199,7 +207,11 @@ impl InputSink for SyntheticPlatform {
                 _ => {}
             }
         }
-        self.events()?.push(event);
+        let mut events = self.events()?;
+        if events.len() >= RECORDED_EVENTS {
+            events.pop_front();
+        }
+        events.push_back(event);
         Ok(())
     }
 
@@ -432,6 +444,33 @@ mod tests {
         );
         assert_eq!(platform.take_input_events().unwrap(), events);
         assert!(platform.input_events().unwrap().is_empty());
+    }
+
+    #[test]
+    fn only_the_most_recent_events_are_kept() {
+        let platform = SyntheticPlatform::new(SIZE).unwrap();
+        let extra = 10;
+        for x in 0..(RECORDED_EVENTS + extra) as u32 {
+            platform
+                .inject(InputEvent::PointerAbsolute { x, y: 0 })
+                .unwrap();
+        }
+        let events = platform.take_input_events().unwrap();
+        assert_eq!(events.len(), RECORDED_EVENTS);
+        assert_eq!(
+            events.first(),
+            Some(&InputEvent::PointerAbsolute {
+                x: extra as u32,
+                y: 0
+            })
+        );
+        assert_eq!(
+            events.last(),
+            Some(&InputEvent::PointerAbsolute {
+                x: (RECORDED_EVENTS + extra - 1) as u32,
+                y: 0
+            })
+        );
     }
 
     #[test]

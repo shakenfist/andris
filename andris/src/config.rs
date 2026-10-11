@@ -1,18 +1,26 @@
 //! Command-line options, and their validation into a [`Config`].
 
+use std::fs::File;
+use std::io::Read;
 use std::net::SocketAddr;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
+use tracing::warn;
 
 use crate::platform::Size;
 
 /// The longest ticket SPICE allows, in bytes (`SPICE_MAX_PASSWORD_LENGTH`
 /// in spice-protocol's `protocol.h`).
 pub const MAX_TICKET_LEN: usize = 60;
+
+/// The shortest ticket andris does not warn about, in bytes. Wrong
+/// guesses are only slowed, never locked out, so a ticket must be too
+/// long to guess.
+pub const RECOMMENDED_TICKET_LEN: usize = 16;
 
 /// The shortest frame interval `--frame-interval-ms` accepts.
 pub const MIN_FRAME_INTERVAL_MS: u64 = 20;
@@ -44,13 +52,14 @@ pub struct Args {
     #[arg(long, value_name = "PATH")]
     pub tls_cert: Option<PathBuf>,
 
-    /// The TLS private key, as PEM.
+    /// The TLS private key, as PEM. Like the ticket file, it must be
+    /// owned by andris's user and give group and other no access.
     #[arg(long, value_name = "PATH")]
     pub tls_key: Option<PathBuf>,
 
     /// A file holding the SPICE ticket (password) clients must present.
-    /// It must give group and other no access, and holds at most 60
-    /// bytes, plus an optional trailing newline.
+    /// It must be owned by andris's user, give group and other no access,
+    /// and hold at most 60 bytes, plus an optional trailing newline.
     #[arg(long, value_name = "PATH")]
     pub ticket_file: PathBuf,
 
@@ -185,26 +194,98 @@ impl Args {
     }
 }
 
-/// Read and check the ticket file named by `--ticket-file`.
+/// Open a file that must be private to andris's user: `--ticket-file`
+/// or `--tls-key`, named in errors as `option`.
 ///
-/// It is refused if its mode gives group or other any access, if it is
-/// empty, or if it holds more than [`MAX_TICKET_LEN`] bytes after one
-/// trailing newline is stripped.
-pub fn read_ticket_file(path: &Path) -> Result<Ticket> {
-    let shown = path.display();
-    let metadata =
-        std::fs::metadata(path).with_context(|| format!("--ticket-file {shown} cannot be read"))?;
-    if !metadata.is_file() {
-        bail!("--ticket-file {shown} is not a regular file");
+/// It is refused unless it is a regular file, owned by andris's
+/// effective uid, whose mode gives group and other no access. The checks
+/// are made on the open file, so the file read is the file checked.
+pub fn open_private_file(path: &Path, option: &str) -> Result<File> {
+    let shown = path.display().to_string();
+    // Refuse a FIFO or device before opening it, since opening one can
+    // block. This check is only that: the one that counts is below.
+    let named =
+        std::fs::metadata(path).with_context(|| format!("{option} {shown} cannot be read"))?;
+    if !named.is_file() {
+        bail!("{option} {shown} is not a regular file");
     }
-    let mode = metadata.permissions().mode() & 0o777;
+    let file = File::open(path).with_context(|| format!("{option} {shown} cannot be read"))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("{option} {shown} cannot be read"))?;
+    check_private(
+        option,
+        &shown,
+        metadata.is_file(),
+        metadata.mode(),
+        metadata.uid(),
+        effective_uid()?,
+    )?;
+    Ok(file)
+}
+
+/// The checks [`open_private_file`] makes, on an open file's type, mode
+/// and owner.
+fn check_private(
+    option: &str,
+    shown: &str,
+    is_file: bool,
+    mode: u32,
+    owner: u32,
+    euid: u32,
+) -> Result<()> {
+    if !is_file {
+        bail!("{option} {shown} is not a regular file");
+    }
+    let mode = mode & 0o777;
     if mode & 0o077 != 0 {
         bail!(
-            "--ticket-file {shown} is open to group or other (mode {mode:04o}): run chmod 600 {shown}"
+            "{option} {shown} is open to group or other (mode {mode:04o}): run chmod 600 {shown}"
         );
     }
-    let mut ticket =
-        std::fs::read(path).with_context(|| format!("--ticket-file {shown} cannot be read"))?;
+    if owner != euid {
+        bail!(
+            "{option} {shown} is owned by uid {owner}, not uid {euid} that andris runs as: run \
+             chown $(id -un) {shown} as root, or run andris as its owner"
+        );
+    }
+    Ok(())
+}
+
+/// The process's effective uid, from `/proc/self/status`. Andris is
+/// Linux-only, and this needs no new dependency.
+fn effective_uid() -> Result<u32> {
+    let status = std::fs::read_to_string("/proc/self/status")
+        .context("reading /proc/self/status for andris's effective uid")?;
+    parse_effective_uid(&status).context("/proc/self/status names no effective uid")
+}
+
+/// The effective uid from a `/proc/<pid>/status` file: the second of the
+/// `Uid:` line's real, effective, saved and filesystem uids.
+fn parse_effective_uid(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// Read and check the ticket file named by `--ticket-file`.
+///
+/// It is refused if [`open_private_file`] refuses it, if it is empty, or
+/// if it holds more than [`MAX_TICKET_LEN`] bytes after one trailing
+/// newline is stripped. A ticket shorter than [`RECOMMENDED_TICKET_LEN`]
+/// is accepted with a warning.
+pub fn read_ticket_file(path: &Path) -> Result<Ticket> {
+    let shown = path.display();
+    let file = open_private_file(path, "--ticket-file")?;
+    // Enough to tell a ticket that is too long, and no more.
+    let mut ticket = Vec::new();
+    file.take(MAX_TICKET_LEN as u64 + 2)
+        .read_to_end(&mut ticket)
+        .with_context(|| format!("--ticket-file {shown} cannot be read"))?;
     if ticket.last() == Some(&b'\n') {
         ticket.pop();
     }
@@ -215,8 +296,14 @@ pub fn read_ticket_file(path: &Path) -> Result<Ticket> {
     }
     if ticket.len() > MAX_TICKET_LEN {
         bail!(
-            "--ticket-file {shown} holds a {}-byte ticket; SPICE allows at most {MAX_TICKET_LEN} \
-             bytes, so write a shorter one",
+            "--ticket-file {shown} holds a ticket of more than {MAX_TICKET_LEN} bytes; SPICE \
+             allows at most {MAX_TICKET_LEN} bytes, so write a shorter one"
+        );
+    }
+    if ticket.len() < RECOMMENDED_TICKET_LEN {
+        warn!(
+            "--ticket-file {shown} holds a {}-byte ticket; use at least {RECOMMENDED_TICKET_LEN} \
+             random bytes, because wrong guesses are only slowed, never locked out",
             ticket.len()
         );
     }
@@ -244,6 +331,7 @@ fn parse_size(text: &str) -> Result<Size> {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
 
     use tempfile::NamedTempFile;
 
@@ -425,6 +513,61 @@ mod tests {
             read_ticket_file(Path::new("/nonexistent/andris-ticket")).unwrap_err()
         );
         assert!(message.contains("--ticket-file"), "{message}");
+    }
+
+    #[test]
+    fn ticket_file_is_checked_as_opened() {
+        // A directory is not a regular file.
+        let dir = tempfile::tempdir().unwrap();
+        let message = format!("{:#}", read_ticket_file(dir.path()).unwrap_err());
+        assert!(message.contains("not a regular file"), "{message}");
+    }
+
+    #[test]
+    fn private_file_owner_must_be_the_effective_uid() {
+        assert!(check_private("--ticket-file", "t", true, 0o100600, 1000, 1000).is_ok());
+        let message = format!(
+            "{:#}",
+            check_private("--ticket-file", "t", true, 0o100600, 0, 1000).unwrap_err()
+        );
+        assert!(
+            message.contains("--ticket-file t is owned by uid 0"),
+            "{message}"
+        );
+        assert!(message.contains("chown"), "{message}");
+        let message = format!(
+            "{:#}",
+            check_private("--tls-key", "k", true, 0o100640, 1000, 1000).unwrap_err()
+        );
+        assert!(message.contains("--tls-key k is open"), "{message}");
+        assert!(check_private("--tls-key", "k", false, 0o600, 1000, 1000).is_err());
+    }
+
+    #[test]
+    fn effective_uid_owns_the_files_andris_creates() {
+        let file = NamedTempFile::new().unwrap();
+        let owner = file.as_file().metadata().unwrap().uid();
+        assert_eq!(effective_uid().unwrap(), owner);
+    }
+
+    #[test]
+    fn parses_the_effective_uid() {
+        let status =
+            "Name:\tandris\nUmask:\t0022\nUid:\t1000\t1001\t1002\t1003\nGid:\t5\t5\t5\t5\n";
+        assert_eq!(parse_effective_uid(status), Some(1001));
+        assert_eq!(parse_effective_uid("Name:\tandris\n"), None);
+        assert_eq!(parse_effective_uid("Uid:\t1000\n"), None);
+    }
+
+    #[test]
+    fn short_tickets_are_accepted() {
+        // Shorter than RECOMMENDED_TICKET_LEN warns, but is not refused:
+        // kerbside's demo uses an 11-byte ticket.
+        let ticket = ticket_file(b"kerbside-11", 0o600);
+        assert_eq!(
+            read_ticket_file(ticket.path()).unwrap().as_bytes(),
+            b"kerbside-11"
+        );
     }
 
     #[test]

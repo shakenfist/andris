@@ -19,7 +19,7 @@ use config::{Config, PlatformConfig};
 use platform::Platform;
 use platform::synthetic::SyntheticPlatform;
 use platform::x11::X11Platform;
-use server::{Server, ServerOptions, TlsOptions};
+use server::{HandshakeTimeouts, Server, ServerOptions, TlsOptions};
 
 /// Andris's name and version, as `--version` prints them.
 pub fn banner() -> String {
@@ -62,6 +62,7 @@ async fn serve(config: Config, platform: Platform) -> Result<()> {
         tls,
         ticket: config.ticket,
         frame_interval: config.frame_interval,
+        timeouts: HandshakeTimeouts::default(),
     };
     let handle = Server::bind(options, platform).await?.spawn()?;
     tokio::signal::ctrl_c()

@@ -17,10 +17,20 @@
 //!
 //! Each listener runs one accept task. Each accepted connection gets one
 //! task, which links and authenticates it and then serves the channel,
-//! owning its socket throughout. A connection holds one of
-//! [`MAX_HANDSHAKES`] permits from accept until its handshake ends, so
-//! unauthenticated peers can only cause a bounded amount of work; with
-//! none free, a new connection is closed at once.
+//! owning its socket throughout.
+//!
+//! # Limits on unauthenticated peers
+//!
+//! From accept until its handshake ends, a connection holds a slot for
+//! its source address, of which there are [`MAX_HANDSHAKES_PER_PEER`],
+//! and a permit: one of [`MAX_HANDSHAKES`] shared by the serving
+//! listeners, or on a plain listener that only redirects to TLS, one of
+//! its own [`MAX_REDIRECTS`]. With none free, a new connection is closed
+//! at once. So one peer cannot take every permit, and a flood of the
+//! redirect port cannot starve the TLS listener. The first stage of a
+//! handshake, which a peer can stall having proved nothing, has a shorter
+//! time limit than the rest; see [`HandshakeTimeouts`]. At most
+//! [`MAX_KEY_GENERATIONS`] RSA keys are generated at once.
 
 pub mod channel;
 pub mod cursor;
@@ -34,7 +44,8 @@ pub mod opcodes;
 pub mod session;
 pub mod tls;
 
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -49,16 +60,31 @@ use tracing::{debug, info, warn};
 use crate::config::Ticket;
 use crate::platform::Platform;
 use channel::{ChannelConn, ChannelContext, drive};
-use link::{HANDSHAKE_TIMEOUT, Linked, ServedChannel};
+pub use link::HandshakeTimeouts;
+use link::{HandshakeContext, Linked, ServedChannel, timed};
 use opcodes::{CursorOpcode, DisplayOpcode, InputsOpcode, MainOpcode};
 use session::{Cancel, Session, SessionRegistry};
 
-/// How many connections may be in their handshake at once, across both
-/// listeners.
+/// How many connections may be in their handshake at once, across the
+/// listeners that serve SPICE.
 pub const MAX_HANDSHAKES: usize = 8;
 
-/// How often a refused connection is logged at most.
-const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(10);
+/// How many connections from one source address may be in their
+/// handshake at once, across every listener. Four lets a client link its
+/// main channel and then display, cursor and inputs in parallel, as
+/// spice-gtk does, including through a kerbside on the same host whose
+/// every link comes from one address; it still keeps one address from
+/// holding all [`MAX_HANDSHAKES`]. IPv6 addresses count by their /64,
+/// which is what one host usually has to pick from.
+pub const MAX_HANDSHAKES_PER_PEER: usize = 4;
+
+/// How many connections a plain listener that only redirects to TLS may
+/// be answering at once. Apart from [`MAX_HANDSHAKES`], so that a flood
+/// of the redirect port cannot starve the TLS listener.
+pub const MAX_REDIRECTS: usize = 4;
+
+/// How many RSA ticket keys may be generated at once.
+pub const MAX_KEY_GENERATIONS: usize = 2;
 
 /// How long to pause after a failed accept, so that running out of file
 /// descriptors does not become a busy loop.
@@ -79,17 +105,25 @@ pub struct ServerOptions {
     pub tls: Option<TlsOptions>,
     pub ticket: Ticket,
     pub frame_interval: Duration,
+    /// The handshake's time limits; tests shorten them.
+    pub timeouts: HandshakeTimeouts,
 }
 
-/// Logs refused connections at most once per [`REFUSAL_LOG_INTERVAL`],
-/// with how many were refused since the last log.
-#[derive(Default)]
-struct RefusalLog {
+/// Lets an event that a peer can repeat at will be logged at most once
+/// per [`LogThrottle::INTERVAL`], with how many happened since the last
+/// log.
+#[derive(Debug, Default)]
+pub struct LogThrottle {
     state: Mutex<(Option<Instant>, u64)>,
 }
 
-impl RefusalLog {
-    fn refused(&self, peer: SocketAddr) {
+impl LogThrottle {
+    /// The shortest time between two logs.
+    pub const INTERVAL: Duration = Duration::from_secs(10);
+
+    /// Count one event. When it should be logged, returns how many events
+    /// there have been since the last log, this one included.
+    pub fn should_log(&self) -> Option<u64> {
         let mut state = self
             .state
             .lock()
@@ -98,18 +132,94 @@ impl RefusalLog {
         let now = Instant::now();
         if state
             .0
-            .is_none_or(|last| now.duration_since(last) >= REFUSAL_LOG_INTERVAL)
+            .is_none_or(|last| now.duration_since(last) >= Self::INTERVAL)
         {
-            warn!(
-                %peer,
-                refused = state.1,
-                "{MAX_HANDSHAKES} handshakes are already in progress, so new connections are \
-                 being closed (logged at most every {}s)",
-                REFUSAL_LOG_INTERVAL.as_secs()
-            );
+            let count = state.1;
             *state = (Some(now), 0);
+            Some(count)
+        } else {
+            None
         }
     }
+}
+
+/// The key a source address's handshakes are counted under: an IPv4
+/// address (including one mapped into IPv6) as it is, and an IPv6
+/// address by its /64.
+fn peer_key(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+        IpAddr::V6(v6) => {
+            let prefix = u128::from(v6) & !((1u128 << 64) - 1);
+            IpAddr::V6(Ipv6Addr::from(prefix))
+        }
+    }
+}
+
+/// How many handshakes each source address has in progress.
+#[derive(Debug, Default)]
+struct PeerSlots {
+    counts: Mutex<HashMap<IpAddr, usize>>,
+}
+
+impl PeerSlots {
+    /// Take one of `ip`'s [`MAX_HANDSHAKES_PER_PEER`] slots, if one is
+    /// free.
+    fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Option<PeerSlot> {
+        let key = peer_key(ip);
+        let mut counts = self
+            .counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count = counts.entry(key).or_insert(0);
+        if *count >= MAX_HANDSHAKES_PER_PEER {
+            return None;
+        }
+        *count += 1;
+        Some(PeerSlot {
+            slots: self.clone(),
+            key,
+        })
+    }
+
+    /// How many handshakes `ip` has in progress.
+    fn in_progress(&self, ip: IpAddr) -> usize {
+        self.counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&peer_key(ip))
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+/// One of a source address's handshake slots; dropping it frees it.
+#[derive(Debug)]
+struct PeerSlot {
+    slots: Arc<PeerSlots>,
+    key: IpAddr,
+}
+
+impl Drop for PeerSlot {
+    fn drop(&mut self) {
+        let mut counts = self
+            .slots
+            .counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = counts.get_mut(&self.key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// What a connection holds until its handshake ends.
+struct HandshakeSlot {
+    _permit: OwnedSemaphorePermit,
+    _peer: PeerSlot,
 }
 
 /// State every task of the server shares.
@@ -117,9 +227,16 @@ struct Shared {
     ticket: Ticket,
     platform: Platform,
     frame_interval: Duration,
+    timeouts: HandshakeTimeouts,
     registry: SessionRegistry,
     handshakes: Arc<Semaphore>,
-    refusals: RefusalLog,
+    redirects: Arc<Semaphore>,
+    peers: Arc<PeerSlots>,
+    key_generations: Arc<Semaphore>,
+    /// Throttles for the log lines a peer can provoke at will.
+    busy_refusals: LogThrottle,
+    peer_refusals: LogThrottle,
+    wrong_tickets: LogThrottle,
     shutdown: Cancel,
 }
 
@@ -164,9 +281,15 @@ impl Server {
                 ticket: options.ticket,
                 platform,
                 frame_interval: options.frame_interval,
+                timeouts: options.timeouts,
                 registry: SessionRegistry::new(),
                 handshakes: Arc::new(Semaphore::new(MAX_HANDSHAKES)),
-                refusals: RefusalLog::default(),
+                redirects: Arc::new(Semaphore::new(MAX_REDIRECTS)),
+                peers: Arc::new(PeerSlots::default()),
+                key_generations: Arc::new(Semaphore::new(MAX_KEY_GENERATIONS)),
+                busy_refusals: LogThrottle::default(),
+                peer_refusals: LogThrottle::default(),
+                wrong_tickets: LogThrottle::default(),
                 shutdown: Cancel::new(),
             }),
         })
@@ -237,6 +360,17 @@ impl ServerHandle {
         self.shared.registry.lookup(id)
     }
 
+    /// How many of the [`MAX_HANDSHAKES`] permits are free. Tests poll
+    /// it to see a handshake end.
+    pub fn handshakes_available(&self) -> usize {
+        self.shared.handshakes.available_permits()
+    }
+
+    /// How many handshakes `ip` has in progress.
+    pub fn handshakes_from(&self, ip: IpAddr) -> usize {
+        self.shared.peers.in_progress(ip)
+    }
+
     /// Stop accepting connections and end the current session. Idempotent.
     pub fn shutdown(&self) {
         self.shared.shutdown.cancel();
@@ -248,6 +382,43 @@ impl Drop for ServerHandle {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// Take what a new connection from `peer` on a `kind` listener must hold
+/// for its handshake, or say why it cannot have it.
+fn admit(shared: &Shared, kind: &ListenerKind, peer: SocketAddr) -> Option<HandshakeSlot> {
+    let Some(peer_slot) = shared.peers.try_acquire(peer.ip()) else {
+        if let Some(refused) = shared.peer_refusals.should_log() {
+            warn!(
+                %peer,
+                refused,
+                "a source address already has {MAX_HANDSHAKES_PER_PEER} handshakes in progress, \
+                 so its new connections are being closed (logged at most every {}s)",
+                LogThrottle::INTERVAL.as_secs()
+            );
+        }
+        return None;
+    };
+    let (permits, limit) = match kind {
+        ListenerKind::Redirect => (&shared.redirects, MAX_REDIRECTS),
+        ListenerKind::Plain | ListenerKind::Tls(_) => (&shared.handshakes, MAX_HANDSHAKES),
+    };
+    let Ok(permit) = permits.clone().try_acquire_owned() else {
+        if let Some(refused) = shared.busy_refusals.should_log() {
+            warn!(
+                %peer,
+                refused,
+                "{limit} connections are already in their handshake, so new connections are \
+                 being closed (logged at most every {}s)",
+                LogThrottle::INTERVAL.as_secs()
+            );
+        }
+        return None;
+    };
+    Some(HandshakeSlot {
+        _permit: permit,
+        _peer: peer_slot,
+    })
 }
 
 /// Accept connections until shutdown, each in its own task.
@@ -266,8 +437,7 @@ async fn accept_loop(listener: TcpListener, kind: ListenerKind, shared: Arc<Shar
                 continue;
             }
         };
-        let Ok(permit) = shared.handshakes.clone().try_acquire_owned() else {
-            shared.refusals.refused(peer);
+        let Some(slot) = admit(&shared, &kind, peer) else {
             drop(stream);
             continue;
         };
@@ -276,42 +446,58 @@ async fn accept_loop(listener: TcpListener, kind: ListenerKind, shared: Arc<Shar
             peer,
             kind.clone(),
             shared.clone(),
-            permit,
+            slot,
         ));
     }
     debug!("listener closed");
 }
 
-/// Serve one accepted connection. `permit` is released when the
-/// handshake ends, whatever its result.
+/// Serve one accepted connection. `slot` is released when the handshake
+/// ends, whatever its result.
 async fn handle_connection(
     mut tcp: TcpStream,
     peer: SocketAddr,
     kind: ListenerKind,
     shared: Arc<Shared>,
-    permit: OwnedSemaphorePermit,
+    slot: HandshakeSlot,
 ) {
     if let Err(e) = tcp.set_nodelay(true) {
         debug!(%peer, error = %e, "setting TCP_NODELAY failed");
     }
+    let timeouts = shared.timeouts;
     match kind {
         ListenerKind::Redirect => {
-            let result = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-                read_link_mess(&mut tcp).await?;
-                send_need_secured(&mut tcp).await
-            })
+            let result = async {
+                timed(
+                    timeouts.first_stage,
+                    "reading the link message",
+                    read_link_mess(&mut tcp),
+                )
+                .await?;
+                timed(
+                    timeouts.stage,
+                    "sending NeedSecured",
+                    send_need_secured(&mut tcp),
+                )
+                .await
+            }
             .await;
-            drop(permit);
+            drop(slot);
             match result {
-                Ok(Ok(())) => debug!(%peer, "redirected a client to the TLS listener"),
-                Ok(Err(e)) => debug!(%peer, error = format!("{e:#}"), "redirect failed"),
-                Err(_) => debug!(%peer, "redirect timed out"),
+                Ok(()) => debug!(%peer, "redirected a client to the TLS listener"),
+                Err(e) => debug!(%peer, error = format!("{e:#}"), "redirect failed"),
             }
         }
-        ListenerKind::Plain => serve(SpiceStream::Plain(tcp), peer, &shared, permit).await,
+        ListenerKind::Plain => {
+            let stream = SpiceStream::Plain(tcp);
+            serve(stream, peer, &shared, slot).await
+        }
         ListenerKind::Tls(acceptor) => {
-            match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
-                Ok(Ok(tls)) => serve(SpiceStream::TlsServer(tls), peer, &shared, permit).await,
+            match tokio::time::timeout(timeouts.first_stage, acceptor.accept(tcp)).await {
+                Ok(Ok(tls)) => {
+                    let stream = SpiceStream::TlsServer(tls);
+                    serve(stream, peer, &shared, slot).await
+                }
                 Ok(Err(e)) => debug!(%peer, error = %e, "TLS accept failed"),
                 Err(_) => debug!(%peer, "TLS accept timed out"),
             }
@@ -320,14 +506,17 @@ async fn handle_connection(
 }
 
 /// Link and authenticate a connection, then serve its channel.
-async fn serve(
-    mut stream: SpiceStream,
-    peer: SocketAddr,
-    shared: &Shared,
-    permit: OwnedSemaphorePermit,
-) {
-    let linked = link::handshake(&mut stream, &shared.registry, &shared.ticket).await;
-    drop(permit);
+async fn serve(mut stream: SpiceStream, peer: SocketAddr, shared: &Shared, slot: HandshakeSlot) {
+    let ctx = HandshakeContext {
+        registry: &shared.registry,
+        ticket: &shared.ticket,
+        timeouts: shared.timeouts,
+        key_generations: &shared.key_generations,
+        wrong_tickets: &shared.wrong_tickets,
+        peer,
+    };
+    let linked = link::handshake(&mut stream, &ctx).await;
+    drop(slot);
     match linked {
         Ok(Some(linked)) => {
             debug!(
@@ -355,8 +544,25 @@ impl Drop for EndSessionOnDrop<'_> {
     }
 }
 
-/// Serve a linked channel until it closes or its session ends.
+/// Serve a linked channel until it closes, its session ends, or a later
+/// link of the same type replaces it.
 async fn run_channel(stream: SpiceStream, linked: Linked, shared: &Shared) {
+    let session = linked.session.clone();
+    let channel = linked.channel;
+    let claim = session.claim_channel(channel);
+    tokio::select! {
+        biased;
+        () = claim.replaced() => debug!(
+            session = session.id(),
+            channel = channel.name(),
+            "a later link replaced this channel; closing it"
+        ),
+        () = serve_channel(stream, linked, shared) => {}
+    }
+}
+
+/// Drive a linked channel's handler.
+async fn serve_channel(stream: SpiceStream, linked: Linked, shared: &Shared) {
     let session = linked.session;
     let ctx = ChannelContext {
         session: session.clone(),
@@ -386,5 +592,52 @@ async fn run_channel(stream: SpiceStream, linked: Linked, shared: &Shared) {
             let conn = ChannelConn::<CursorOpcode>::new(stream, session);
             drive(ctx, conn, cursor::run).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_slots_cap_each_address() {
+        let slots = Arc::new(PeerSlots::default());
+        let one: IpAddr = "192.0.2.1".parse().unwrap();
+        let two: IpAddr = "192.0.2.2".parse().unwrap();
+        let held: Vec<PeerSlot> = (0..MAX_HANDSHAKES_PER_PEER)
+            .map(|_| slots.try_acquire(one).unwrap())
+            .collect();
+        assert!(slots.try_acquire(one).is_none());
+        assert_eq!(slots.in_progress(one), MAX_HANDSHAKES_PER_PEER);
+        let other = slots.try_acquire(two).unwrap();
+        assert_eq!(slots.in_progress(two), 1);
+
+        drop(held);
+        assert_eq!(slots.in_progress(one), 0);
+        assert!(slots.try_acquire(one).is_some());
+        drop(other);
+        assert!(slots.counts.lock().unwrap().is_empty(), "idle entries go");
+    }
+
+    #[test]
+    fn peer_keys() {
+        let mapped: IpAddr = "::ffff:192.0.2.1".parse().unwrap();
+        assert_eq!(peer_key(mapped), "192.0.2.1".parse::<IpAddr>().unwrap());
+        let a: IpAddr = "2001:db8:1:2:aaaa::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2:bbbb::2".parse().unwrap();
+        let c: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert_eq!(peer_key(a), peer_key(b), "one /64");
+        assert_ne!(peer_key(a), peer_key(c));
+    }
+
+    #[test]
+    fn log_throttle_counts_between_logs() {
+        let throttle = LogThrottle::default();
+        assert_eq!(throttle.should_log(), Some(1));
+        assert_eq!(throttle.should_log(), None);
+        assert_eq!(throttle.should_log(), None);
+        // Pretend the interval has passed.
+        throttle.state.lock().unwrap().0 = Instant::now().checked_sub(LogThrottle::INTERVAL);
+        assert_eq!(throttle.should_log(), Some(3));
     }
 }

@@ -54,7 +54,7 @@ together: give all or none.
 ## Exporting an X display
 
 ```bash
-printf '%s\n' 'a-secret' > ticket && chmod 600 ticket
+(umask 077; head -c 24 /dev/urandom | base64 > ticket)
 DISPLAY=:10 XAUTHORITY=$HOME/.Xauthority \
     target/release/andris --ticket-file ticket
 ```
@@ -94,13 +94,31 @@ It is for trying a client, load testing, and the tests.
 Clients authenticate with a SPICE ticket, which is a password
 andris reads from `--ticket-file`. The file must:
 
-- be a regular file whose mode gives group and other no access, so
-  `chmod 600` it; andris refuses a file with any group or other bit
-  set;
+- be a regular file owned by the user andris runs as, whose mode
+  gives group and other no access, so `chmod 600` it; andris refuses
+  a file with any group or other bit set, or owned by anyone else;
 - hold 1 to 60 bytes (SPICE's limit), not counting one trailing
   newline, which is stripped.
 
-The ticket is read once at startup, and is never logged.
+Make the ticket long and random:
+
+```bash
+(umask 077; head -c 24 /dev/urandom | base64 > ticket)
+```
+
+writes 32 characters of base64 to a file only you can read. Length
+matters because andris only slows wrong guesses, and never locks a
+client out: a client whose ticket is wrong waits a second for its
+answer, and each address may have at most four handshakes in
+progress. A short ticket can still be guessed, so andris logs a
+warning at startup for one under 16 bytes, but accepts it.
+
+The ticket is read once at startup, and is never logged. Each wrong
+ticket is logged at `info` with the client's address, for tools such
+as fail2ban, at most once every 10 seconds with a count of those
+since the last.
+
+The `--tls-key` file is held to the same rules of ownership and mode.
 
 ## Listeners, TLS and the loopback rule
 
@@ -122,13 +140,31 @@ answers every link with "need secured", which sends a SPICE client
 to the TLS listener. With TLS configured, `--listen` may be any
 address. Clients are not asked for certificates.
 
-At most 8 connections may be in their handshake at once, across both
-listeners; further ones are closed immediately, and the refusals are
-logged at most every 10 seconds. Every step of the handshake has a
-10 second limit.
+Unauthenticated connections are limited, so that no one peer can
+lock others out:
+
+- at most 8 connections may be in their handshake at once on the
+  listeners that serve SPICE;
+- with TLS configured, the plain listener's redirects have their own
+  limit of 4, so a flood of the plain port cannot starve the TLS one;
+- at most 4 connections from one address may be in their handshake
+  at once, on any listener, so that no one address can hold all 8;
+  four lets a client link its main channel and then its display,
+  cursor and inputs channels in parallel, as spice-gtk does. An IPv6
+  address counts by its /64;
+- at most 2 RSA keys for ticket encryption are generated at once.
+
+Connections past a limit are closed immediately, and the refusals
+are logged at most every 10 seconds. The first step of a handshake,
+which a peer can stall without having proved anything, has a 3
+second limit: on the TLS listener the TLS handshake and then the
+SPICE link message each get 3 seconds, and on the plain listener the
+link message does. Every later step has a 10 second limit.
 
 Andris serves one client at a time. A client that authenticates
-replaces the one before it, whose channels are closed.
+replaces the one before it, whose channels are closed. A session
+has at most one channel of each type: a new link of a type the
+session already has replaces, and closes, the old channel.
 
 ## What a client gets
 
@@ -242,3 +278,7 @@ production use:
 [console-sources.md](https://github.com/shakenfist/kerbside/blob/develop/docs/console-sources.md).
 Andris sends only message types that kerbside's allowlist accepts,
 so a session through kerbside needs no special configuration.
+Every connection through kerbside comes from kerbside's address, so
+the limit of 4 handshakes in progress per address applies to all of
+kerbside's clients together; that is enough for one client linking
+its channels in parallel.

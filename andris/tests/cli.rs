@@ -1,5 +1,9 @@
 //! Runs the built andris binary and checks what it prints.
 
+// Test helpers, where a failed unwrap is a failed test. clippy's
+// allow-unwrap-in-tests covers only #[test] functions themselves.
+#![allow(clippy::unwrap_used)]
+
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Output};
@@ -49,4 +53,52 @@ fn ticket_file_open_to_others_is_refused() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("--ticket-file"), "{stderr}");
     assert!(stderr.contains("chmod 600"), "{stderr}");
+}
+
+/// A ticket file of `contents`, mode 0600.
+fn ticket_file(contents: &[u8]) -> NamedTempFile {
+    let mut ticket = NamedTempFile::new().unwrap();
+    ticket.write_all(contents).unwrap();
+    std::fs::set_permissions(ticket.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
+    ticket
+}
+
+/// Run andris on the synthetic platform with `ticket` and `extra`, and
+/// return what it printed to stderr; it must have failed.
+fn refused(ticket: &NamedTempFile, extra: &[&str]) -> String {
+    let path = ticket.path().to_str().unwrap();
+    let mut args = vec!["--ticket-file", path, "--platform", "synthetic"];
+    args.extend_from_slice(extra);
+    let output = andris(&args);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !output.status.success(),
+        "andris {args:?} exited with {}: {stderr}",
+        output.status
+    );
+    stderr
+}
+
+#[test]
+fn non_loopback_listener_without_tls_is_refused() {
+    let ticket = ticket_file(b"a-long-enough-ticket\n");
+    let stderr = refused(&ticket, &["--listen", "0.0.0.0:5900"]);
+    assert!(stderr.contains("--listen 0.0.0.0:5900"), "{stderr}");
+    assert!(stderr.contains("--tls-listen"), "{stderr}");
+}
+
+#[test]
+fn empty_ticket_file_is_refused() {
+    let ticket = ticket_file(b"");
+    let stderr = refused(&ticket, &[]);
+    assert!(stderr.contains("--ticket-file"), "{stderr}");
+    assert!(stderr.contains("is empty"), "{stderr}");
+}
+
+#[test]
+fn ticket_over_sixty_bytes_is_refused() {
+    let ticket = ticket_file(&[b'a'; 61]);
+    let stderr = refused(&ticket, &[]);
+    assert!(stderr.contains("--ticket-file"), "{stderr}");
+    assert!(stderr.contains("at most 60"), "{stderr}");
 }

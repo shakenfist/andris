@@ -230,7 +230,8 @@ impl HeldInput {
 
 impl Drop for HeldInput {
     fn drop(&mut self) {
-        // InputSink::inject only queues, so this cannot block.
+        // InputSink::inject_release only queues, so this cannot block, and
+        // it has room even when a flood has filled the sink's queue.
         let keys = std::mem::take(&mut self.keys)
             .into_iter()
             .map(|code| InputEvent::Key {
@@ -246,7 +247,7 @@ impl Drop for HeldInput {
                 });
         for event in keys.chain(buttons) {
             debug!(?event, "releasing input held when the channel closed");
-            if let Err(e) = self.sink.inject(event) {
+            if let Err(e) = self.sink.inject_release(event) {
                 warn!(
                     error = format!("{e:#}"),
                     "releasing held input failed; the desktop may still hold it"

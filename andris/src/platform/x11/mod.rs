@@ -19,6 +19,13 @@
 //! through `std::sync::mpsc` queues, so [`InputSink::inject`] only
 //! enqueues and never blocks.
 //!
+//! The input queue is bounded, so a client flooding keys cannot grow it
+//! without limit: [`InputSink::inject`] fails once [`INPUT_QUEUE_LIMIT`]
+//! events wait, and the inputs channel that called it closes. Releases
+//! andris owes the desktop go through [`InputSink::inject_release`], which
+//! may use [`RELEASE_RESERVE`] more. Both share one FIFO, so a release
+//! never overtakes the press it undoes; see [`InputQueue`].
+//!
 //! A thread whose connection fails logs that once and exits; every later
 //! call to it returns an error. An error the X server returns for one
 //! request fails that request only.
@@ -40,10 +47,11 @@ mod keymap;
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 use x11rb::connection::{Connection, RequestConnection};
@@ -63,11 +71,18 @@ use super::{
 use checks::ServerFacts;
 use keymap::{KeyName, Keymap, Unmapped};
 
+/// How many events [`InputSink::inject`] lets wait for the input thread.
+pub const INPUT_QUEUE_LIMIT: usize = 8192;
+
+/// How many more events [`InputSink::inject_release`] may queue beyond
+/// [`INPUT_QUEUE_LIMIT`]. Ample for every key and button held at once.
+pub const RELEASE_RESERVE: usize = 512;
+
 /// The X11 platform. Create it with [`X11Platform::connect`] and hand the
 /// server [`X11Platform::platform`].
 pub struct X11Platform {
     capture: Sender<CaptureRequest>,
-    input: Sender<InputRequest>,
+    input: InputQueue,
     cursor: CursorReceiver,
     /// The cursor thread's connection, kept to wake that thread on drop.
     cursor_conn: Arc<RustConnection>,
@@ -113,7 +128,7 @@ impl X11Platform {
         spawn("andris-x11-capture", move || {
             serve_capture(capture_conn, root, capture_queue)
         })?;
-        let (input, input_queue) = mpsc::channel();
+        let (input, input_queue) = InputQueue::new();
         spawn("andris-x11-input", move || {
             serve_input(injector, input_queue)
         })?;
@@ -176,13 +191,15 @@ impl FrameSource for X11Platform {
 
 impl InputSink for X11Platform {
     fn inject(&self, event: InputEvent) -> Result<()> {
-        self.input
-            .send(InputRequest::Event(event))
-            .map_err(|_| stopped("input"))
+        self.input.push(event, INPUT_QUEUE_LIMIT)
+    }
+
+    fn inject_release(&self, event: InputEvent) -> Result<()> {
+        self.input.push(event, INPUT_QUEUE_LIMIT + RELEASE_RESERVE)
     }
 
     fn lock_state(&self) -> Result<LockState> {
-        round_trip(&self.input, "input", InputRequest::LockState)
+        round_trip(&self.input.requests, "input", InputRequest::LockState)
     }
 }
 
@@ -206,6 +223,91 @@ enum InputRequest {
     Event(InputEvent),
     /// Read the lock state, after every event queued before this.
     LockState(SyncSender<Result<LockState>>),
+}
+
+/// The sending end of the input thread's queue.
+///
+/// One unbounded FIFO, bounded instead by counting the events in it: an
+/// event is counted when queued and uncounted when the input thread takes
+/// it. [`InputQueue::push`] refuses an event once `limit` are counted, so
+/// [`InputSink::inject`] and [`InputSink::inject_release`] differ only in
+/// the limit they pass. A second queue for releases, drained first, would
+/// let a release overtake its own press still waiting here, leaving the
+/// key held. Lock-state reads are not counted: each caller blocks for its
+/// answer, so there are never more than there are callers.
+struct InputQueue {
+    requests: Sender<InputRequest>,
+    queued: Arc<AtomicUsize>,
+}
+
+/// The input thread's end of an [`InputQueue`].
+struct InputReceiver {
+    requests: Receiver<InputRequest>,
+    queued: Arc<AtomicUsize>,
+}
+
+impl InputQueue {
+    fn new() -> (Self, InputReceiver) {
+        let (requests, receiver) = mpsc::channel();
+        let queued = Arc::new(AtomicUsize::new(0));
+        (
+            Self {
+                requests,
+                queued: queued.clone(),
+            },
+            InputReceiver {
+                requests: receiver,
+                queued,
+            },
+        )
+    }
+
+    /// Queue `event`, unless `limit` events are already queued.
+    fn push(&self, event: InputEvent, limit: usize) -> Result<()> {
+        let mut queued = self.queued.load(Ordering::Acquire);
+        loop {
+            if queued >= limit {
+                bail!("the X11 input queue is full: {limit} events are waiting to be injected");
+            }
+            match self.queued.compare_exchange_weak(
+                queued,
+                queued + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(now) => queued = now,
+            }
+        }
+        if self.requests.send(InputRequest::Event(event)).is_err() {
+            self.queued.fetch_sub(1, Ordering::AcqRel);
+            return Err(stopped("input"));
+        }
+        Ok(())
+    }
+}
+
+impl InputReceiver {
+    /// Uncount `request` if it is an event.
+    fn taken(&self, request: InputRequest) -> InputRequest {
+        if matches!(request, InputRequest::Event(_)) {
+            self.queued.fetch_sub(1, Ordering::AcqRel);
+        }
+        request
+    }
+
+    /// The next request, waiting for one; `None` once the queue closes.
+    fn recv(&self) -> Option<InputRequest> {
+        self.requests.recv().ok().map(|request| self.taken(request))
+    }
+
+    /// The next request, if one is waiting.
+    fn try_recv(&self) -> Option<InputRequest> {
+        self.requests
+            .try_recv()
+            .ok()
+            .map(|request| self.taken(request))
+    }
 }
 
 /// The error for a call to a backend thread that has stopped.
@@ -618,8 +720,8 @@ fn x_button(button: Button) -> u8 {
 /// Serve input requests until the queue closes or the connection fails,
 /// flushing after each batch: every request already queued when the
 /// thread wakes.
-fn serve_input(mut injector: Injector, requests: Receiver<InputRequest>) {
-    while let Ok(first) = requests.recv() {
+fn serve_input(mut injector: Injector, requests: InputReceiver) {
+    while let Some(first) = requests.recv() {
         let mut next = Some(first);
         while let Some(request) = next {
             let gone = match request {
@@ -635,7 +737,7 @@ fn serve_input(mut injector: Injector, requests: Receiver<InputRequest>) {
                 );
                 return;
             }
-            next = requests.try_recv().ok();
+            next = requests.try_recv();
         }
         if let Err(e) = injector.finish_batch() {
             error!(
@@ -839,6 +941,76 @@ mod tests {
         .map(x_button)
         .collect();
         assert_eq!(numbers, [1, 2, 3, 4, 5, 8, 9]);
+    }
+
+    fn key(code: u16, pressed: bool) -> InputEvent {
+        InputEvent::Key {
+            code: crate::platform::EvdevCode(code),
+            pressed,
+        }
+    }
+
+    /// Every event waiting in `queue`, in order.
+    fn drain(queue: &InputReceiver) -> Vec<InputEvent> {
+        std::iter::from_fn(|| queue.try_recv())
+            .filter_map(|request| match request {
+                InputRequest::Event(event) => Some(event),
+                InputRequest::LockState(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_full_input_queue_refuses_events_but_keeps_room_for_releases() {
+        let (queue, receiver) = InputQueue::new();
+        // A key held, then a flood that fills the queue.
+        queue.push(key(30, true), INPUT_QUEUE_LIMIT).unwrap();
+        for _ in 1..INPUT_QUEUE_LIMIT {
+            queue
+                .push(
+                    InputEvent::PointerRelative { dx: 1, dy: 0 },
+                    INPUT_QUEUE_LIMIT,
+                )
+                .unwrap();
+        }
+        let error = queue
+            .push(key(31, true), INPUT_QUEUE_LIMIT)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("input queue is full"), "{error}");
+        // A client's own release is refused like any other event.
+        assert!(queue.push(key(30, false), INPUT_QUEUE_LIMIT).is_err());
+
+        // The release andris owes still gets through, after the press.
+        let platform_limit = INPUT_QUEUE_LIMIT + RELEASE_RESERVE;
+        queue.push(key(30, false), platform_limit).unwrap();
+        let events = drain(&receiver);
+        assert_eq!(events.len(), INPUT_QUEUE_LIMIT + 1);
+        assert_eq!(events.first(), Some(&key(30, true)));
+        assert_eq!(events.last(), Some(&key(30, false)));
+
+        // Drained, the queue takes events again.
+        queue.push(key(31, true), INPUT_QUEUE_LIMIT).unwrap();
+        assert_eq!(drain(&receiver), vec![key(31, true)]);
+    }
+
+    #[test]
+    fn the_release_reserve_is_bounded_too() {
+        let (queue, _receiver) = InputQueue::new();
+        let limit = INPUT_QUEUE_LIMIT + RELEASE_RESERVE;
+        for _ in 0..limit {
+            queue.push(key(30, false), limit).unwrap();
+        }
+        assert!(queue.push(key(30, false), limit).is_err());
+    }
+
+    #[test]
+    fn a_stopped_input_thread_uncounts_the_event() {
+        let (queue, receiver) = InputQueue::new();
+        drop(receiver);
+        let error = queue.push(key(30, true), 1).unwrap_err().to_string();
+        assert!(error.contains("input thread has stopped"), "{error}");
+        assert_eq!(queue.queued.load(Ordering::Acquire), 0);
     }
 
     #[test]

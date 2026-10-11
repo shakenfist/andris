@@ -6,7 +6,13 @@
 //! handler against [`Session::cancelled`], so cancelling a session drops
 //! each of its channels' sockets without a message, as spice-server
 //! does when a new client replaces an old one.
+//!
+//! A session holds at most one channel of each type. A new link of a
+//! type the session already has replaces the old channel: claiming the
+//! type with [`Session::claim_channel`] cancels the previous claim, whose
+//! task then drops its handler and socket, running its `Drop` guards.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -14,6 +20,8 @@ use anyhow::{Result, bail};
 use shakenfist_spice_protocol::{MOUSE_MODE_CLIENT, MOUSE_MODE_SERVER};
 use tokio::sync::watch;
 use tracing::info;
+
+use super::link::ServedChannel;
 
 /// A one-way cancel signal that any number of tasks can await.
 ///
@@ -89,6 +97,8 @@ pub struct Session {
     started: Instant,
     mouse_mode: watch::Sender<MouseMode>,
     cancel: Cancel,
+    /// The channel serving each type, by its claim's cancel signal.
+    channels: Mutex<HashMap<ServedChannel, Arc<Cancel>>>,
 }
 
 impl Session {
@@ -98,6 +108,36 @@ impl Session {
             started: Instant::now(),
             mouse_mode: watch::Sender::new(MouseMode::Client),
             cancel: Cancel::new(),
+            channels: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn channels(&self) -> MutexGuard<'_, HashMap<ServedChannel, Arc<Cancel>>> {
+        // Each update is a single insert or remove, so a panic while
+        // holding the lock cannot leave the map half-updated.
+        self.channels
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Claim `channel` for a newly linked channel, cancelling the claim of
+    /// the channel of that type already serving, if any. The returned
+    /// claim's [`ChannelClaim::replaced`] returns once a later link claims
+    /// the type in turn.
+    pub fn claim_channel(self: &Arc<Self>, channel: ServedChannel) -> ChannelClaim {
+        let cancel = Arc::new(Cancel::new());
+        if let Some(old) = self.channels().insert(channel, cancel.clone()) {
+            info!(
+                session = self.id,
+                channel = channel.name(),
+                "a new link replaces the session's channel of this type"
+            );
+            old.cancel();
+        }
+        ChannelClaim {
+            session: self.clone(),
+            channel,
+            cancel,
         }
     }
 
@@ -136,6 +176,39 @@ impl Session {
     /// Return once the session has been cancelled. Cancel-safe.
     pub async fn cancelled(&self) {
         self.cancel.cancelled().await
+    }
+}
+
+/// A channel's hold on its type within a session. Dropping it frees the
+/// type, unless a later claim has already taken it.
+#[derive(Debug)]
+pub struct ChannelClaim {
+    session: Arc<Session>,
+    channel: ServedChannel,
+    cancel: Arc<Cancel>,
+}
+
+impl ChannelClaim {
+    /// Return once a later link has claimed this channel's type.
+    /// Cancel-safe.
+    pub async fn replaced(&self) {
+        self.cancel.cancelled().await
+    }
+
+    pub fn is_replaced(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+}
+
+impl Drop for ChannelClaim {
+    fn drop(&mut self) {
+        let mut channels = self.session.channels();
+        if channels
+            .get(&self.channel)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.cancel))
+        {
+            channels.remove(&self.channel);
+        }
     }
 }
 
@@ -289,6 +362,31 @@ mod tests {
         assert!(session.is_cancelled());
         assert!(registry.begin().is_err());
         assert_eq!(registry.current_id(), None);
+    }
+
+    #[test]
+    fn a_second_claim_replaces_the_first() {
+        let session = SessionRegistry::new().begin().unwrap();
+        let first = session.claim_channel(ServedChannel::Display);
+        let inputs = session.claim_channel(ServedChannel::Inputs);
+        assert!(!first.is_replaced());
+
+        let second = session.claim_channel(ServedChannel::Display);
+        assert!(first.is_replaced());
+        assert!(!second.is_replaced());
+        assert!(!inputs.is_replaced(), "other types are untouched");
+
+        // The replaced claim's drop leaves the new one in place.
+        drop(first);
+        let third = session.claim_channel(ServedChannel::Display);
+        assert!(second.is_replaced());
+
+        // Once dropped, a type is free and a new claim replaces nothing.
+        drop(third);
+        drop(second);
+        assert!(session.channels().get(&ServedChannel::Display).is_none());
+        let fourth = session.claim_channel(ServedChannel::Display);
+        assert!(!fourth.is_replaced());
     }
 
     #[test]

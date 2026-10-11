@@ -79,17 +79,21 @@ DOCKER_RUN := docker run --rm $(DOCKER_BASE_ARGS) $(WORKSPACE_MOUNT_RW) $(CACHE_
 # Networked invocation for `ryll-headless`, which compiles ryll and its
 # dependency tree with the network up. It is not DOCKER_RUN: that mounts
 # the checkout and the shared crate cache writable, which is safe only
-# because nothing compiles under it. This mounts neither, only the ryll
-# directory of the cargo cache, and the recipe points CARGO_HOME into
-# the per-revision directory there, so ryll's build scripts can reach
-# nothing that andris's own compiles later trust: not .git, not the
-# sources, and not the crates the offline targets read.
+# because nothing compiles under it. This mounts neither, only the one
+# per-revision staging directory, $(RYLL_DIR)/$(RYLL_REV).tmp, and the
+# recipe points CARGO_HOME and the install root into it, so ryll's build
+# scripts can reach nothing that andris's own compiles later trust: not
+# .git, not the sources, not the crates the offline targets read, and not
+# the ryll binary of any other revision, which a build script could
+# otherwise plant for a later `make e2e` to run. The rename of the staging
+# directory into place happens on the host, outside the container.
 DOCKER_RUN_RYLL := docker run --rm \
 	-w /build/ryll \
 	-u $(UID):$(GID) \
 	-e HOME=/build \
 	-e CARGO_BUILD_JOBS \
-	-v "$(RYLL_DIR)":/build/ryll
+	-e CARGO_HOME=/build/ryll/cargo-home \
+	-v "$(RYLL_DIR)/$(RYLL_REV).tmp":/build/ryll
 
 # Offline invocation for the targets that compile crates: build,
 # release, test and lint. A build script (build.rs) runs arbitrary code
@@ -232,11 +236,13 @@ lint-fix: fetch
 
 # Build ryll's slim headless client (no GUI, audio or capture) at the
 # revision Cargo.lock pins, for `make e2e`. Skipped when that revision's
-# binary already exists. Installed into <rev>.tmp and renamed into place
-# only once complete, so an interrupted build is never mistaken for a
-# finished one. CARGO_HOME sits inside the per-revision directory, apart
-# from andris's crate cache (see DOCKER_RUN_RYLL), and is removed once the
-# binary is installed, so the cache keeps only the binary.
+# binary already exists. Installed into <rev>.tmp, the only directory the
+# build container sees, and renamed into place on the host only once
+# complete, so an interrupted build is never mistaken for a finished one.
+# The staging directory is created here first, so docker does not create
+# it owned by root. CARGO_HOME sits inside it, apart from andris's crate
+# cache (see DOCKER_RUN_RYLL), and is removed once the binary is
+# installed, so the cache keeps only the binary.
 ryll-headless: ensure-cache
 	@echo "$(RYLL_REV)" | grep -Eqx '[0-9a-f]{40}' || { \
 		echo "could not read ryll's revision from Cargo.lock (got '$(RYLL_REV)')" >&2; \
@@ -247,12 +253,12 @@ ryll-headless: ensure-cache
 		echo "ryll already built: $(RYLL_BIN)"; \
 	else \
 		rm -rf "$(RYLL_DIR)/$(RYLL_REV).tmp" && \
+		mkdir -p "$(RYLL_DIR)/$(RYLL_REV).tmp" && \
 		$(DOCKER_RUN_RYLL) \
-			-e CARGO_HOME=/build/ryll/$(RYLL_REV).tmp/cargo-home \
 			$(ANDRIS_IMAGE) \
 			cargo install --locked --git https://github.com/shakenfist/ryll \
 				--rev $(RYLL_REV) --no-default-features ryll \
-				--root /build/ryll/$(RYLL_REV).tmp && \
+				--root /build/ryll && \
 		rm -rf "$(RYLL_DIR)/$(RYLL_REV).tmp/cargo-home" "$(RYLL_DIR)/$(RYLL_REV)" && \
 		mv "$(RYLL_DIR)/$(RYLL_REV).tmp" "$(RYLL_DIR)/$(RYLL_REV)" && \
 		echo "ryll built: $(RYLL_BIN)"; \

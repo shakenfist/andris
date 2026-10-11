@@ -20,9 +20,9 @@
 //!
 //! - a method that **may block** (an X round trip, a capture) is called
 //!   from async code through `tokio::task::spawn_blocking`;
-//! - [`InputSink::inject`] **never blocks**: an implementation only
-//!   queues the event. It can be called from async code directly, and
-//!   from a `Drop` implementation;
+//! - [`InputSink::inject`] and [`InputSink::inject_release`] **never
+//!   block**: an implementation only queues the event. They can be called
+//!   from async code directly, and from a `Drop` implementation;
 //! - [`CursorSource::subscribe`] never blocks, and its receiver is
 //!   awaited.
 //!
@@ -296,11 +296,28 @@ pub trait FrameSource: Send + Sync {
 }
 
 /// Injects input into the desktop.
+///
+/// An implementation's queue may be bounded, so that a client flooding
+/// input cannot grow it without limit. A release andris owes the desktop
+/// must not be lost to that bound, or a key would stay held: those go
+/// through [`InputSink::inject_release`], for which an implementation
+/// keeps room beyond what [`InputSink::inject`] may fill.
 pub trait InputSink: Send + Sync {
     /// Queue one event. Never blocks; events are applied in the order
-    /// they are queued. An error means the sink can take no more input,
-    /// for instance because its connection to the display has gone.
+    /// they are queued, whichever method queued them. An error means the
+    /// sink can take no more input: its queue is full, or its connection
+    /// to the display has gone.
     fn inject(&self, event: InputEvent) -> Result<()>;
+
+    /// Queue the release of a key or button andris pressed: one held when
+    /// a channel closes, or the second half of a lock-key toggle. Never
+    /// blocks, and is applied after every event already queued. Unlike
+    /// [`InputSink::inject`] it does not fail merely because the queue is
+    /// full. Callers pass only releases, so there are never more of these
+    /// queued than keys and buttons held.
+    fn inject_release(&self, event: InputEvent) -> Result<()> {
+        self.inject(event)
+    }
 
     /// The desktop's current lock state, read after every event already
     /// queued has been applied. May block.
@@ -322,7 +339,7 @@ pub trait InputSink: Send + Sync {
                     code,
                     pressed: true,
                 })?;
-                self.inject(InputEvent::Key {
+                self.inject_release(InputEvent::Key {
                     code,
                     pressed: false,
                 })?;

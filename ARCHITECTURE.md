@@ -17,9 +17,9 @@ SPICE.
 
 | Component | Where | What it does |
 |-----------|-------|--------------|
-| Configuration | `config.rs` | Command-line options and the checks across them: the TLS options go together, a plain listener must be loopback, the ticket file must be private and at most 60 bytes |
-| Listener and link | `server/mod.rs`, `link.rs`, `tls.rs` | One accept task per listener. A connection holds one of 8 handshake permits while it links and authenticates with the ticket, with a time limit on every step. With TLS configured the plain listener only redirects clients to the TLS listener |
-| Session registry | `server/session.rs` | Holds the one session served at a time. A main-channel link that authenticates begins a session and cancels the previous one; secondary channels must name the session's id. The session carries the mouse mode and a cancel signal every channel task races against |
+| Configuration | `config.rs` | Command-line options and the checks across them: the TLS options go together, a plain listener must be loopback, the ticket file and TLS key must be private to andris's user, and the ticket at most 60 bytes |
+| Listener and link | `server/mod.rs`, `link.rs`, `tls.rs` | One accept task per listener. A connection holds one of 8 handshake permits, and one of 4 slots for its source address, while it links and authenticates with the ticket, with a time limit on every step and a delay before a wrong ticket is refused. With TLS configured the plain listener only redirects clients to the TLS listener, under its own permits |
+| Session registry | `server/session.rs` | Holds the one session served at a time. A main-channel link that authenticates begins a session and cancels the previous one; secondary channels must name the session's id. The session carries the mouse mode and a cancel signal every channel task races against, and holds one channel of each type: a new link of a type replaces the old channel |
 | Channel framing | `server/channel.rs`, `opcodes.rs` | Mini-header message framing, the messages every channel shares, and the ack window. Each channel sends only variants of its own opcode enum |
 | Main channel | `server/main_channel.rs` | `INIT`, the channel list, mouse mode and pings |
 | Display channel | `server/display.rs` | The primary surface and the frame timer |
@@ -28,7 +28,7 @@ SPICE.
 | Cursor channel | `server/cursor.rs` | Sends each cursor shape the platform reports as an alpha cursor |
 | Platform traits | `platform/mod.rs` | `DisplayGeometry`, `FrameSource`, `InputSink` and `CursorSource`, bundled as a `Platform`. They use no SPICE types, and keys cross them as Linux evdev codes |
 | Synthetic platform | `platform/synthetic.rs` | A deterministic test pattern, an input sink that records events, and one cursor shape; for tests, load testing and `--platform synthetic` |
-| X11 platform | `platform/x11/` | `GetImage` capture, XTEST input, XFIXES cursor and XKB key names, each on its own connection and thread; refuses an X server it cannot read as BGRX |
+| X11 platform | `platform/x11/` | `GetImage` capture, XTEST input, XFIXES cursor and XKB key names, each on its own connection and thread; the input queue is bounded, with room kept for releases; refuses an X server it cannot read as BGRX |
 
 Around the code: `Makefile` and `.devcontainer/` run cargo in a
 container; `scripts/e2e.sh` drives the end-to-end test;

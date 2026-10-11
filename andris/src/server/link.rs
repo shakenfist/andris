@@ -6,7 +6,14 @@
 //! carrying a fresh RSA key, read and check the ticket, and send the
 //! verdict. Every read and write has a time limit, because the peer is
 //! not yet authenticated.
+//!
+//! A wrong ticket is answered only after [`HandshakeTimeouts::wrong_ticket`],
+//! with the connection's handshake slot still held, so that together with
+//! the per-address cap on handshakes in progress a peer can only guess
+//! slowly. RSA key generation, the costliest step, is capped separately
+//! by a semaphore the caller passes in.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,15 +25,50 @@ use shakenfist_spice_protocol::link::{
 use shakenfist_spice_protocol::reader::LinkError;
 use shakenfist_spice_protocol::{ChannelType, SpiceError, capabilities};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::Semaphore;
 use tracing::{debug, info};
 
+use super::LogThrottle;
 use super::channel::ClientCaps;
 use super::session::{Session, SessionRegistry};
 use crate::config::Ticket;
 
-/// How long each stage of the handshake may take: the link message, the
-/// reply and ticket together, and the verdict.
-pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The time limits on a connection's handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandshakeTimeouts {
+    /// Each first stage, which a peer can stall without having proved
+    /// anything: the TLS accept on the TLS listener, then on every
+    /// listener reading the link message. Each gets this limit on its own.
+    pub first_stage: Duration,
+    /// Each later stage: waiting to generate a key, the reply and ticket
+    /// together, and the verdict.
+    pub stage: Duration,
+    /// How long a client whose ticket is wrong waits to be told so.
+    pub wrong_ticket: Duration,
+}
+
+impl Default for HandshakeTimeouts {
+    fn default() -> Self {
+        Self {
+            first_stage: Duration::from_secs(3),
+            stage: Duration::from_secs(10),
+            wrong_ticket: Duration::from_secs(1),
+        }
+    }
+}
+
+/// What a handshake needs from the server besides the connection.
+pub struct HandshakeContext<'a> {
+    pub registry: &'a SessionRegistry,
+    pub ticket: &'a Ticket,
+    pub timeouts: HandshakeTimeouts,
+    /// Permits to generate a ticket key; one is held for each generation.
+    pub key_generations: &'a Arc<Semaphore>,
+    /// Throttles the log line for a wrong ticket.
+    pub wrong_tickets: &'a LogThrottle,
+    /// The peer, for the log.
+    pub peer: SocketAddr,
+}
 
 /// `SPICE_INPUTS_CAP_KEY_SCANCODE`, bit 0 of the inputs channel's
 /// capabilities (spice-protocol's `spice/enums.h`). Ryll's crate does not
@@ -57,7 +99,7 @@ const DISPLAY_CAPS: [u32; 1] = [capabilities::DISPLAY_MONITORS_CONFIG
 const INPUTS_CAPS: [u32; 1] = [INPUTS_CAP_KEY_SCANCODE];
 
 /// The channels andris serves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ServedChannel {
     Main,
     Display,
@@ -128,19 +170,24 @@ fn is_bad_ticket(error: &anyhow::Error) -> bool {
     )
 }
 
-/// Run `fut` under [`HANDSHAKE_TIMEOUT`], naming `what` on a timeout.
-async fn timed<T>(what: &str, fut: impl Future<Output = Result<T>>) -> Result<T> {
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, fut)
+/// Run `fut` under `limit`, naming `what` on a timeout.
+pub async fn timed<T>(
+    limit: Duration,
+    what: &str,
+    fut: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout(limit, fut)
         .await
         .with_context(|| format!("{what} timed out"))?
 }
 
 /// Send a link reply carrying only `error`.
-async fn refuse<S>(stream: &mut S, error: SpiceError) -> Result<Option<Linked>>
+async fn refuse<S>(stream: &mut S, limit: Duration, error: SpiceError) -> Result<Option<Linked>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     timed(
+        limit,
         "sending a link refusal",
         send_link_reply(stream, &SpiceLinkReply::error_reply(error)),
     )
@@ -148,28 +195,36 @@ where
     Ok(None)
 }
 
-/// Link and authenticate one connection.
+/// Link and authenticate one connection, reading its link message within
+/// the first-stage limit.
 ///
 /// Returns `Ok(None)` when the client was refused and told why, and an
 /// error when the connection failed or stalled. A main channel that
 /// authenticates begins a new session, replacing the current one.
-pub async fn handshake<S>(
-    stream: &mut S,
-    registry: &SessionRegistry,
-    ticket: &Ticket,
-) -> Result<Option<Linked>>
+///
+/// Refusals before the ticket is checked log at debug level only: an
+/// unauthenticated peer can provoke them as fast as it can connect.
+pub async fn handshake<S>(stream: &mut S, ctx: &HandshakeContext<'_>) -> Result<Option<Linked>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let link = timed("reading the link message", read_link_mess(stream)).await?;
+    let stage = ctx.timeouts.stage;
+    let registry = ctx.registry;
+    let link = timed(
+        ctx.timeouts.first_stage,
+        "reading the link message",
+        read_link_mess(stream),
+    )
+    .await?;
 
     let common = link.common_caps.first().copied().unwrap_or(0);
     if common & REQUIRED_CLIENT_CAPS != REQUIRED_CLIENT_CAPS {
-        info!(
+        debug!(
+            peer = %ctx.peer,
             common_caps = ?link.common_caps,
             "refusing a client without AUTH_SELECTION and MINI_HEADER"
         );
-        return refuse(stream, SpiceError::VersionMismatch).await;
+        return refuse(stream, stage, SpiceError::VersionMismatch).await;
     }
 
     let Some(channel) = ChannelType::from_u8(link.channel_type).and_then(ServedChannel::from_type)
@@ -178,7 +233,7 @@ where
             channel_type = link.channel_type,
             "refusing a channel andris does not serve"
         );
-        return refuse(stream, SpiceError::ChannelUnavailable).await;
+        return refuse(stream, stage, SpiceError::ChannelUnavailable).await;
     };
     if link.channel_id != 0 {
         debug!(
@@ -186,7 +241,7 @@ where
             channel_id = link.channel_id,
             "refusing a channel id other than 0"
         );
-        return refuse(stream, SpiceError::ChannelUnavailable).await;
+        return refuse(stream, stage, SpiceError::ChannelUnavailable).await;
     }
 
     // A secondary channel must name the current session.
@@ -200,17 +255,30 @@ where
                     connection_id = link.connection_id,
                     "refusing a channel for a session that is not current"
                 );
-                return refuse(stream, SpiceError::BadConnectionId).await;
+                return refuse(stream, stage, SpiceError::BadConnectionId).await;
             }
         },
     };
 
     // RSA key generation takes long enough to stall a runtime thread. A
     // fresh key for each connection, never reused (RUSTSEC-2023-0071).
-    let (key, public_der) = tokio::task::spawn_blocking(generate_ticket_keypair)
-        .await
-        .context("the key generation task failed")?
-        .context("generating the ticket key")?;
+    // The permit moves into the blocking task, so it is held for as long
+    // as the generation runs, even if this handshake is dropped meanwhile.
+    let permit = timed(stage, "waiting to generate a ticket key", async {
+        ctx.key_generations
+            .clone()
+            .acquire_owned()
+            .await
+            .context("the key generation semaphore is closed")
+    })
+    .await?;
+    let (key, public_der) = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        generate_ticket_keypair()
+    })
+    .await
+    .context("the key generation task failed")?
+    .context("generating the ticket key")?;
 
     let reply = SpiceLinkReply {
         error: SpiceError::Ok,
@@ -218,7 +286,7 @@ where
         common_caps: REPLY_COMMON_CAPS.to_vec(),
         channel_caps: channel.reply_caps().to_vec(),
     };
-    let password = timed("the link reply and ticket", async {
+    let password = timed(stage, "the link reply and ticket", async {
         send_link_reply(stream, &reply).await?;
         match read_auth_ticket(stream, &key).await {
             Ok(password) => Ok(Some(password)),
@@ -229,13 +297,21 @@ where
     .await?;
 
     let accepted =
-        password.is_some_and(|password| ticket_matches(password.as_bytes(), ticket.as_bytes()));
+        password.is_some_and(|password| ticket_matches(password.as_bytes(), ctx.ticket.as_bytes()));
     if !accepted {
-        info!(
-            channel = channel.name(),
-            "refusing a client whose ticket is wrong"
-        );
+        if let Some(refused) = ctx.wrong_tickets.should_log() {
+            info!(
+                peer = %ctx.peer,
+                channel = channel.name(),
+                refused,
+                "refusing a client whose ticket is wrong (logged at most every {}s)",
+                LogThrottle::INTERVAL.as_secs()
+            );
+        }
+        // The caller's handshake slot stays held through this wait.
+        tokio::time::sleep(ctx.timeouts.wrong_ticket).await;
         timed(
+            stage,
             "sending the auth result",
             send_auth_result(stream, SpiceError::PermissionDenied),
         )
@@ -260,6 +336,7 @@ where
         }
     };
     let sent = timed(
+        stage,
         "sending the auth result",
         send_auth_result(stream, SpiceError::Ok),
     )

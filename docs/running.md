@@ -215,8 +215,8 @@ new size. A slow client is not flooded: while too much is
 unacknowledged, no frame starts, and changes merge until the client
 catches up, when one frame brings it up to date. A capture that fails,
 as one can while the desktop is being resized, is retried and logged
-as a warning; the display channel closes after ten failures in a row,
-or at once if the connection to the X display has gone.
+as a warning; the display channel closes after ten failed captures in a row,
+frame or scrub, or at once if the connection to the X display has gone.
 
 **The scrub.** The X server does not report every change, so andris
 also re-reads the whole desktop every four seconds, in 16 slices of
@@ -225,15 +225,17 @@ sent, and any tile that differs is sent in the next frame as if it had
 been reported. A change damage missed therefore reaches the client
 within about four seconds. The scrub runs even on a still desktop,
 where it sends nothing but still costs a slice's capture and
-comparison each tick (see [High CPU use](#high-cpu-use)).
+comparison each tick (see [High CPU use](#high-cpu-use)). It
+pauses while the client is behind (the ack window is full) and for a
+moment after a failed capture.
 
 **JPEG.** Andris sends JPEG, at `--jpeg-quality`,
 only when the client leaves the choice of compression to the server:
-it has asked for none, or for `auto-glz` (ryll's default) or
+it has sent no compression preference, or has asked for `auto-glz` (ryll's default) or
 `auto-lz`. A client that asks for a particular compression (`lz4`,
-say) gets lossless images only, and `--jpeg-quality 0` turns JPEG off
-for every client. A rectangle goes as JPEG when it is at least one
-64x64 tile, LZ4 would save less than half of its bytes, and the JPEG
+say) gets lossless images only, and one that asks for `OFF` gets bitmaps, and `--jpeg-quality 0` turns JPEG off
+for every client. A rectangle goes as JPEG when it covers at least 4096
+pixels and its shortest side is at least 16 pixels, LZ4 would save less than half of its bytes, and the JPEG
 is at most half the size of what would otherwise be sent. Text and
 user interface compress far better than that, so they are never sent
 as JPEG; photographs are. Smooth gradients compress well
@@ -291,7 +293,7 @@ Ryll's protocol crate also does not yet name the inputs channel's
 
 While a client is receiving frames, andris logs one line at info every
 10 seconds, and one more when the session ends, for the whole session.
-Nothing is logged for an interval in which no frame was sent, so an
+Nothing is logged for an interval in which no frame or refresh was sent, so an
 idle desktop is silent. A line reads:
 
 ```
@@ -342,7 +344,7 @@ line and the startup log:
   damage, so the scrub is doing real work; a `changed` figure that is
   low means damage reports are coarse and most of each capture is
   unchanged.
-- No metrics line at all means no frame was sent in the interval, so
+- No metrics line at all means no frame or refresh was sent in the interval, so
   any CPU use is the scrub's.
 
 ## Connecting with ryll

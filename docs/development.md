@@ -56,8 +56,8 @@ file. Last, it asserts, over ryll's control socket:
 
 - **frames**: a frame of the window arrived;
 - **keys**: two keys reached the window;
-- **idle silence**: with nothing changing, no draw arrives for several
-  seconds, since andris sends frames only on damage;
+- **idle silence**: with nothing changing, once the desktop has settled (the
+  driver waits for quiet first), no draw arrives for two seconds, since andris sends frames only on damage;
 - **a small change**: a key makes the window repaint a 64x64 square,
   which must reach the client in fewer draws than there are 64-row
   bands in the screen.

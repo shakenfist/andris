@@ -15,9 +15,12 @@
 # display, reporting which capture method andris chose; and ryll --headless
 # against andris, through a .vv file because a password needs one.
 # scripts/e2e-drive.py then asserts over ryll's control socket that a
-# frame of the window arrived and that two keys reached it. It also checks
-# ryll's log for all four channels, since nothing else uses the cursor
-# channel. Last, ryll and andris are stopped with SIGINT and must exit 0.
+# frame of the window arrived, that two keys reached it, that an idle
+# desktop is silent for two seconds once it has settled, and that a small
+# change arrives as few draws. It also checks ryll's log for all four
+# channels, since nothing else uses the cursor channel. Last, ryll and
+# andris are stopped with SIGINT and must exit 0, and andris's log must
+# hold the session-end metrics line.
 #
 # It fails if any step fails or times out, if any process exits before it
 # is stopped, or if andris logged an ERROR. On failure it prints every log.
@@ -227,6 +230,13 @@ if sed 's/\x1b\[[0-9;]*m//g' "$work/andris.log" | grep ' ERROR ' >/dev/null; the
     say "FAIL: andris logged an ERROR"
     exit 1
 fi
+
+# 10. Ending the session, which stopping ryll did, logs the metrics.
+if ! sed 's/\x1b\[[0-9;]*m//g' "$work/andris.log" | grep 'session ends after .*kB written in all' >/dev/null; then
+    say "FAIL: andris never logged the session-end metrics line"
+    exit 1
+fi
+say "andris logged the session-end metrics line"
 
 passed=true
 say "PASS"

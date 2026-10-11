@@ -3,7 +3,8 @@
 //! Four traits separate the SPICE server from the display system:
 //!
 //! - [`DisplayGeometry`] reports the size of the desktop;
-//! - [`FrameSource`] captures the whole desktop as BGRX;
+//! - [`ScreenSource`] reports where the desktop changed, as damage, and
+//!   captures parts of it, or all of it, as BGRX;
 //! - [`InputSink`] injects keys, pointer motion and buttons, and reads
 //!   the lock-key state;
 //! - [`CursorSource`] yields the cursor shape as it changes.
@@ -24,22 +25,30 @@
 //!   block**: an implementation only queues the event. They can be called
 //!   from async code directly, and from a `Drop` implementation;
 //! - [`CursorSource::subscribe`] never blocks, and its receiver is
-//!   awaited.
+//!   awaited;
+//! - [`ScreenSource::subscribe_damage`] never blocks, and its
+//!   [`DamageSubscription::changed`] is awaited.
+//!
+//! [`damage`] holds the types damage is reported in, and how it is
+//! accumulated.
 //!
 //! This module knows nothing of SPICE. Mapping SPICE's scancodes, button
 //! ids and modifier flags onto these types is the server's job.
 
+pub mod damage;
 pub mod synthetic;
 pub mod x11;
 
 use std::sync::Arc;
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 // Plain constants, so that a frame andris captures is never larger than
 // what the encoders and ryll's decoders accept. No ryll type crosses this
 // module's interface.
 use shakenfist_spice_compression::{MAX_IMAGE_DIMENSION, MAX_IMAGE_PIXELS};
 use tokio::sync::watch;
+
+pub use damage::{DamageHub, DamageSubscription, Rectangle, Region, TILE};
 
 /// The size of a desktop or frame, in pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,8 +85,8 @@ impl std::fmt::Display for Size {
     }
 }
 
-/// A capture of the whole desktop: 32 bits a pixel, bytes B, G, R and an
-/// unused byte, rows `stride` bytes apart.
+/// A BGRX image, of the whole desktop or one rectangle of it: 32 bits a
+/// pixel, bytes B, G, R and an unused byte, rows `stride` bytes apart.
 ///
 /// The fields are private, so a `Frame` always satisfies what
 /// [`Frame::new`] checks.
@@ -159,6 +168,26 @@ impl Frame {
         let end = (top + count - 1) as usize * self.stride + self.size.width as usize * 4;
         self.data.get(start..end)
     }
+
+    /// A copy of the pixels of `rect`, with no row padding. Fails unless
+    /// `rect` has pixels and lies within the frame.
+    pub fn crop(&self, rect: Rectangle) -> Result<Frame> {
+        ensure!(
+            rect.lies_within(self.size),
+            "{rect} does not lie within a {} frame",
+            self.size
+        );
+        let row_bytes = rect.width as usize * 4;
+        let left = rect.x as usize * 4;
+        let mut data = Vec::with_capacity(row_bytes * rect.height as usize);
+        for y in rect.y..rect.y + rect.height {
+            let row = self
+                .row(y)
+                .with_context(|| format!("row {y} lies outside a {} frame", self.size))?;
+            data.extend_from_slice(&row[left..left + row_bytes]);
+        }
+        Frame::new(rect.width, rect.height, row_bytes, data)
+    }
 }
 
 impl std::fmt::Debug for Frame {
@@ -169,6 +198,118 @@ impl std::fmt::Debug for Frame {
             .field("stride", &self.stride)
             .field("data_len", &self.data.len())
             .finish()
+    }
+}
+
+/// The pixels of one rectangle of the desktop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Patch {
+    rect: Rectangle,
+    pixels: Frame,
+}
+
+impl Patch {
+    /// `pixels` as the contents of `rect`. Fails unless they are the
+    /// rectangle's size.
+    pub fn new(rect: Rectangle, pixels: Frame) -> Result<Self> {
+        ensure!(
+            pixels.size() == rect.size(),
+            "a {} image cannot be the pixels of {rect}",
+            pixels.size()
+        );
+        Ok(Self { rect, pixels })
+    }
+
+    /// Where on the desktop the pixels belong.
+    pub fn rect(&self) -> Rectangle {
+        self.rect
+    }
+
+    /// The pixels, exactly the rectangle's size.
+    pub fn pixels(&self) -> &Frame {
+        &self.pixels
+    }
+
+    /// The pixels, consuming the patch.
+    pub fn into_pixels(self) -> Frame {
+        self.pixels
+    }
+}
+
+/// What a capture read: the desktop's size when it was read, and the
+/// pixels of each rectangle asked for, clipped to that size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Capture {
+    size: Size,
+    patches: Vec<Patch>,
+}
+
+impl Capture {
+    /// `patches` of a desktop of `size`. Fails unless every patch lies
+    /// within it.
+    pub fn new(size: Size, patches: Vec<Patch>) -> Result<Self> {
+        for patch in &patches {
+            ensure!(
+                patch.rect.lies_within(size),
+                "{} does not lie within a {size} desktop",
+                patch.rect
+            );
+        }
+        Ok(Self { size, patches })
+    }
+
+    /// One patch of all of `frame`, as [`ScreenSource::capture_all`]
+    /// returns.
+    pub fn whole(frame: Frame) -> Result<Self> {
+        let size = frame.size();
+        Self::new(size, vec![Patch::new(Rectangle::full(size), frame)?])
+    }
+
+    /// The parts of `frame`, a capture of the whole desktop, that `rects`
+    /// cover, each clipped to it. A rectangle wholly outside it yields no
+    /// patch.
+    pub fn cut(frame: &Frame, rects: &[Rectangle]) -> Result<Self> {
+        let size = frame.size();
+        let patches = rects
+            .iter()
+            .filter_map(|rect| rect.clip(size))
+            .map(|rect| Patch::new(rect, frame.crop(rect)?))
+            .collect::<Result<_>>()?;
+        Self::new(size, patches)
+    }
+
+    /// The desktop's size when it was captured.
+    pub fn size(&self) -> Size {
+        self.size
+    }
+
+    /// The patches, in the order their rectangles were asked for.
+    pub fn patches(&self) -> &[Patch] {
+        &self.patches
+    }
+
+    /// The patches, consuming the capture.
+    pub fn into_patches(self) -> Vec<Patch> {
+        self.patches
+    }
+
+    /// The whole desktop as one frame. Fails unless the capture is one
+    /// patch covering all of it, as [`ScreenSource::capture_all`]
+    /// returns.
+    pub fn into_whole(self) -> Result<Frame> {
+        let full = Rectangle::full(self.size);
+        match <[Patch; 1]>::try_from(self.patches) {
+            Ok([patch]) if patch.rect == full => Ok(patch.pixels),
+            Ok([patch]) => bail!(
+                "a capture of {} is not all of a {} desktop",
+                patch.rect,
+                self.size
+            ),
+            Err(patches) => bail!(
+                "a capture of {} patches is not one of the whole desktop",
+                patches.len()
+            ),
+        }
     }
 }
 
@@ -309,12 +450,33 @@ pub trait DisplayGeometry: Send + Sync {
     fn size(&self) -> Result<Size>;
 }
 
-/// Captures the desktop.
-pub trait FrameSource: Send + Sync {
-    /// Capture the whole desktop at its current size. May block for as
-    /// long as a capture takes. An error that is not [`Gone`] may pass:
-    /// a later capture can succeed.
-    fn capture(&self) -> Result<Frame>;
+/// Reports where the desktop changed, and captures it.
+///
+/// Damage says where to look; it may cover pixels that did not change.
+/// A consumer waits on its subscription, takes the pending damage, and
+/// then captures the rectangles it covers: in that order, so that damage
+/// reported meanwhile stays pending for the next capture (see
+/// [`damage`]).
+///
+/// For the captures, an error that is not [`Gone`] may pass: a later
+/// capture can succeed.
+pub trait ScreenSource: Send + Sync {
+    /// A new subscription to the desktop's damage, whose pending damage
+    /// starts as the whole desktop. Never blocks. Fails with [`Gone`]
+    /// once the desktop has gone.
+    fn subscribe_damage(&self) -> Result<DamageSubscription>;
+
+    /// Capture `rects`, each clipped to the desktop's size when it is
+    /// read; a rectangle wholly outside it yields no patch. The cost is
+    /// proportional to the rectangles' area, not the desktop's. May
+    /// block for as long as the capture takes.
+    fn capture(&self, rects: &[Rectangle]) -> Result<Capture>;
+
+    /// Capture the whole desktop at its current size, as one patch: for
+    /// a new client, or after a resize. The size and pixels are read
+    /// together, so they always agree. May block for as long as the
+    /// capture takes.
+    fn capture_all(&self) -> Result<Capture>;
 }
 
 /// Injects input into the desktop.
@@ -387,7 +549,7 @@ pub trait CursorSource: Send + Sync {
 #[derive(Clone)]
 pub struct Platform {
     pub geometry: Arc<dyn DisplayGeometry>,
-    pub frames: Arc<dyn FrameSource>,
+    pub screen: Arc<dyn ScreenSource>,
     pub input: Arc<dyn InputSink>,
     pub cursor: Arc<dyn CursorSource>,
 }
@@ -472,6 +634,80 @@ mod tests {
         assert!(frame.band(0, 0).is_none());
         assert!(frame.band(2, 2).is_none());
         assert!(frame.band(u32::MAX, 2).is_none());
+    }
+
+    #[test]
+    fn crop_copies_a_rectangle_without_padding() {
+        // Three rows of two pixels, stride 12 (4 bytes of padding).
+        let data: Vec<u8> = (0..36).collect();
+        let frame = Frame::new(2, 3, 12, data).unwrap();
+        let cropped = frame.crop(Rectangle::new(1, 1, 1, 2)).unwrap();
+        assert_eq!(
+            cropped.size(),
+            Size {
+                width: 1,
+                height: 2
+            }
+        );
+        assert_eq!(cropped.stride(), 4);
+        assert_eq!(cropped.data(), &[16, 17, 18, 19, 28, 29, 30, 31]);
+        assert_eq!(
+            frame.crop(Rectangle::full(frame.size())).unwrap().row(2),
+            frame.row(2)
+        );
+        assert!(frame.crop(Rectangle::new(1, 1, 2, 1)).is_err());
+        assert!(frame.crop(Rectangle::new(0, 0, 0, 1)).is_err());
+    }
+
+    #[test]
+    fn patch_and_capture_checks() {
+        let frame = Frame::new(2, 2, 8, vec![0; 16]).unwrap();
+        assert!(Patch::new(Rectangle::new(5, 5, 2, 2), frame.clone()).is_ok());
+        assert!(Patch::new(Rectangle::new(0, 0, 2, 1), frame.clone()).is_err());
+        let patch = Patch::new(Rectangle::new(5, 5, 2, 2), frame.clone()).unwrap();
+        let small = Size {
+            width: 6,
+            height: 7,
+        };
+        assert!(Capture::new(small, vec![patch.clone()]).is_err());
+        let size = Size {
+            width: 7,
+            height: 7,
+        };
+        let capture = Capture::new(size, vec![patch]).unwrap();
+        assert!(capture.into_whole().is_err(), "a part is not the whole");
+        assert!(Capture::new(size, vec![]).unwrap().into_whole().is_err());
+        assert_eq!(
+            Capture::whole(frame.clone()).unwrap().into_whole().unwrap(),
+            frame
+        );
+    }
+
+    #[test]
+    fn cut_clips_and_drops_rectangles() {
+        let data: Vec<u8> = (0..64).collect();
+        let frame = Frame::new(4, 4, 16, data).unwrap();
+        let capture = Capture::cut(
+            &frame,
+            &[
+                Rectangle::new(2, 2, 10, 10),
+                Rectangle::new(9, 9, 1, 1),
+                Rectangle::new(0, 0, 1, 1),
+            ],
+        )
+        .unwrap();
+        assert_eq!(capture.size(), frame.size());
+        let rects: Vec<Rectangle> = capture.patches().iter().map(Patch::rect).collect();
+        assert_eq!(
+            rects,
+            vec![Rectangle::new(2, 2, 2, 2), Rectangle::new(0, 0, 1, 1)]
+        );
+        assert_eq!(
+            capture.patches()[0].pixels().data(),
+            &[
+                40, 41, 42, 43, 44, 45, 46, 47, 56, 57, 58, 59, 60, 61, 62, 63
+            ]
+        );
     }
 
     #[test]

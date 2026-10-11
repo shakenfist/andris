@@ -26,8 +26,8 @@ SPICE.
 | Frames | `server/frames.rs` | Cuts a captured frame into 64-row bands, keeps the previous frame to find the changed ones, and encodes each as LZ4 or an uncompressed bitmap |
 | Inputs channel | `server/inputs.rs`, `keymap.rs` | Decodes set-1 scancodes to evdev codes, tracks lock keys, applies pointer events according to the mouse mode |
 | Cursor channel | `server/cursor.rs` | Sends each cursor shape the platform reports as an alpha cursor |
-| Platform traits | `platform/mod.rs` | `DisplayGeometry`, `FrameSource`, `InputSink` and `CursorSource`, bundled as a `Platform`. They use no SPICE types, and keys cross them as Linux evdev codes |
-| Synthetic platform | `platform/synthetic.rs` | A deterministic test pattern, an input sink that records events, and one cursor shape; for tests, load testing and `--platform synthetic` |
+| Platform traits | `platform/mod.rs`, `damage.rs` | `DisplayGeometry`, `ScreenSource`, `InputSink` and `CursorSource`, bundled as a `Platform`. They use no SPICE types, and keys cross them as Linux evdev codes. `ScreenSource` captures rectangles or the whole desktop, and hands each subscriber the damage reported since it last took some, as a region of 64x64 tiles |
+| Synthetic platform | `platform/synthetic.rs` | A deterministic test pattern that reports damage as it moves, an input sink that records events, and one cursor shape; for tests, load testing and `--platform synthetic` |
 | X11 platform | `platform/x11/` | `GetImage` capture, XTEST input, XFIXES cursor and XKB key names, each on its own connection and thread; the input queue is bounded, with room kept for releases; refuses an X server it cannot read as BGRX |
 
 Around the code: `Makefile` and `.devcontainer/` run cargo in a
@@ -40,8 +40,8 @@ the pre-push audit runbook.
 ### How a frame reaches the wire
 
 A timer in the display channel fires every `--frame-interval-ms`. It
-calls the platform's `FrameSource`, on a blocking thread, which
-returns the whole desktop as BGRX. The frame encoder compares it row
+captures the whole desktop through the platform's `ScreenSource`, on a
+blocking thread, as BGRX. The frame encoder compares it row
 by row with the frame it sent last and cuts it into bands of 64 rows;
 each changed band becomes one `DRAW_COPY` message carrying an LZ4 image
 (or an uncompressed bitmap when LZ4 would not help or the client asked

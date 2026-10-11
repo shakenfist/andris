@@ -7,7 +7,8 @@
 //! connections to the display, each owned by its own thread:
 //!
 //! - **capture** answers size and capture requests with `GetGeometry` and
-//!   `GetImage` on the root window;
+//!   `GetImage` on the root window. Every capture reads the whole root
+//!   window, and a capture of rectangles cuts them from it;
 //! - **input** injects events with XTest and reads the lock state from
 //!   XKB's indicators. Both go through one queue, so a lock-state read
 //!   sees every event queued before it;
@@ -27,6 +28,10 @@
 //! never overtakes the press it undoes; see [`InputQueue`].
 //!
 //! [`InputQueue`]: input::InputQueue
+//!
+//! Nothing reports damage yet: a [`DamageSubscription`] starts with the
+//! whole desktop, sized from the root window at connect time, and sees
+//! nothing after that.
 //!
 //! A thread whose connection fails logs that once and exits; every later
 //! call to it returns an error. An error the X server returns for one
@@ -67,8 +72,8 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::x11_utils::X11Error;
 
 use super::{
-    CursorReceiver, CursorSource, DisplayGeometry, Frame, FrameSource, Gone, InputEvent, InputSink,
-    LockState, Platform, Size,
+    Capture, CursorReceiver, CursorSource, DamageHub, DamageSubscription, DisplayGeometry, Gone,
+    InputEvent, InputSink, LockState, Platform, Rectangle, ScreenSource, Size,
 };
 use capture::{CaptureRequest, serve_capture};
 use checks::ServerFacts;
@@ -92,6 +97,8 @@ pub struct X11Platform {
     cursor_conn: Arc<RustConnection>,
     /// The window the wake-up is sent to.
     wake_window: Window,
+    /// The desktop's damage, for every subscriber.
+    damage: DamageHub,
 }
 
 impl X11Platform {
@@ -114,6 +121,10 @@ impl X11Platform {
             .with_context(|| format!("asking X display {name} what it supports"))?;
         checks::check(name, &facts)?;
         let root = screen.root;
+        let damage = DamageHub::new(Size {
+            width: screen.width_in_pixels.into(),
+            height: screen.height_in_pixels.into(),
+        });
         info!(
             depth = screen.root_depth,
             "connected to X display {name}; it can be exported"
@@ -147,6 +158,7 @@ impl X11Platform {
             cursor,
             cursor_conn,
             wake_window,
+            damage,
         }))
     }
 
@@ -154,7 +166,7 @@ impl X11Platform {
     pub fn platform(self: &Arc<Self>) -> Platform {
         Platform {
             geometry: self.clone(),
-            frames: self.clone(),
+            screen: self.clone(),
             input: self.clone(),
             cursor: self.clone(),
         }
@@ -187,9 +199,22 @@ impl DisplayGeometry for X11Platform {
     }
 }
 
-impl FrameSource for X11Platform {
-    fn capture(&self) -> Result<Frame> {
-        round_trip(&self.capture, "capture", CaptureRequest::Capture)
+impl ScreenSource for X11Platform {
+    fn subscribe_damage(&self) -> Result<DamageSubscription> {
+        self.damage.subscribe()
+    }
+
+    fn capture(&self, rects: &[Rectangle]) -> Result<Capture> {
+        let frame = round_trip(&self.capture, "capture", CaptureRequest::Capture)?;
+        Capture::cut(&frame, rects)
+    }
+
+    fn capture_all(&self) -> Result<Capture> {
+        Capture::whole(round_trip(
+            &self.capture,
+            "capture",
+            CaptureRequest::Capture,
+        )?)
     }
 }
 

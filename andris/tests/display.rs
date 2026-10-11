@@ -14,7 +14,7 @@ mod support;
 
 use std::time::Duration;
 
-use andris::platform::{DisplayGeometry, Frame, FrameSource, Size};
+use andris::platform::{DisplayGeometry, Frame, Size};
 use andris::server::display::MAX_CAPTURE_FAILURES;
 use shakenfist_spice_compression::decompress_spice_lz4;
 use shakenfist_spice_protocol::constants::{
@@ -323,7 +323,7 @@ async fn advance_and_expect_bands(
         screen.apply(&draw);
         images.push((draw.image_type, draw.image_id));
     }
-    screen.assert_shows(&server.platform.capture().unwrap());
+    screen.assert_shows(&server.platform.desktop().unwrap());
     images
 }
 
@@ -343,7 +343,7 @@ async fn start_sequence_waits_for_init_and_runs_in_order() {
     let images = expect_complete_frame(&mut client, &mut screen).await;
     let lz4 = ImageType::Lz4 as u8;
     assert_eq!(images, vec![(lz4, 1), (lz4, 2), (lz4, 3)]);
-    screen.assert_shows(&server.platform.capture().unwrap());
+    screen.assert_shows(&server.platform.desktop().unwrap());
     expect_monitors_config(&mut client, size).await;
     expect_mark(&mut client).await;
 
@@ -357,7 +357,7 @@ async fn no_monitors_config_without_the_capability() {
     let (server, _main, mut client) = open_display(caps).await;
     expect_set_ack(&mut client).await;
     send_init(&mut client, image_compression::AUTO_GLZ).await;
-    let size = server.platform.capture().unwrap().size();
+    let size = server.platform.desktop().unwrap().size();
     expect_surface_create(&mut client, size).await;
     let mut screen = Screen::new(size);
     expect_complete_frame(&mut client, &mut screen).await;
@@ -382,13 +382,13 @@ async fn bitmaps_for_a_client_without_lz4() {
     let (server, _main, mut client) = open_display(caps).await;
     expect_set_ack(&mut client).await;
     send_init(&mut client, image_compression::LZ4).await;
-    let size = server.platform.capture().unwrap().size();
+    let size = server.platform.desktop().unwrap().size();
     expect_surface_create(&mut client, size).await;
     let mut screen = Screen::new(size);
     let pixmap = ImageType::Pixmap as u8;
     let images = expect_complete_frame(&mut client, &mut screen).await;
     assert!(images.iter().all(|&(image_type, _)| image_type == pixmap));
-    screen.assert_shows(&server.platform.capture().unwrap());
+    screen.assert_shows(&server.platform.desktop().unwrap());
     expect_monitors_config(&mut client, size).await;
     expect_mark(&mut client).await;
 
@@ -408,12 +408,12 @@ async fn preferred_compression_off_is_honoured_whenever_it_arrives() {
     expect_set_ack(&mut client).await;
     send_compression(&mut client, image_compression::OFF).await;
     send_init(&mut client, image_compression::OFF).await;
-    let size = server.platform.capture().unwrap().size();
+    let size = server.platform.desktop().unwrap().size();
     expect_surface_create(&mut client, size).await;
     let mut screen = Screen::new(size);
     let images = expect_complete_frame(&mut client, &mut screen).await;
     assert!(images.iter().all(|&(image_type, _)| image_type == pixmap));
-    screen.assert_shows(&server.platform.capture().unwrap());
+    screen.assert_shows(&server.platform.desktop().unwrap());
     expect_monitors_config(&mut client, size).await;
     expect_mark(&mut client).await;
 
@@ -461,7 +461,7 @@ async fn nothing_is_sent_beyond_twice_the_ack_window_until_acks_arrive() {
         assert_eq!(draw.bbox.top, top);
         screen.apply(&draw);
     }
-    screen.assert_shows(&server.platform.capture().unwrap());
+    screen.assert_shows(&server.platform.desktop().unwrap());
     expect_quiet(&mut client).await;
 }
 
@@ -487,7 +487,7 @@ async fn a_size_change_replaces_the_surface() {
     let mut screen = Screen::new(size);
     let images = expect_complete_frame(&mut client, &mut screen).await;
     assert_eq!(images.len(), 4);
-    screen.assert_shows(&server.platform.capture().unwrap());
+    screen.assert_shows(&server.platform.desktop().unwrap());
     expect_monitors_config(&mut client, size).await;
     expect_mark(&mut client).await;
     expect_quiet(&mut client).await;

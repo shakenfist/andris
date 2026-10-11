@@ -196,13 +196,13 @@ impl Display {
         self.conn.send_msg(op, message).await
     }
 
-    /// Capture the desktop. Captures may block, so this runs on the
-    /// blocking pool. It borrows `self` only to start, so the future
+    /// Capture the whole desktop. Captures may block, so this runs on
+    /// the blocking pool. It borrows `self` only to start, so the future
     /// stays `Send` although the connection is not `Sync`.
     fn capture(&self) -> impl Future<Output = Result<Frame>> + Send + 'static {
-        let frames = self.ctx.platform.frames.clone();
+        let screen = self.ctx.platform.screen.clone();
         async move {
-            tokio::task::spawn_blocking(move || frames.capture())
+            tokio::task::spawn_blocking(move || screen.capture_all()?.into_whole())
                 .await
                 .context("the capture task failed")?
                 .context("capturing the desktop")

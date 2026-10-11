@@ -218,8 +218,8 @@ mod tests {
     use shakenfist_spice_protocol::messages::{DrawCopy, WireType};
 
     use super::*;
+    use crate::platform::Size;
     use crate::platform::synthetic::{STRIDE_PADDING, SyntheticPlatform};
-    use crate::platform::{FrameSource, Size};
 
     const SIZE: Size = Size {
         width: 256,
@@ -342,24 +342,24 @@ mod tests {
 
     #[test]
     fn without_a_previous_frame_every_band_changed() {
-        let frame = platform().capture().unwrap();
+        let frame = platform().desktop().unwrap();
         assert_eq!(changed_bands(None, &frame), bands(200).collect::<Vec<_>>());
     }
 
     #[test]
     fn an_unchanged_frame_has_no_changed_bands() {
         let platform = platform();
-        let a = platform.capture().unwrap();
-        let b = platform.capture().unwrap();
+        let a = platform.desktop().unwrap();
+        let b = platform.desktop().unwrap();
         assert!(changed_bands(Some(&a), &b).is_empty());
     }
 
     #[test]
     fn advance_changes_the_two_bands_the_square_crosses() {
         let platform = platform();
-        let before = platform.capture().unwrap();
+        let before = platform.desktop().unwrap();
         platform.advance().unwrap();
-        let after = platform.capture().unwrap();
+        let after = platform.desktop().unwrap();
         let tops: Vec<u32> = changed_bands(Some(&before), &after)
             .iter()
             .map(|band| band.top)
@@ -370,14 +370,14 @@ mod tests {
     #[test]
     fn a_size_change_changes_every_band() {
         let platform = platform();
-        let before = platform.capture().unwrap();
+        let before = platform.desktop().unwrap();
         platform
             .set_size(Size {
                 width: 256,
                 height: 128,
             })
             .unwrap();
-        let after = platform.capture().unwrap();
+        let after = platform.desktop().unwrap();
         assert_eq!(changed_bands(Some(&before), &after).len(), 2);
     }
 
@@ -395,7 +395,7 @@ mod tests {
 
     #[test]
     fn lz4_bands_decode_to_the_frame() {
-        let frame = platform().capture().unwrap();
+        let frame = platform().desktop().unwrap();
         assert_eq!(frame.stride(), 256 * 4 + STRIDE_PADDING);
         for (index, band) in bands(frame.height()).enumerate() {
             let body = encode_band(&frame, band, index as u64 + 1, true).unwrap();
@@ -407,7 +407,7 @@ mod tests {
 
     #[test]
     fn bitmap_bands_when_lz4_is_not_allowed() {
-        let frame = platform().capture().unwrap();
+        let frame = platform().desktop().unwrap();
         for band in bands(frame.height()) {
             let body = encode_band(&frame, band, 7, false).unwrap();
             let (image_type, _) = check_draw(&body, &frame, band);
@@ -427,7 +427,7 @@ mod tests {
 
     #[test]
     fn a_band_outside_the_frame_is_refused() {
-        let frame = platform().capture().unwrap();
+        let frame = platform().desktop().unwrap();
         assert!(encode_band(&frame, Band { top: 192, rows: 9 }, 1, true).is_err());
         assert!(encode_band(&frame, Band { top: 0, rows: 0 }, 1, true).is_err());
         assert!(
@@ -449,7 +449,7 @@ mod tests {
         let platform = platform();
         let mut encoder = FrameEncoder::new();
 
-        let first = platform.capture().unwrap();
+        let first = platform.desktop().unwrap();
         let bodies = encoder.encode(first.clone(), false, true).unwrap();
         assert_eq!(bodies.len(), 4, "the first frame is complete");
         let ids: Vec<u64> = bodies
@@ -459,11 +459,11 @@ mod tests {
             .collect();
         assert_eq!(ids, vec![1, 2, 3, 4]);
 
-        let same = platform.capture().unwrap();
+        let same = platform.desktop().unwrap();
         assert!(encoder.encode(same, false, true).unwrap().is_empty());
 
         platform.advance().unwrap();
-        let moved = platform.capture().unwrap();
+        let moved = platform.desktop().unwrap();
         let bodies = encoder.encode(moved.clone(), false, false).unwrap();
         assert_eq!(bodies.len(), 2);
         let changed = [Band { top: 64, rows: 64 }, Band { top: 128, rows: 64 }];
@@ -474,7 +474,7 @@ mod tests {
             .collect();
         assert_eq!(ids, vec![5, 6]);
 
-        let again = platform.capture().unwrap();
+        let again = platform.desktop().unwrap();
         assert_eq!(
             encoder.encode(again, true, true).unwrap().len(),
             4,

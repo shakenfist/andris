@@ -43,6 +43,7 @@ pub mod link;
 pub mod main_channel;
 pub mod opcodes;
 pub mod session;
+pub mod stats;
 pub mod tls;
 pub mod updates;
 

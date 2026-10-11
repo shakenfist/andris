@@ -271,6 +271,36 @@ Ryll's protocol crate also does not yet name the inputs channel's
 `KEY_SCANCODE` capability, so andris defines the constant itself
 ([ryll#503](https://github.com/shakenfist/ryll/issues/503)).
 
+## Metrics
+
+While a client is receiving frames, andris logs one line at info every
+10 seconds, and one more when the session ends, for the whole session.
+Nothing is logged for an interval in which no frame was sent, so an
+idle desktop is silent. A line reads:
+
+```
+metrics: 12.4 fps (1 refreshes), draws lz4=118 bitmap=0 jpeg=6, display 842 kbit/s, capture 1.8 ms, encode 3.2 ms, ack lag 4.1 ms, ping 0.6 ms, scrub tiles 0, changed 31.5% of captured
+```
+
+- `fps` is frames per second over the interval, and `refreshes` how
+  many of them were lossless resends of JPEG areas.
+- `draws` counts the rectangles sent, by encoding.
+- `display` is the display channel's output.
+- `capture` and `encode` are mean milliseconds per desktop capture and
+  per comparing-and-encoding pass.
+- `ack lag` is the mean time from sending the message that completes
+  an acknowledgement window to the client's `ACK`; it rises when the
+  client or the network falls behind.
+- `ping` is the latest round trip to the client.
+- `scrub tiles` is how many tiles the periodic re-read found changed
+  that the X server's damage reports had not; a steadily nonzero
+  figure means damage is being missed.
+- `changed` is the share of captured pixels that had actually
+  changed; a low figure means damage reports are coarser than the
+  real changes.
+
+A `-` means there was nothing to average in the interval.
+
 ## Connecting with ryll
 
 Ryll's `--direct` option has no password, so a ticket needs a

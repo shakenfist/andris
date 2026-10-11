@@ -447,8 +447,13 @@ impl Display {
     /// [`MAX_CAPTURE_FAILURES`] captures in a row have failed.
     async fn capture_or_skip(&mut self, rects: Option<Vec<Rectangle>>) -> Result<Option<Capture>> {
         let session = self.conn.session().id();
+        let started = Instant::now();
         match self.capture(rects).await {
             Ok(capture) => {
+                self.conn
+                    .session()
+                    .counters()
+                    .capture_done(started.elapsed());
                 if self.capture_failures > 0 {
                     info!(
                         session,
@@ -519,6 +524,7 @@ impl Display {
         }
         if self.send_update(capture).await? > 0 {
             self.send(DisplayOpcode::Mark, &[]).await?;
+            self.conn.session().counters().frame_sent(false);
         }
         Ok(())
     }
@@ -586,7 +592,9 @@ impl Display {
             self.send_msg(DisplayOpcode::MonitorsConfig, &config)
                 .await?;
         }
-        self.send(DisplayOpcode::Mark, &[]).await
+        self.send(DisplayOpcode::Mark, &[]).await?;
+        self.conn.session().counters().frame_sent(false);
+        Ok(())
     }
 
     /// Send what in `capture` differs from what the client was last
@@ -596,6 +604,7 @@ impl Display {
     async fn send_update(&mut self, capture: Capture) -> Result<usize> {
         let options = self.encode_options();
         let mut encoder = std::mem::take(&mut self.encoder);
+        let started = Instant::now();
         let (encoder, update) = tokio::task::spawn_blocking(move || {
             let update = encoder.update(&capture, options);
             (encoder, update)
@@ -603,15 +612,22 @@ impl Display {
         .await
         .context("the encoding task failed")?;
         self.encoder = encoder;
-        let draws = update?.draws;
-        self.send_draws(&draws).await?;
-        Ok(draws.len())
+        let update = update?;
+        let counters = self.conn.session().counters();
+        counters.encode_done(started.elapsed());
+        counters.area_updated(update.captured_area, update.changed_area);
+        self.send_draws(&update.draws).await?;
+        Ok(update.draws.len())
     }
 
     /// Send `draws`, and record which tiles they leave lossy or exact.
     async fn send_draws(&mut self, draws: &[Draw]) -> Result<()> {
         for draw in draws {
             self.send(DisplayOpcode::DrawCopy, &draw.body).await?;
+            self.conn
+                .session()
+                .counters()
+                .draw_sent(draw.encoding, draw.encoded_bytes());
         }
         self.lossy.record(draws, Instant::now());
         Ok(())
@@ -630,6 +646,7 @@ impl Display {
         let options = self.encode_options().lossless();
         let mut encoder = std::mem::take(&mut self.encoder);
         let region = due.clone();
+        let started = Instant::now();
         let (encoder, update) = tokio::task::spawn_blocking(move || {
             let update = encoder.refresh(&region, options);
             (encoder, update)
@@ -638,6 +655,10 @@ impl Display {
         .context("the refresh's encoding task failed")?;
         self.encoder = encoder;
         let draws = update?.draws;
+        self.conn
+            .session()
+            .counters()
+            .encode_done(started.elapsed());
         debug!(
             session = self.conn.session().id(),
             tiles = due.tile_count(),
@@ -650,6 +671,7 @@ impl Display {
         self.lossy.clear(&due);
         if !draws.is_empty() {
             self.send(DisplayOpcode::Mark, &[]).await?;
+            self.conn.session().counters().frame_sent(true);
         }
         Ok(())
     }
@@ -703,6 +725,7 @@ impl Display {
         let added = self.damage.add(&differences)?;
         if added > 0 {
             self.scrub_tiles += added as u64;
+            self.conn.session().counters().scrub_found(added as u64);
             debug!(
                 session = self.conn.session().id(),
                 slice = %slice,

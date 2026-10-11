@@ -33,7 +33,7 @@ use shakenfist_spice_protocol::{
     ChannelType, ImageType, capabilities, display_client, display_server,
 };
 
-use support::{TestClient, TestServer, Tuning};
+use support::{TestClient, TestServer, Tuning, wait_until};
 
 /// The frame interval of the servers here, unless a test says otherwise:
 /// short, so tests are quick.
@@ -1094,4 +1094,60 @@ async fn a_resize_forgets_the_lossy_areas() {
     expect_monitors_config(&mut client, size).await;
     expect_mark(&mut client).await;
     expect_quiet_for(&mut client, LOSSLESS * 2).await;
+}
+
+#[tokio::test]
+async fn the_counters_move_as_frames_are_sent() {
+    let (server, _main, mut client) = open_display(capabilities::DEFAULT_DISPLAY).await;
+    let mut screen = start(&server, &mut client, image_compression::AUTO_GLZ).await;
+    let session = server.handle.session().unwrap();
+
+    // The start sequence: one frame, its draws, and what it took.
+    let first = session.stats();
+    assert_eq!(first.frames, 1);
+    assert_eq!(first.refreshes, 0);
+    assert!(first.draws() > 0);
+    assert_eq!(first.lz4_draws, first.draws());
+    assert!(first.lz4_bytes > 0);
+    assert!(first.display_bytes > first.lz4_bytes);
+    assert!(first.capture.count > 0);
+    assert!(first.encode.count > 0);
+    assert!(first.captured_area > 0);
+    assert_eq!(first.changed_area, first.captured_area);
+
+    advance_and_expect_frame(&server, &mut client, &mut screen).await;
+    let second = session.stats();
+    assert_eq!(second.frames, 2);
+    assert!(second.draws() > first.draws());
+    assert!(second.display_bytes > first.display_bytes);
+    assert!(second.capture.count > first.capture.count);
+    assert!(second.encode.count > first.encode.count);
+    assert!(second.changed_area > first.changed_area);
+    assert!(second.changed_area - first.changed_area <= second.captured_area - first.captured_area);
+    let delta = second.since(&first);
+    assert!(delta.has_frames());
+    assert!(delta.summary(Duration::from_secs(1)).contains("1.0 fps"));
+}
+
+#[tokio::test]
+async fn ack_lag_is_recorded_once_a_window_is_acknowledged() {
+    let (server, _main, mut client) = open_display(capabilities::DEFAULT_DISPLAY).await;
+    let mut screen = start(&server, &mut client, image_compression::AUTO_GLZ).await;
+    let session = server.handle.session().unwrap();
+    let mut sent = 5;
+    while sent < WINDOW {
+        let images = advance_and_expect_frame(&server, &mut client, &mut screen).await;
+        sent += images.len() as u32 + 1;
+    }
+    assert_eq!(session.stats().ack_lag.count, 0, "nothing acked yet");
+
+    client
+        .send(display_client::ACK_SYNC, &body(&AckSync { generation: 1 }))
+        .await;
+    client.send(display_client::ACK, &[]).await;
+    wait_until("the ack lag is recorded", || {
+        session.stats().ack_lag.count == 1
+    })
+    .await;
+    assert!(session.stats().ack_lag.latest().is_some());
 }

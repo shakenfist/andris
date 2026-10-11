@@ -22,6 +22,7 @@ use tokio::sync::watch;
 use tracing::info;
 
 use super::link::ServedChannel;
+use super::stats::{Stats, StatsSnapshot};
 
 /// A one-way cancel signal that any number of tasks can await.
 ///
@@ -121,6 +122,7 @@ pub struct Session {
     cancel: Cancel,
     /// The channel serving each type, by its claim's cancel signal.
     channels: Mutex<HashMap<ServedChannel, Arc<Cancel>>>,
+    stats: Stats,
 }
 
 impl Session {
@@ -131,6 +133,7 @@ impl Session {
             mouse_mode: watch::Sender::new(MouseMode::Client),
             cancel: Cancel::new(),
             channels: Mutex::new(HashMap::new()),
+            stats: Stats::default(),
         }
     }
 
@@ -167,6 +170,16 @@ impl Session {
     /// secondary channel's link must name it.
     pub fn id(&self) -> u32 {
         self.id
+    }
+
+    /// The session's metrics, for its channels to update.
+    pub fn counters(&self) -> &Stats {
+        &self.stats
+    }
+
+    /// The session's metrics so far.
+    pub fn stats(&self) -> StatsSnapshot {
+        self.stats.snapshot()
     }
 
     /// Time since the session began.

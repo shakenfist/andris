@@ -19,7 +19,7 @@ use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use shakenfist_spice_protocol::main_client;
@@ -160,6 +160,11 @@ pub struct AckWindow {
     window: u32,
     synced: bool,
     unacked: u64,
+    /// Messages sent since `SET_ACK`.
+    total_sent: u64,
+    /// When each message that completed a window was sent, for the
+    /// `ACK`s still to come.
+    window_ends: VecDeque<Instant>,
 }
 
 impl AckWindow {
@@ -169,11 +174,17 @@ impl AckWindow {
             window,
             synced: false,
             unacked: 0,
+            total_sent: 0,
+            window_ends: VecDeque::new(),
         }
     }
 
     fn sent(&mut self) {
         self.unacked = self.unacked.saturating_add(1);
+        self.total_sent = self.total_sent.saturating_add(1);
+        if self.window != 0 && self.total_sent.is_multiple_of(u64::from(self.window)) {
+            self.window_ends.push_back(Instant::now());
+        }
     }
 
     fn ack_sync(&mut self, generation: u32) {
@@ -188,10 +199,14 @@ impl AckWindow {
         }
     }
 
-    fn ack(&mut self) {
-        if self.synced {
-            self.unacked = self.unacked.saturating_sub(u64::from(self.window));
+    /// Account for an `ACK`. Returns how long ago the message that
+    /// completed the window it acknowledges was sent.
+    fn ack(&mut self) -> Option<Duration> {
+        if !self.synced {
+            return None;
         }
+        self.unacked = self.unacked.saturating_sub(u64::from(self.window));
+        self.window_ends.pop_front().map(|sent| sent.elapsed())
     }
 
     /// False while more than twice the window is unacknowledged.
@@ -269,6 +284,9 @@ impl<O: ServerOpcode> ChannelConn<O> {
         if let Some(ack) = &mut self.ack {
             ack.sent();
         }
+        self.session
+            .counters()
+            .bytes_sent(O::CHANNEL, message.len() as u64);
         Ok(())
     }
 
@@ -364,6 +382,9 @@ impl<O: ServerOpcode> ChannelConn<O> {
             main_client::PONG => {
                 let pong = Pong::decode(message.payload()).context("a malformed PONG")?;
                 let rtt = self.session.clock_ns().saturating_sub(pong.timestamp);
+                self.session
+                    .counters()
+                    .ping_round_trip(Duration::from_nanos(rtt));
                 debug!(
                     channel,
                     id = pong.id,
@@ -381,8 +402,8 @@ impl<O: ServerOpcode> ChannelConn<O> {
                 Ok(Common::Handled)
             }
             main_client::ACK => {
-                if let Some(ack) = &mut self.ack {
-                    ack.ack();
+                if let Some(lag) = self.ack.as_mut().and_then(AckWindow::ack) {
+                    self.session.counters().ack_lag(lag);
                 }
                 Ok(Common::Handled)
             }
@@ -494,6 +515,28 @@ mod tests {
         let mut body = vec![0; header.message_size as usize];
         client.read_exact(&mut body).await.unwrap();
         (header.message_type, body)
+    }
+
+    #[test]
+    fn ack_lag_is_taken_from_the_message_completing_each_window() {
+        let mut ack = AckWindow::new(1, 2);
+        ack.ack_sync(1);
+        assert_eq!(ack.ack(), None, "nothing is outstanding");
+        ack.sent();
+        assert!(ack.window_ends.is_empty(), "a window is not yet complete");
+        ack.sent();
+        ack.sent();
+        ack.sent();
+        assert_eq!(ack.window_ends.len(), 2);
+        assert!(ack.ack().is_some());
+        assert!(ack.ack().is_some());
+        assert_eq!(ack.ack(), None);
+
+        // Before ACK_SYNC an ACK counts for nothing, lag included.
+        let mut unsynced = AckWindow::new(1, 1);
+        unsynced.sent();
+        assert_eq!(unsynced.ack(), None);
+        assert_eq!(unsynced.window_ends.len(), 1);
     }
 
     #[test]

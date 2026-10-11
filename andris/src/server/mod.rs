@@ -7,6 +7,8 @@
 //! - [`opcodes`] lists what each channel may send;
 //! - [`main_channel`], [`display`], [`inputs`] and [`cursor`] serve the
 //!   four channels;
+//! - [`frames`] cuts captured frames into the display channel's
+//!   `DRAW_COPY` bands;
 //! - [`tls`] loads the TLS listener's certificate.
 //!
 //! # Tasks
@@ -21,6 +23,7 @@
 pub mod channel;
 pub mod cursor;
 pub mod display;
+pub mod frames;
 pub mod inputs;
 pub mod link;
 pub mod main_channel;

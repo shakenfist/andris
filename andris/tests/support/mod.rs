@@ -39,6 +39,9 @@ pub const TICKET: &str = "andris-test-ticket";
 /// in a debug build is slow, and several may run at once.
 pub const WAIT: Duration = Duration::from_secs(20);
 
+/// The frame interval of a server from [`TestServer::start`].
+pub const FRAME_INTERVAL: Duration = Duration::from_millis(50);
+
 /// The largest message body the test client accepts.
 const MAX_BODY: usize = 16 * 1024 * 1024;
 
@@ -65,15 +68,21 @@ pub struct TestServer {
 impl TestServer {
     /// A server with only a plain listener.
     pub async fn start() -> Self {
-        Self::start_with(false).await
+        Self::start_with(false, FRAME_INTERVAL).await
+    }
+
+    /// A server with only a plain listener, capturing every
+    /// `frame_interval`.
+    pub async fn start_with_frame_interval(frame_interval: Duration) -> Self {
+        Self::start_with(false, frame_interval).await
     }
 
     /// A server with a TLS listener, whose plain listener redirects.
     pub async fn start_tls() -> Self {
-        Self::start_with(true).await
+        Self::start_with(true, FRAME_INTERVAL).await
     }
 
-    async fn start_with(tls: bool) -> Self {
+    async fn start_with(tls: bool, frame_interval: Duration) -> Self {
         init_logging();
         let platform = SyntheticPlatform::new(Size {
             width: 256,
@@ -100,7 +109,7 @@ impl TestServer {
             listen: "127.0.0.1:0".parse().unwrap(),
             tls: tls_options,
             ticket: Ticket::new(TICKET).unwrap(),
-            frame_interval: Duration::from_millis(50),
+            frame_interval,
         };
         let handle = Server::bind(options, platform.platform())
             .await
@@ -140,8 +149,26 @@ impl TestServer {
 
     /// A client on the plain listener, with an authenticated channel.
     pub async fn open(&self, connection_id: u32, channel_type: ChannelType) -> TestClient {
+        self.open_with_caps(
+            connection_id,
+            channel_type,
+            default_channel_caps(channel_type),
+        )
+        .await
+    }
+
+    /// A client on the plain listener, with an authenticated channel
+    /// whose link advertised `channel_caps` as its channel capabilities.
+    pub async fn open_with_caps(
+        &self,
+        connection_id: u32,
+        channel_type: ChannelType,
+        channel_caps: u32,
+    ) -> TestClient {
         let mut client = TestClient::connect(self.addr()).await;
-        let reply = client.link(connection_id, channel_type).await;
+        let reply = client
+            .link_with_caps(connection_id, channel_type, channel_caps)
+            .await;
         assert_eq!(reply.error, SpiceError::Ok, "linking {channel_type:?}");
         client.auth(TICKET).await.unwrap();
         client
@@ -209,8 +236,24 @@ impl TestClient {
     /// Send a link message with ryll's default capabilities and return
     /// the server's reply.
     pub async fn link(&mut self, connection_id: u32, channel_type: ChannelType) -> SpiceLinkReply {
+        self.link_with_caps(
+            connection_id,
+            channel_type,
+            default_channel_caps(channel_type),
+        )
+        .await
+    }
+
+    /// Send a link message with ryll's default common capabilities and
+    /// `channel_caps` as the channel's, and return the server's reply.
+    pub async fn link_with_caps(
+        &mut self,
+        connection_id: u32,
+        channel_type: ChannelType,
+        channel_caps: u32,
+    ) -> SpiceLinkReply {
         let common = [capabilities::DEFAULT_COMMON];
-        let channel = [default_channel_caps(channel_type)];
+        let channel = [channel_caps];
         let reply = perform_link_with_caps(
             &mut self.stream,
             connection_id,
@@ -275,7 +318,14 @@ impl TestClient {
 
     /// Read one message.
     pub async fn recv(&mut self) -> ReceivedMessage {
-        tokio::time::timeout(WAIT, async {
+        self.recv_within(WAIT).await.expect("no message arrived")
+    }
+
+    /// Read one message, or `None` if none arrives within `wait`. A
+    /// message that is still arriving when `wait` runs out is kept for
+    /// the next read.
+    pub async fn recv_within(&mut self, wait: Duration) -> Option<ReceivedMessage> {
+        tokio::time::timeout(wait, async {
             loop {
                 if let Some(message) = take_message(&mut self.buf, MAX_BODY).unwrap() {
                     return message;
@@ -289,7 +339,7 @@ impl TestClient {
             }
         })
         .await
-        .expect("no message arrived")
+        .ok()
     }
 
     /// Wait for the server to close the connection, discarding anything

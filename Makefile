@@ -24,6 +24,17 @@ $(error CARGO_CACHE is empty; unset it or give it a path)
 endif
 CARGO_CACHE_DIR := $(abspath $(CARGO_CACHE))
 
+# The ryll revision Cargo.lock pins, for `make ryll-headless`: the full
+# sha after the `#` in the shakenfist-spice-protocol package's source
+# line, so the lockfile stays the one source of truth. The regex matches
+# the `#` with `.` because a `#` in a makefile line starts a comment in
+# some versions of make and not in others.
+RYLL_REV := $(shell sed -nE '/^name = "shakenfist-spice-protocol"$$/,/^$$/ s/^source = "git\+https:\/\/github\.com\/shakenfist\/ryll\?rev=[0-9a-f]+.([0-9a-f]{40})"$$/\1/p' Cargo.lock)
+# Ryll is installed per revision under the cargo cache, so CI's cache
+# action keeps the binary between runs and a new pin builds afresh.
+RYLL_DIR := $(CARGO_CACHE_DIR)/ryll
+RYLL_BIN := $(RYLL_DIR)/$(RYLL_REV)/bin/ryll
+
 # Detect user/group for permission-safe container builds
 UID := $(shell id -u)
 GID := $(shell id -g)
@@ -65,6 +76,21 @@ CACHE_MOUNTS_RO := \
 # needs a root container, so it writes its own docker run.
 DOCKER_RUN := docker run --rm $(DOCKER_BASE_ARGS) $(WORKSPACE_MOUNT_RW) $(CACHE_MOUNTS)
 
+# Networked invocation for `ryll-headless`, which compiles ryll and its
+# dependency tree with the network up. It is not DOCKER_RUN: that mounts
+# the checkout and the shared crate cache writable, which is safe only
+# because nothing compiles under it. This mounts neither, only the ryll
+# directory of the cargo cache, and the recipe points CARGO_HOME into
+# the per-revision directory there, so ryll's build scripts can reach
+# nothing that andris's own compiles later trust: not .git, not the
+# sources, and not the crates the offline targets read.
+DOCKER_RUN_RYLL := docker run --rm \
+	-w /build/ryll \
+	-u $(UID):$(GID) \
+	-e HOME=/build \
+	-e CARGO_BUILD_JOBS \
+	-v "$(RYLL_DIR)":/build/ryll
+
 # Offline invocation for the targets that compile crates: build,
 # release, test and lint. A build script (build.rs) runs arbitrary code
 # at compile time for each dependency in the tree -- the supply-chain
@@ -101,7 +127,7 @@ DOCKER_RUN_OFFLINE_RW := docker run --rm --network none \
 	$(DOCKER_BASE_ARGS) $(WORKSPACE_MOUNT_RW) $(CACHE_MOUNTS_RO)
 
 .PHONY: all build release clean devcontainer ensure-cache fetch lock \
-	target-dir lint lint-fix test help
+	target-dir lint lint-fix test ryll-headless e2e help
 
 all: build
 
@@ -113,6 +139,8 @@ help:
 	@echo "  make build                  - Build debug version"
 	@echo "  make release                - Build release version"
 	@echo "  make test                   - Run tests"
+	@echo "  make ryll-headless          - Build ryll's headless client at the pinned revision"
+	@echo "  make e2e                    - Run the end-to-end test against Xvfb and ryll"
 	@echo "  make lint                   - Run rustfmt and clippy checks"
 	@echo "  make lint-fix               - Run rustfmt and clippy with auto-fix"
 	@echo "  make clean                  - Remove build artifacts"
@@ -122,13 +150,14 @@ devcontainer:
 	docker build -t $(ANDRIS_IMAGE) $(DEVCONTAINER_DIR)
 
 # Create cargo cache directories
-$(CARGO_CACHE)/registry $(CARGO_CACHE)/git:
+$(CARGO_CACHE)/registry $(CARGO_CACHE)/git $(CARGO_CACHE)/ryll:
 	mkdir -p $@
 
 # Ensure cargo cache directories are writable by the build user.
 # A previous root-owned docker run can leave these owned by root.
-ensure-cache: devcontainer $(CARGO_CACHE)/registry $(CARGO_CACHE)/git
-	@if [ ! -w "$(CARGO_CACHE)/registry" ] || [ ! -w "$(CARGO_CACHE)/git" ]; then \
+ensure-cache: devcontainer $(CARGO_CACHE)/registry $(CARGO_CACHE)/git $(CARGO_CACHE)/ryll
+	@if [ ! -w "$(CARGO_CACHE)/registry" ] || [ ! -w "$(CARGO_CACHE)/git" ] \
+			|| [ ! -w "$(CARGO_CACHE)/ryll" ]; then \
 		echo "Fixing cargo cache permissions..."; \
 		docker run --rm \
 			-v "$(CARGO_CACHE_DIR)":/cache \
@@ -200,6 +229,46 @@ lint-fix: fetch
 	$(DOCKER_RUN_OFFLINE_RW) \
 		$(ANDRIS_IMAGE) \
 		sh -c "cargo fmt --all && cargo clippy --fix --frozen --allow-dirty --allow-no-vcs --workspace --all-targets -- -D warnings"
+
+# Build ryll's slim headless client (no GUI, audio or capture) at the
+# revision Cargo.lock pins, for `make e2e`. Skipped when that revision's
+# binary already exists. Installed into <rev>.tmp and renamed into place
+# only once complete, so an interrupted build is never mistaken for a
+# finished one. CARGO_HOME sits inside the per-revision directory, apart
+# from andris's crate cache (see DOCKER_RUN_RYLL), and is removed once the
+# binary is installed, so the cache keeps only the binary.
+ryll-headless: ensure-cache
+	@echo "$(RYLL_REV)" | grep -Eqx '[0-9a-f]{40}' || { \
+		echo "could not read ryll's revision from Cargo.lock (got '$(RYLL_REV)')" >&2; \
+		exit 1; \
+	}
+	@echo "ryll revision $(RYLL_REV)"
+	@if [ -x "$(RYLL_BIN)" ]; then \
+		echo "ryll already built: $(RYLL_BIN)"; \
+	else \
+		rm -rf "$(RYLL_DIR)/$(RYLL_REV).tmp" && \
+		$(DOCKER_RUN_RYLL) \
+			-e CARGO_HOME=/build/ryll/$(RYLL_REV).tmp/cargo-home \
+			$(ANDRIS_IMAGE) \
+			cargo install --locked --git https://github.com/shakenfist/ryll \
+				--rev $(RYLL_REV) --no-default-features ryll \
+				--root /build/ryll/$(RYLL_REV).tmp && \
+		rm -rf "$(RYLL_DIR)/$(RYLL_REV).tmp/cargo-home" "$(RYLL_DIR)/$(RYLL_REV)" && \
+		mv "$(RYLL_DIR)/$(RYLL_REV).tmp" "$(RYLL_DIR)/$(RYLL_REV)" && \
+		echo "ryll built: $(RYLL_BIN)"; \
+	fi
+
+# Run andris against Xvfb and drive it with ryll's headless client; see
+# scripts/e2e.sh. Offline, with the checkout read-only, like the compile
+# targets: the script writes only under the container's /tmp. Ryll's
+# binary is mounted read-only from the cargo cache.
+e2e: build ryll-headless
+	$(DOCKER_RUN_OFFLINE) \
+		-v "$(dir $(RYLL_BIN))":/build/ryll-bin:ro \
+		-e RYLL=/build/ryll-bin/ryll \
+		-e ANDRIS=/workspace/target/debug/andris \
+		$(ANDRIS_IMAGE) \
+		scripts/e2e.sh
 
 # Clean build artifacts.
 #

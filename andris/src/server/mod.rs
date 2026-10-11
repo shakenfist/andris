@@ -9,6 +9,8 @@
 //!   four channels;
 //! - [`frames`] cuts captured frames into the display channel's
 //!   `DRAW_COPY` bands;
+//! - [`keymap`] decodes the inputs channel's set-1 scancodes to evdev
+//!   codes;
 //! - [`tls`] loads the TLS listener's certificate.
 //!
 //! # Tasks
@@ -25,6 +27,7 @@ pub mod cursor;
 pub mod display;
 pub mod frames;
 pub mod inputs;
+pub mod keymap;
 pub mod link;
 pub mod main_channel;
 pub mod opcodes;

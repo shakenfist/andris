@@ -23,6 +23,18 @@ use super::session::MouseMode;
 /// How often the main channel pings the client.
 pub const PING_INTERVAL: Duration = Duration::from_secs(30);
 
+/// The channels `CHANNELS_LIST` offers, in order. Inputs must come last:
+/// ryll stops reading the list at the inputs channel (its session loop
+/// `break`s once the one inputs channel has taken its event receiver), so
+/// any channel listed after it is never opened (ryll#509). spice-server
+/// lists inputs after the display and cursor channels, so against QEMU it
+/// goes unnoticed.
+pub const CHANNELS: [ChannelType; 3] = [
+    ChannelType::Display,
+    ChannelType::Cursor,
+    ChannelType::Inputs,
+];
+
 /// The mouse modes andris supports, as `SPICE_MOUSE_MODE_*` flags.
 // Both constants are 1 and 2, so the sum fits a u16.
 const SUPPORTED_MOUSE_MODES: u16 = (MOUSE_MODE_SERVER | MOUSE_MODE_CLIENT) as u16;
@@ -68,7 +80,7 @@ pub async fn serve(
                 match message.header.message_type {
                     main_client::ATTACH_CHANNELS => {
                         let list = ChannelsList {
-                            channels: [ChannelType::Display, ChannelType::Inputs, ChannelType::Cursor]
+                            channels: CHANNELS
                                 .into_iter()
                                 .map(|channel_type| ChannelEntry {
                                     channel_type: channel_type as u8,

@@ -77,8 +77,10 @@ async fn ping_one_follows_init() {
     assert_eq!(ping.id, 1);
 }
 
+/// Inputs comes last because ryll opens nothing listed after it; see
+/// `andris::server::main_channel::CHANNELS`.
 #[tokio::test]
-async fn attach_channels_lists_display_inputs_and_cursor() {
+async fn attach_channels_lists_display_cursor_and_inputs_last() {
     let server = TestServer::start().await;
     let (mut client, _) = server.open_main().await;
     skip_opening(&mut client).await;
@@ -95,8 +97,8 @@ async fn attach_channels_lists_display_inputs_and_cursor() {
         list.channels,
         vec![
             entry(ChannelType::Display),
-            entry(ChannelType::Inputs),
             entry(ChannelType::Cursor),
+            entry(ChannelType::Inputs),
         ]
     );
 }

@@ -12,12 +12,13 @@ pub mod config;
 pub mod platform;
 pub mod server;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use tracing::info;
 
 use config::{Config, PlatformConfig};
 use platform::Platform;
 use platform::synthetic::SyntheticPlatform;
+use platform::x11::X11Platform;
 use server::{Server, ServerOptions, TlsOptions};
 
 /// Andris's name and version, as `--version` prints them.
@@ -33,11 +34,9 @@ pub fn run(config: Config) -> Result<()> {
             info!("exporting a synthetic {size} desktop");
             SyntheticPlatform::new(*size)?.platform()
         }
-        PlatformConfig::X11 { display } => {
-            bail!(
-                "--platform x11 (display {display}) is not available in this build: use \
-                 --platform synthetic"
-            )
+        PlatformConfig::X11 { display: name } => {
+            info!("exporting X display {name}");
+            X11Platform::connect(name)?.platform()
         }
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()

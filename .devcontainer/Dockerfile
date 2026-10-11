@@ -12,6 +12,14 @@ RUN apt-get update && apt-get install -y \
     cmake \
     && rm -rf /var/lib/apt/lists/*
 
+# A headless X server, to test the X11 backend against:
+#   - xvfb: the virtual framebuffer X server
+#   - xauth: X authorisation cookies, for Xvfb -auth and xvfb-run
+RUN apt-get update && apt-get install -y \
+    xvfb \
+    xauth \
+    && rm -rf /var/lib/apt/lists/*
+
 # Create a shared build directory that any user can use
 RUN mkdir -p /build && chmod 777 /build
 

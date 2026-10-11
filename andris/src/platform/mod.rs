@@ -9,7 +9,8 @@
 //! - [`CursorSource`] yields the cursor shape as it changes.
 //!
 //! [`Platform`] bundles one implementation of each. [`synthetic`] is a
-//! deterministic implementation for tests and load testing.
+//! deterministic implementation for tests and load testing, and [`x11`]
+//! exports an X display.
 //!
 //! # Threads
 //!
@@ -29,6 +30,7 @@
 //! ids and modifier flags onto these types is the server's job.
 
 pub mod synthetic;
+pub mod x11;
 
 use std::sync::Arc;
 

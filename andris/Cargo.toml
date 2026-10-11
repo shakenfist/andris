@@ -17,7 +17,6 @@ clap = { version = "4", features = ["derive", "env"] }
 # 0.8, the version shakenfist-spice-protocol uses, so that only one rand
 # is built.
 rand = "0.8"
-rustls-pemfile = "2"
 # 2.6, the version rsa and rustls already pull in.
 subtle = "2.6"
 tokio = { version = "1", features = ["full"] }
@@ -31,10 +30,10 @@ x11rb = { version = "0.13", features = ["xtest", "xfixes", "xkb"] }
 # ryll's shared crates, pinned to ryll's develop at 502199e (2026-10-11).
 # Both crates come from one ryll workspace, so they must always carry the
 # same rev, here and in [dev-dependencies]; move them together.
-shakenfist-spice-protocol = { git = "https://github.com/shakenfist/ryll", rev = "502199e9b87789b2dd45cb9c13a8b6709e5ab7f8" }
+shakenfist-spice-protocol = { version = "0.1.7", git = "https://github.com/shakenfist/ryll", rev = "502199e9b87789b2dd45cb9c13a8b6709e5ab7f8" }
 # Only the encoders. openh264 is still built, because the crate depends on
 # it unconditionally (ryll#499).
-shakenfist-spice-compression = { git = "https://github.com/shakenfist/ryll", rev = "502199e9b87789b2dd45cb9c13a8b6709e5ab7f8", default-features = false, features = [
+shakenfist-spice-compression = { version = "0.1.7", git = "https://github.com/shakenfist/ryll", rev = "502199e9b87789b2dd45cb9c13a8b6709e5ab7f8", default-features = false, features = [
     "encode",
 ] }
 
@@ -42,7 +41,7 @@ shakenfist-spice-compression = { git = "https://github.com/shakenfist/ryll", rev
 rcgen = "0.14"
 # The LZ4 decoder too, so tests can decode what the encoder produced.
 # Cargo unifies these features with the ones above in test builds.
-shakenfist-spice-compression = { git = "https://github.com/shakenfist/ryll", rev = "502199e9b87789b2dd45cb9c13a8b6709e5ab7f8", default-features = false, features = [
+shakenfist-spice-compression = { version = "0.1.7", git = "https://github.com/shakenfist/ryll", rev = "502199e9b87789b2dd45cb9c13a8b6709e5ab7f8", default-features = false, features = [
     "encode",
     "lz4",
 ] }

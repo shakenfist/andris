@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
 use tokio_rustls::rustls::ServerConfig;
-use tokio_rustls::rustls::pki_types::CertificateDer;
+use tokio_rustls::rustls::pki_types::pem::{self, PemObject};
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::config::open_private_file;
 
@@ -23,7 +24,7 @@ pub fn load_server_config(cert: &Path, key: &Path) -> Result<Arc<ServerConfig>> 
     let mut reader = BufReader::new(
         File::open(cert).with_context(|| format!("--tls-cert {cert_shown} cannot be read"))?,
     );
-    let chain = rustls_pemfile::certs(&mut reader)
+    let chain = CertificateDer::pem_reader_iter(&mut reader)
         .collect::<Result<Vec<CertificateDer<'static>>, _>>()
         .with_context(|| format!("--tls-cert {cert_shown} is not valid PEM"))?;
     ensure!(
@@ -32,11 +33,15 @@ pub fn load_server_config(cert: &Path, key: &Path) -> Result<Arc<ServerConfig>> 
     );
 
     let mut reader = BufReader::new(open_private_file(key, "--tls-key")?);
-    let private_key = rustls_pemfile::private_key(&mut reader)
-        .with_context(|| format!("--tls-key {key_shown} is not valid PEM"))?
-        .with_context(|| {
-            format!("--tls-key {key_shown} holds no private key: give a PEM private key")
-        })?;
+    let private_key = match PrivateKeyDer::from_pem_reader(&mut reader) {
+        Ok(key) => key,
+        Err(pem::Error::NoItemsFound) => {
+            anyhow::bail!("--tls-key {key_shown} holds no private key: give a PEM private key")
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("--tls-key {key_shown} is not valid PEM"));
+        }
+    };
 
     let config = ServerConfig::builder()
         .with_no_client_auth()

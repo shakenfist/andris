@@ -19,7 +19,6 @@ dependencies = [
  "clap",
  "rand",
  "rcgen",
- "rustls-pemfile",
  "shakenfist-spice-compression",
  "shakenfist-spice-protocol",
  "subtle",

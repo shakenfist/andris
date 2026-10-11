@@ -6,8 +6,7 @@
 # redistribution use.
 #
 # The advisories ignore list tracks known issues we have explicitly
-# accepted. Every entry must have a URL and a rationale. There are
-# currently none.
+# accepted. Every entry must have a URL and a rationale.
 
 [graph]
 targets = [
@@ -18,7 +17,24 @@ targets = [
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+    # RUSTSEC-2023-0071: rsa Marvin timing attack. rsa reaches andris
+    # through shakenfist-spice-protocol, whose SPICE ticket exchange is
+    # RSA-OAEP by protocol. No fixed rsa release exists. The attack
+    # recovers a key from many timed decryptions with that one key;
+    # andris generates a fresh key for every connection and decrypts
+    # exactly one ticket with it, so no key is ever queried twice.
+    # ryll's deny.toml carries the same entry.
+    # https://rustsec.org/advisories/RUSTSEC-2023-0071
+    "RUSTSEC-2023-0071",
+
+    # RUSTSEC-2025-0134: rustls-pemfile unmaintained. andris parses
+    # PEM with rustls-pki-types itself; the crate remains only as a
+    # dependency of shakenfist-spice-protocol, where ryll tracks the
+    # same migration. ryll's deny.toml carries the same entry.
+    # https://rustsec.org/advisories/RUSTSEC-2025-0134
+    "RUSTSEC-2025-0134",
+]
 
 [licenses]
 version = 2

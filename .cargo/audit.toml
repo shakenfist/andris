@@ -1,0 +1,16 @@
+# cargo-audit policy for andris.
+#
+# This mirrors the [advisories].ignore list in deny.toml, so that
+# `cargo audit` and `cargo deny check advisories` agree about which
+# advisories are accepted. The rationale for each lives in deny.toml.
+# When you change one file, change the other: CI runs both scanners
+# and both must pass.
+
+[advisories]
+ignore = [
+    # rsa Marvin timing attack. See deny.toml.
+    "RUSTSEC-2023-0071",
+
+    # rustls-pemfile unmaintained. See deny.toml.
+    "RUSTSEC-2025-0134",
+]

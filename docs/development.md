@@ -117,6 +117,9 @@ a licence allowlist, yanked crates denied, and crates.io as the only
 registry. Git dependencies are denied except for the ryll
 repository. Add a licence to the allowlist only when a dependency
 needs it, and give every advisory ignore a URL and a rationale.
+`cargo audit` runs too and does not read `deny.toml`, so
+[`.cargo/audit.toml`](https://github.com/shakenfist/andris/blob/develop/.cargo/audit.toml)
+repeats the same advisory ignores; change both together.
 
 ## Pre-commit
 

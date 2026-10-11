@@ -22,14 +22,18 @@
 //! [`PADDING_BYTE`], so that code which mistakes the stride for
 //! `width * 4` shows up.
 //!
-//! [`SyntheticPlatform::paint_undamaged`] lays solid rectangles over the
-//! pattern, the latest on top.
+//! [`SyntheticPlatform::paint`] and [`SyntheticPlatform::paint_undamaged`]
+//! lay solid rectangles over the pattern, and
+//! [`SyntheticPlatform::paint_photo`] a rectangle that looks like a
+//! photograph: smooth gradients and waves with a fixed grain, which LZ4
+//! shrinks little and JPEG a lot. The latest paint is on top.
 //!
 //! # Damage
 //!
 //! [`SyntheticPlatform::advance`] reports the square's old and new
-//! rectangles as damage, and [`SyntheticPlatform::set_size`] the whole
-//! desktop at its new size. [`SyntheticPlatform::paint_undamaged`]
+//! rectangles as damage, [`SyntheticPlatform::paint`] and
+//! [`SyntheticPlatform::paint_photo`] the rectangle they paint, and
+//! [`SyntheticPlatform::set_size`] the whole desktop at its new size. [`SyntheticPlatform::paint_undamaged`]
 //! changes pixels and reports nothing, as a change XDamage missed would,
 //! and [`SyntheticPlatform::report_damage`] reports damage and changes
 //! nothing. A capture renders only the rectangles asked for.
@@ -78,13 +82,22 @@ const SQUARE: (u8, u8, u8) = (255, 128, 0);
 /// The colour of a pixel, as (R, G, B).
 pub type Rgb = (u8, u8, u8);
 
+/// What a paint fills its rectangle with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fill {
+    /// One colour.
+    Solid(Rgb),
+    /// Something like a photograph; see [`photo_pixel`].
+    Photo,
+}
+
 /// What the synthetic desktop looks like now.
 #[derive(Debug)]
 struct State {
     size: Size,
     square_x: u32,
     /// Solid rectangles over the pattern, the latest on top.
-    overlays: Vec<(Rectangle, Rgb)>,
+    overlays: Vec<(Rectangle, Fill)>,
     locks: LockState,
     /// How many of the next captures fail.
     failing_captures: u32,
@@ -108,7 +121,7 @@ pub struct SyntheticPlatform {
 struct Scene {
     size: Size,
     square_x: u32,
-    overlays: Vec<(Rectangle, Rgb)>,
+    overlays: Vec<(Rectangle, Fill)>,
 }
 
 impl SyntheticPlatform {
@@ -167,8 +180,29 @@ impl SyntheticPlatform {
     /// the square and earlier paints, without reporting damage: a change
     /// XDamage missed.
     pub fn paint_undamaged(&self, rect: Rectangle, rgb: Rgb) -> Result<()> {
-        self.state()?.overlays.push((rect, rgb));
+        self.state()?.overlays.push((rect, Fill::Solid(rgb)));
         Ok(())
+    }
+
+    /// Lay a solid `rgb` rectangle over the desktop, as
+    /// [`SyntheticPlatform::paint_undamaged`] does, and report it as
+    /// damage.
+    pub fn paint(&self, rect: Rectangle, rgb: Rgb) -> Result<()> {
+        self.paint_damaged(rect, Fill::Solid(rgb))
+    }
+
+    /// Lay a rectangle that looks like a photograph over the desktop,
+    /// and report it as damage. Its pixels depend only on their place on
+    /// the desktop, so painting it again changes nothing.
+    pub fn paint_photo(&self, rect: Rectangle) -> Result<()> {
+        self.paint_damaged(rect, Fill::Photo)
+    }
+
+    fn paint_damaged(&self, rect: Rectangle, fill: Fill) -> Result<()> {
+        // The lock is released before damage is reported, so a capture
+        // the damage starts sees the paint.
+        self.state()?.overlays.push((rect, fill));
+        self.damage.damage(&[rect])
     }
 
     /// Report `rect` as damaged without changing a pixel.
@@ -377,7 +411,8 @@ fn render(scene: &Scene, rect: Rectangle) -> Result<Frame> {
                 .rev()
                 .find(|(area, _)| contains(area, x, y));
             let (r, g, b) = match overlay {
-                Some(&(_, rgb)) => rgb,
+                Some(&(_, Fill::Solid(rgb))) => rgb,
+                Some((_, Fill::Photo)) => photo_pixel(x, y),
                 None if square.is_some_and(|square| contains(&square, x, y)) => SQUARE,
                 // x < width, so the index is at most 7.
                 None => BARS[(u64::from(x) * 8 / width) as usize],
@@ -386,6 +421,24 @@ fn render(scene: &Scene, rect: Rectangle) -> Result<Frame> {
         }
     }
     Frame::new(rect.width, rect.height, stride, data)
+}
+
+/// Pixel (`x`, `y`) of a photograph-like paint: gradients and slow waves
+/// in each channel, plus a grain of up to 6 either way that a hash of the
+/// place decides.
+fn photo_pixel(x: u32, y: u32) -> Rgb {
+    let (fx, fy) = (f64::from(x), f64::from(y));
+    let wave = 40.0 * (fx / 23.0).sin() * (fy / 31.0).cos();
+    let mut hash = (u64::from(x) << 32 | u64::from(y)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    hash ^= hash >> 29;
+    hash = hash.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    hash ^= hash >> 32;
+    let channel = |base: f64, shift: u32| {
+        let grain = ((hash >> shift) % 13) as f64 - 6.0;
+        // Clamped to a byte first, so the cast cannot truncate.
+        (base + fx * 0.2 + fy * 0.15 + wave + grain).clamp(0.0, 255.0) as u8
+    };
+    (channel(160.0, 0), channel(110.0, 8), channel(60.0, 16))
 }
 
 /// The synthetic cursor: a 32x32 arrow, white with a black outline,
@@ -672,6 +725,28 @@ mod tests {
         assert_eq!(pixel(&after, 2, SQUARE_TOP), [7, 7, 7, 0]);
         assert_eq!(pixel(&after, 6, SQUARE_TOP + 4), [0, 128, 255, 0]);
         assert!(damaged(&subscription).is_empty());
+    }
+
+    #[test]
+    fn paints_report_their_damage() {
+        let platform = SyntheticPlatform::new(SIZE).unwrap();
+        let subscription = platform.subscribe_damage().unwrap();
+        subscription.take().unwrap();
+        platform
+            .paint(Rectangle::new(10, 10, 4, 4), (1, 2, 3))
+            .unwrap();
+        assert_eq!(damaged(&subscription), vec![Rectangle::new(0, 0, 64, 64)]);
+        assert_eq!(pixel(&platform.desktop().unwrap(), 12, 12), [3, 2, 1, 0]);
+
+        let photo = Rectangle::new(128, 0, 128, 64);
+        platform.paint_photo(photo).unwrap();
+        assert_eq!(damaged(&subscription), vec![photo]);
+        let desktop = platform.desktop().unwrap();
+        // Not flat: neighbours differ.
+        assert_ne!(pixel(&desktop, 130, 5), pixel(&desktop, 131, 5));
+        // Painting it again changes no pixel.
+        platform.paint_photo(photo).unwrap();
+        assert_eq!(platform.desktop().unwrap(), desktop);
     }
 
     #[test]

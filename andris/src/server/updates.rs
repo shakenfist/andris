@@ -28,7 +28,8 @@
 //!    cover tiles that did not change, or were not captured.
 //! 4. A rectangle over [`MAX_DRAW_BYTES`] raw is split by rows into pieces
 //!    that fit, so that every message stays far below kerbside's 16 MiB
-//!    cap.
+//!    cap. The pieces are whole tile rows, so every draw covers whole
+//!    tiles (clipped to the surface).
 //! 5. Each piece is encoded from the shadow as one `DRAW_COPY`.
 //!
 //! The shadow is brought up to date before anything is encoded, and every
@@ -40,22 +41,36 @@
 //!
 //! Each `DRAW_COPY` draws on surface [`SURFACE_ID`]: the rectangle as the
 //! box, no clip, `OP_PUT`, no mask, and one image exactly the rectangle's
-//! size, all of which is the source area. The image is LZ4 when the
-//! client may take LZ4 and the result is smaller than the raw pixels, and
-//! an uncompressed top-down 32-bit `BITMAP` otherwise. Each [`Encoding`]
-//! says whether it is lossy; neither is. Image ids count from 1, and no
-//! image asks to be cached.
+//! size, all of which is the source area. The image is, in order of
+//! preference:
+//!
+//! 1. JPEG, when the client may take it ([`EncodeOptions::jpeg`]), the
+//!    rectangle [`looks_photographic`], and the JPEG comes to at most
+//!    [`JPEG_MAX_PERCENT`] of what lossless would send;
+//! 2. LZ4, when the client may take LZ4 and the result is smaller than
+//!    the raw pixels;
+//! 3. an uncompressed top-down 32-bit `BITMAP`.
+//!
+//! The classifier's thresholds were chosen from measurements of real
+//! screens; each constant says what they showed. JPEG is never sent with
+//! alpha. Each [`Encoding`] says whether it is lossy, and only JPEG is:
+//! [`LossyTiles`] tracks where the client holds JPEG's approximation, so
+//! that it can be sent again losslessly once it stops changing. Image ids
+//! count from 1, and no image asks to be cached.
 //!
 //! This module knows nothing of sockets, so it is tested on its own.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result, ensure};
-use shakenfist_spice_compression::{Bgrx, encode_spice_lz4};
+use shakenfist_spice_compression::{Bgrx, encode_spice_jpeg, encode_spice_lz4};
 use shakenfist_spice_protocol::ImageType;
 use shakenfist_spice_protocol::constants::{bitmap_flags, bitmap_fmt, ropd};
 use shakenfist_spice_protocol::messages::{
     BinaryData, BitmapHeader, BitmapPalette, BitmapPayload, Clip, DrawBase, DrawCopyBuilder,
     ImageDescriptor, ImagePayload, Rect, SpiceImage,
 };
+use tokio::time::Instant;
 
 use crate::platform::{Capture, Patch, Rectangle, Region, Size, TILE};
 
@@ -72,11 +87,83 @@ pub const MAX_DRAW_BYTES: usize = 4 * 1024 * 1024;
 /// The surface every update draws on: the primary surface.
 pub const SURFACE_ID: u32 = 0;
 
+/// The smallest rectangle, in pixels, that may be sent as JPEG: one
+/// whole [`TILE`].
+///
+/// Measured with `andris/tests/jpeg_corpus.rs` on a corpus of real
+/// screens, photographic content gains plenty at one tile: the JPEG at
+/// quality 85 of a 64 x 64 photo tile is under a tenth of its LZ4.
+/// Rectangles are tile-merged, so anything smaller is a tile clipped by
+/// the surface's edge, and stays lossless.
+pub const JPEG_MIN_AREA: u64 = TILE as u64 * TILE as u64;
+
+/// The shortest side of a rectangle that may be sent as JPEG: one 4:2:0
+/// MCU. A thinner strip is mostly padding.
+pub const JPEG_MIN_SIDE: u32 = 16;
+
+/// A rectangle is tried as JPEG only if its LZ4 encoding is more than
+/// this percentage of its raw bytes: LZ4 saves less than half.
+///
+/// This is the classifier's signal. In the corpus every 64 x 64 tile of
+/// text, whether a terminal, a document or a real desktop, came out
+/// under 30%, and almost all under 20%; photographs came out at 40% to
+/// 100%, with 1% of their tiles under 50%. Smooth gradients came out at
+/// 10% to 40%, overlapping the text, so no threshold separates them, and
+/// they stay lossless, where LZ4 already takes them to a fifth or less.
+/// 50% keeps the widest margin from text, where a JPEG would smear
+/// glyphs, for the cost of that 1% of photo tiles going as LZ4. The size
+/// test that follows cannot stand in for this one: JPEG was the smaller
+/// for 43% of the real desktop's tiles, and for a whole terminal.
+pub const JPEG_MIN_LZ4_PERCENT: u64 = 50;
+
+/// A JPEG is sent only if it is at most this percentage of what lossless
+/// would send.
+///
+/// An area sent as JPEG is sent again losslessly once still, so a JPEG
+/// that saves little costs more than it gains. In the corpus the JPEG of
+/// a photograph came to 3% to 9% of its LZ4, by rectangle size, and
+/// this limit turned none away; it bounds the waste on content the
+/// classifier misjudges.
+pub const JPEG_MAX_PERCENT: u64 = 50;
+
+/// A JPEG quality, 1 to 100: `--jpeg-quality` when it is not 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JpegQuality(u8);
+
+impl JpegQuality {
+    /// `--jpeg-quality`'s default, and spice-server's.
+    pub const DEFAULT: Self = Self(85);
+
+    /// The quality `quality`, or `None` unless it is 1 to 100.
+    pub const fn new(quality: u8) -> Option<Self> {
+        if matches!(quality, 1..=100) {
+            Some(Self(quality))
+        } else {
+            None
+        }
+    }
+
+    /// The quality, 1 to 100.
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
 /// What the client may be sent, as far as encoding goes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EncodeOptions {
     /// Whether images may be LZ4.
     pub lz4: bool,
+    /// The quality to encode a photographic rectangle as JPEG at, or
+    /// `None` if images must be lossless.
+    pub jpeg: Option<JpegQuality>,
+}
+
+impl EncodeOptions {
+    /// These options with JPEG ruled out: for a lossless refresh.
+    pub fn lossless(self) -> Self {
+        Self { jpeg: None, ..self }
+    }
 }
 
 /// How one draw's image is encoded.
@@ -86,14 +173,17 @@ pub enum Encoding {
     Lz4,
     /// An uncompressed top-down 32-bit `BITMAP`.
     Bitmap,
+    /// A baseline JPEG, with no alpha.
+    Jpeg,
 }
 
 impl Encoding {
     /// Whether the client's pixels may differ from the shadow's once the
-    /// image is drawn.
+    /// image is drawn: only for JPEG.
     pub fn is_lossy(self) -> bool {
         match self {
             Self::Lz4 | Self::Bitmap => false,
+            Self::Jpeg => true,
         }
     }
 
@@ -102,6 +192,7 @@ impl Encoding {
         match self {
             Self::Lz4 => ImageType::Lz4,
             Self::Bitmap => ImageType::Pixmap,
+            Self::Jpeg => ImageType::Jpeg,
         }
     }
 }
@@ -328,12 +419,18 @@ fn tile_parts(rect: Rectangle) -> impl Iterator<Item = Rectangle> {
 }
 
 /// `rect` in pieces of whole rows, top first, each at most `max_bytes`
-/// raw, or one row a piece if a row is larger.
+/// raw, or one row a piece if a row is larger. When a piece may be at
+/// least [`TILE`] rows, its height is a whole number of tiles, so that a
+/// tile-aligned rectangle splits into tile-aligned pieces and no tile is
+/// sent half in one piece and half in another.
 fn split(rect: Rectangle, max_bytes: usize) -> impl Iterator<Item = Rectangle> {
     let row_bytes = (rect.width as usize * 4).max(1);
-    let rows = u32::try_from(max_bytes / row_bytes)
+    let mut rows = u32::try_from(max_bytes / row_bytes)
         .unwrap_or(u32::MAX)
         .max(1);
+    if rows >= TILE {
+        rows -= rows % TILE;
+    }
     (0..rect.height.div_ceil(rows)).map(move |index| {
         // index * rows < height, so neither overflows.
         let top = index * rows;
@@ -357,17 +454,49 @@ fn wire_rect(rect: Rectangle) -> Result<Rect> {
     })
 }
 
-/// Choose how to encode `image`, and encode it: LZ4 if `options` allow
-/// it and it comes out smaller than the raw pixels, otherwise a top-down
-/// 32-bit `BITMAP` with no row padding.
+/// Whether a `width` x `height` image whose LZ4 encoding is `lz4_len`
+/// bytes looks photographic enough to try as JPEG: large enough, and
+/// LZ4 leaves more than [`JPEG_MIN_LZ4_PERCENT`] of its raw bytes.
+pub fn looks_photographic(width: u32, height: u32, lz4_len: usize) -> bool {
+    let area = u64::from(width) * u64::from(height);
+    let raw_len = area * 4;
+    width.min(height) >= JPEG_MIN_SIDE
+        && area >= JPEG_MIN_AREA
+        && (lz4_len as u64).saturating_mul(100) > raw_len * JPEG_MIN_LZ4_PERCENT
+}
+
+/// Choose how to encode `image`, and encode it.
+///
+/// - JPEG if `options` allow it, the image [`looks_photographic`], and
+///   the JPEG is at most [`JPEG_MAX_PERCENT`] of what lossless would
+///   send. The LZ4 the classifier needs is made whether or not LZ4 may
+///   be sent.
+/// - Otherwise LZ4 if `options` allow it and it comes out smaller than
+///   the raw pixels.
+/// - Otherwise a top-down 32-bit `BITMAP` with no row padding.
 fn choose_encoding(image: &Bgrx<'_>, options: EncodeOptions) -> Result<(Encoding, ImagePayload)> {
     let row_bytes = image.width() as usize * 4;
     let raw_len = row_bytes * image.height() as usize;
-    if options.lz4 {
-        let data = encode_spice_lz4(image);
-        if data.len() < raw_len {
-            return Ok((Encoding::Lz4, ImagePayload::Lz4(BinaryData { data })));
+    let lz4 = (options.lz4 || options.jpeg.is_some()).then(|| encode_spice_lz4(image));
+    if let (Some(quality), Some(lz4)) = (options.jpeg, &lz4)
+        && looks_photographic(image.width(), image.height(), lz4.len())
+    {
+        let lossless_len = if options.lz4 {
+            lz4.len().min(raw_len)
+        } else {
+            raw_len
+        };
+        let data = encode_spice_jpeg(image, quality.get())
+            .with_context(|| format!("encoding a {}x{} JPEG", image.width(), image.height()))?;
+        if data.len() as u64 * 100 <= lossless_len as u64 * JPEG_MAX_PERCENT {
+            return Ok((Encoding::Jpeg, ImagePayload::Jpeg(BinaryData { data })));
         }
+    }
+    if options.lz4
+        && let Some(data) = lz4
+        && data.len() < raw_len
+    {
+        return Ok((Encoding::Lz4, ImagePayload::Lz4(BinaryData { data })));
     }
     let mut data = Vec::with_capacity(raw_len);
     for row in image
@@ -425,6 +554,177 @@ fn encode_draw(
         encoding,
         body,
     })
+}
+
+/// The tiles of a surface whose pixels the client may hold only
+/// approximately, because they were last sent lossily, each with the time
+/// it is due to be sent again losslessly.
+///
+/// A tile becomes lossy when a lossy draw touches it, due `delay` later.
+/// Damage that touches a lossy tile postpones it to `delay` after the
+/// damage. A tile lying wholly within a lossless draw, or in a region a
+/// refresh sent, is exact again. Each tile keeps its own time, so an area
+/// that keeps changing does not hold back the refresh of one that has
+/// stopped.
+#[derive(Debug, Clone)]
+pub struct LossyTiles {
+    size: Size,
+    columns: u32,
+    delay: Duration,
+    /// One entry a tile, row by row: when it is due, or `None` if it is
+    /// exact.
+    due: Vec<Option<Instant>>,
+}
+
+impl LossyTiles {
+    /// No lossy tiles, and no surface until [`LossyTiles::reset`] gives
+    /// one; a tile is refreshed once it has been still for `delay`.
+    pub fn new(delay: Duration) -> Self {
+        Self {
+            size: Size {
+                width: 0,
+                height: 0,
+            },
+            columns: 0,
+            delay,
+            due: Vec::new(),
+        }
+    }
+
+    /// Forget every lossy tile, for a new surface of `size`.
+    pub fn reset(&mut self, size: Size) {
+        let region = Region::empty(size);
+        let (columns, rows) = region.grid();
+        self.size = size;
+        self.columns = columns;
+        self.due = vec![None; columns as usize * rows as usize];
+    }
+
+    /// The size of the surface the tiles belong to.
+    pub fn size(&self) -> Size {
+        self.size
+    }
+
+    /// Whether every tile is exact.
+    pub fn is_empty(&self) -> bool {
+        self.due.iter().all(Option::is_none)
+    }
+
+    /// The lossy tiles, as a region.
+    pub fn region(&self) -> Region {
+        self.region_where(|_| true)
+    }
+
+    /// When the earliest lossy tile is due, if there is one.
+    pub fn next_due(&self) -> Option<Instant> {
+        self.due.iter().flatten().min().copied()
+    }
+
+    /// The lossy tiles due by `now`, as a region. They stay lossy until
+    /// [`LossyTiles::clear`].
+    pub fn due(&self, now: Instant) -> Region {
+        self.region_where(|due| due <= now)
+    }
+
+    /// Postpone every lossy tile `damage` touches to `delay` after `now`.
+    /// Damage of a desktop of another size touches nothing: the surface is
+    /// about to be replaced.
+    pub fn touch(&mut self, damage: &Region, now: Instant) {
+        if damage.size() != self.size {
+            return;
+        }
+        let later = now + self.delay;
+        for (index, due) in self.due.iter_mut().enumerate() {
+            let (col, row) = tile_at(index, self.columns);
+            if due.is_some() && damage.contains_tile(col, row) {
+                *due = Some(later);
+            }
+        }
+    }
+
+    /// Record what `draws`, sent at `now`, did to the client: each tile a
+    /// lossless draw covers wholly is exact, and then each tile a lossy
+    /// draw touches is lossy, due `delay` after `now`.
+    pub fn record(&mut self, draws: &[Draw], now: Instant) {
+        for draw in draws.iter().filter(|draw| !draw.is_lossy()) {
+            for (index, tile) in self.tiles_of(draw.rect) {
+                if tile_within(tile, draw.rect)
+                    && let Some(due) = self.due.get_mut(index)
+                {
+                    *due = None;
+                }
+            }
+        }
+        let later = now + self.delay;
+        for draw in draws.iter().filter(|draw| draw.is_lossy()) {
+            for (index, _) in self.tiles_of(draw.rect) {
+                if let Some(due) = self.due.get_mut(index) {
+                    *due = Some(later);
+                }
+            }
+        }
+    }
+
+    /// Mark every tile of `region` exact, as once a refresh has sent it
+    /// losslessly. A region of another size clears nothing.
+    pub fn clear(&mut self, region: &Region) {
+        if region.size() != self.size {
+            return;
+        }
+        for (index, due) in self.due.iter_mut().enumerate() {
+            let (col, row) = tile_at(index, self.columns);
+            if region.contains_tile(col, row) {
+                *due = None;
+            }
+        }
+    }
+
+    /// The lossy tiles whose time satisfies `keep`, as a region.
+    fn region_where(&self, keep: impl Fn(Instant) -> bool) -> Region {
+        let mut region = Region::empty(self.size);
+        for (index, due) in self.due.iter().enumerate() {
+            if due.is_some_and(&keep) {
+                let (col, row) = tile_at(index, self.columns);
+                region.add(Rectangle::new(col * TILE, row * TILE, TILE, TILE));
+            }
+        }
+        region
+    }
+
+    /// The index and rectangle, clipped to the surface, of each tile
+    /// `rect` touches.
+    fn tiles_of(&self, rect: Rectangle) -> Vec<(usize, Rectangle)> {
+        let mut region = Region::empty(self.size);
+        region.add(rect);
+        let (columns, rows) = region.grid();
+        let mut tiles = Vec::new();
+        for row in 0..rows {
+            for col in 0..columns {
+                if region.contains_tile(col, row)
+                    && let Some(tile) =
+                        Rectangle::new(col * TILE, row * TILE, TILE, TILE).clip(self.size)
+                {
+                    tiles.push((row as usize * columns as usize + col as usize, tile));
+                }
+            }
+        }
+        tiles
+    }
+}
+
+/// The column and row of tile `index` of a grid `columns` tiles wide.
+fn tile_at(index: usize, columns: u32) -> (u32, u32) {
+    let columns = columns.max(1) as usize;
+    // Both are below the grid's sides, which are u32s.
+    ((index % columns) as u32, (index / columns) as u32)
+}
+
+/// Whether `tile` lies wholly within `rect`.
+fn tile_within(tile: Rectangle, rect: Rectangle) -> bool {
+    tile.x >= rect.x
+        && tile.y >= rect.y
+        && tile.right() <= rect.right()
+        && tile.bottom() <= rect.bottom()
 }
 
 /// The pixels of `region`'s tiles, clipped to its desktop.
@@ -557,7 +857,7 @@ impl UpdateEncoder {
 
 #[cfg(test)]
 mod tests {
-    use shakenfist_spice_compression::decompress_spice_lz4;
+    use shakenfist_spice_compression::{JpegDecoder, JpegDecoderRsDecoder, decompress_spice_lz4};
     use shakenfist_spice_protocol::constants::clip_type;
     use shakenfist_spice_protocol::messages::{DrawCopy, WireType};
 
@@ -575,8 +875,24 @@ mod tests {
     /// Bytes of padding after each row of a test frame.
     const PADDING: usize = 12;
 
-    const LZ4: EncodeOptions = EncodeOptions { lz4: true };
-    const RAW: EncodeOptions = EncodeOptions { lz4: false };
+    const LZ4: EncodeOptions = EncodeOptions {
+        lz4: true,
+        jpeg: None,
+    };
+    const RAW: EncodeOptions = EncodeOptions {
+        lz4: false,
+        jpeg: None,
+    };
+    /// What `auto-glz` allows, at the default quality.
+    const AUTO: EncodeOptions = EncodeOptions {
+        lz4: true,
+        jpeg: Some(JpegQuality::DEFAULT),
+    };
+    /// JPEG allowed, but not LZ4: a client without the LZ4 capability.
+    const JPEG_ONLY: EncodeOptions = EncodeOptions {
+        lz4: false,
+        jpeg: Some(JpegQuality::DEFAULT),
+    };
 
     fn size(width: u32, height: u32) -> Size {
         Size { width, height }
@@ -628,6 +944,56 @@ mod tests {
                 }
             }
             Self { size, pixels }
+        }
+
+        /// Something like a photograph: smooth gradients and slow waves,
+        /// with a little grain, which LZ4 cannot shrink much and JPEG
+        /// can.
+        fn photo(size: Size) -> Self {
+            let mut rng = Rng(0x5EED_0F0F_F070_0001);
+            let mut pixels = Vec::with_capacity(size.width as usize * size.height as usize * 4);
+            for y in 0..size.height {
+                for x in 0..size.width {
+                    let (fx, fy) = (f64::from(x), f64::from(y));
+                    let wave = 40.0 * (fx / 23.0).sin() * (fy / 31.0).cos();
+                    let mut pixel = [0; 4];
+                    for (channel, base) in [(0, 60.0), (1, 110.0), (2, 160.0)] {
+                        let grain = f64::from(rng.below(13)) - 6.0;
+                        let value = base + fx * 0.2 + fy * 0.15 + wave + grain;
+                        pixel[channel] = value.clamp(0.0, 255.0) as u8;
+                    }
+                    pixels.extend_from_slice(&pixel);
+                }
+            }
+            Self { size, pixels }
+        }
+
+        /// Something like text: dark glyph strokes, one or two pixels
+        /// wide, in 8 x 16 cells on a flat light background.
+        fn text(size: Size) -> Self {
+            let mut desktop = Self {
+                size,
+                pixels: [0xF0, 0xF0, 0xF0, 0].repeat(size.width as usize * size.height as usize),
+            };
+            let mut rng = Rng(0x7E47_7E47_7E47_7E47);
+            let ink = [0x20, 0x20, 0x20, 0];
+            for top in (0..size.height.saturating_sub(16)).step_by(16) {
+                for left in (0..size.width.saturating_sub(8)).step_by(8) {
+                    // Some cells are spaces.
+                    if rng.below(5) == 0 {
+                        continue;
+                    }
+                    for _ in 0..3 {
+                        let stroke = if rng.below(2) == 0 {
+                            rect(left + 1 + rng.below(5), top + 3, 1 + rng.below(2), 10)
+                        } else {
+                            rect(left + 1, top + 3 + rng.below(9), 6, 1 + rng.below(2))
+                        };
+                        desktop.fill(stroke, ink);
+                    }
+                }
+            }
+            desktop
         }
 
         /// Pseudo-random pixels, which LZ4 cannot shrink.
@@ -770,6 +1136,16 @@ mod tests {
                         .unwrap()
                         .pixels
                 }
+                ImagePayload::Jpeg(data) => {
+                    assert_eq!(draw.encoding, Encoding::Jpeg);
+                    let decoded = decode_jpeg(&data.data);
+                    assert_eq!(
+                        (decoded.width, decoded.height),
+                        (r.width, r.height),
+                        "the JPEG is the rectangle's size"
+                    );
+                    decoded.rgba
+                }
                 ImagePayload::Bitmap(bitmap) => {
                     assert_eq!(draw.encoding, Encoding::Bitmap);
                     assert_eq!(bitmap.header.format, bitmap_fmt::BIT32);
@@ -795,6 +1171,17 @@ mod tests {
             }
         }
 
+        /// The largest difference between any channel of the surface and
+        /// of `desktop`.
+        fn worst_difference(&self, desktop: &Desktop) -> u8 {
+            self.rgba
+                .iter()
+                .zip(rgba(&desktop.pixels))
+                .map(|(&mine, theirs)| mine.abs_diff(theirs))
+                .max()
+                .unwrap_or(0)
+        }
+
         /// Assert the surface shows exactly `desktop`.
         fn assert_shows(&self, desktop: &Desktop) {
             assert_eq!(self.size, desktop.size);
@@ -807,6 +1194,16 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A JPEG, decoded with ryll's pure-Rust decoder, after checking that
+    /// it starts and ends as a JPEG must.
+    fn decode_jpeg(data: &[u8]) -> shakenfist_spice_compression::DecodedJpeg {
+        assert!(data.starts_with(&[0xFF, 0xD8]), "no SOI marker");
+        assert!(data.ends_with(&[0xFF, 0xD9]), "no EOI marker");
+        JpegDecoderRsDecoder::new()
+            .decode(data)
+            .expect("the JPEG does not decode")
     }
 
     /// An encoder, and a client that has drawn `desktop`'s first,
@@ -1003,6 +1400,16 @@ mod tests {
         assert_eq!(split(r, 999).count(), 2, "one byte over");
         assert_eq!(split(r, 10).count(), 25, "a row each when a row is over");
         assert_eq!(split(rect(0, 0, 10, 0), 400).count(), 0);
+        // 100 rows fit, but pieces are whole tiles.
+        assert_eq!(
+            split(rect(0, 64, 1, 200), 400).collect::<Vec<_>>(),
+            vec![
+                rect(0, 64, 1, 64),
+                rect(0, 128, 1, 64),
+                rect(0, 192, 1, 64),
+                rect(0, 256, 1, 8)
+            ]
+        );
     }
 
     #[test]
@@ -1164,6 +1571,249 @@ mod tests {
 
         assert!(!Encoding::Lz4.is_lossy());
         assert!(!Encoding::Bitmap.is_lossy());
+        assert!(Encoding::Jpeg.is_lossy());
+    }
+
+    /// The encodings of the draws of `desktop`'s first, complete update,
+    /// encoded under `options`.
+    fn first_encodings(desktop: &Desktop, options: EncodeOptions) -> Vec<Encoding> {
+        UpdateEncoder::new()
+            .update(&desktop.capture_all(), options)
+            .unwrap()
+            .draws
+            .iter()
+            .map(|draw| draw.encoding)
+            .collect()
+    }
+
+    #[test]
+    fn jpeg_quality_is_one_to_one_hundred() {
+        assert_eq!(JpegQuality::new(0), None);
+        assert_eq!(JpegQuality::new(1).map(JpegQuality::get), Some(1));
+        assert_eq!(JpegQuality::new(100).map(JpegQuality::get), Some(100));
+        assert_eq!(JpegQuality::new(101), None);
+        assert_eq!(JpegQuality::DEFAULT.get(), 85);
+        assert_eq!(AUTO.lossless(), LZ4);
+    }
+
+    #[test]
+    fn a_photographic_rectangle_is_jpeg_when_allowed() {
+        let desktop = Desktop::photo(size(160, 128));
+        for options in [AUTO, JPEG_ONLY] {
+            let update = UpdateEncoder::new()
+                .update(&desktop.capture_all(), options)
+                .unwrap();
+            assert_eq!(rects(&update), vec![Rectangle::full(desktop.size)]);
+            let draw = &update.draws[0];
+            assert_eq!(draw.encoding, Encoding::Jpeg, "{options:?}");
+            assert!(draw.is_lossy());
+            // Far smaller than lossless would have been.
+            assert!(draw.encoded_bytes() * 4 < draw.raw_bytes());
+
+            // It decodes to the rectangle's size, and close to the desktop.
+            let mut client = Client::new(desktop.size);
+            client.apply_all(&update);
+            let worst = client.worst_difference(&desktop);
+            assert!(worst > 0, "a JPEG of this is not exact");
+            assert!(worst < 64, "the JPEG is off by {worst}");
+        }
+    }
+
+    #[test]
+    fn a_photographic_rectangle_is_lossless_unless_allowed() {
+        let desktop = Desktop::photo(size(160, 128));
+        // lz4 is an explicit choice, OFF is RAW, and --jpeg-quality 0 is
+        // LZ4 with no JPEG: none of them is ever JPEG.
+        for options in [LZ4, RAW] {
+            let update = UpdateEncoder::new()
+                .update(&desktop.capture_all(), options)
+                .unwrap();
+            assert!(update.draws.iter().all(|draw| !draw.is_lossy()));
+            let mut client = Client::new(desktop.size);
+            client.apply_all(&update);
+            client.assert_shows(&desktop);
+        }
+    }
+
+    #[test]
+    fn text_is_never_jpeg() {
+        let desktop = Desktop::text(size(512, 384));
+        for options in [AUTO, JPEG_ONLY] {
+            let encodings = first_encodings(&desktop, options);
+            assert!(
+                !encodings.contains(&Encoding::Jpeg),
+                "{options:?}: {encodings:?}"
+            );
+        }
+        // Tile by tile too, as a frame of small changes would send it.
+        let (mut encoder, mut client) = started(&desktop);
+        let mut changed = desktop.clone();
+        for row in 0..6 {
+            for col in 0..8 {
+                changed.flip(col * TILE + 9, row * TILE + 9);
+            }
+        }
+        let update = encoder.update(&changed.capture_all(), AUTO).unwrap();
+        assert!(update.draws.iter().all(|draw| !draw.is_lossy()));
+        client.apply_all(&update);
+        client.assert_shows(&changed);
+    }
+
+    #[test]
+    fn small_rectangles_are_never_jpeg() {
+        // Under a tile's area, or too thin, however photographic.
+        for small in [size(63, 64), size(64, 63), size(400, 10), size(10, 400)] {
+            let desktop = Desktop::photo(small);
+            assert_eq!(
+                first_encodings(&desktop, AUTO),
+                vec![Encoding::Lz4],
+                "{small}"
+            );
+        }
+        // A tile clipped by the surface's edge: SIZE's last column is 36
+        // pixels wide.
+        let mut desktop = Desktop::photo(SIZE);
+        let mut encoder = UpdateEncoder::new();
+        encoder.update(&desktop.capture_all(), LZ4).unwrap();
+        desktop.flip(SIZE.width - 1, 0);
+        let update = encoder.update(&desktop.capture_all(), AUTO).unwrap();
+        assert_eq!(rects(&update), vec![rect(192, 0, 36, 64)]);
+        assert!(!update.draws[0].is_lossy());
+        assert!(!looks_photographic(TILE - 1, TILE, usize::MAX));
+        assert!(!looks_photographic(4096, JPEG_MIN_SIDE - 1, usize::MAX));
+        assert!(looks_photographic(TILE, TILE, usize::MAX));
+    }
+
+    #[test]
+    fn the_classifier_needs_lz4_to_save_less_than_half() {
+        let raw = (TILE * TILE * 4) as usize;
+        assert!(!looks_photographic(TILE, TILE, raw / 2));
+        assert!(looks_photographic(TILE, TILE, raw / 2 + 1));
+    }
+
+    #[test]
+    fn a_refresh_makes_a_jpeg_exact() {
+        let desktop = Desktop::photo(size(256, 192));
+        let mut encoder = UpdateEncoder::new();
+        let mut client = Client::new(desktop.size);
+        let update = encoder.update(&desktop.capture_all(), AUTO).unwrap();
+        assert!(update.draws.iter().all(Draw::is_lossy));
+        client.apply_all(&update);
+        assert!(client.worst_difference(&desktop) > 0);
+
+        let start = Instant::now();
+        let delay = Duration::from_millis(500);
+        let mut lossy = LossyTiles::new(delay);
+        lossy.reset(desktop.size);
+        lossy.record(&update.draws, start);
+        assert_eq!(lossy.region(), Region::full(desktop.size));
+        assert_eq!(lossy.next_due(), Some(start + delay));
+
+        let due = lossy.due(start + delay);
+        let update = encoder.refresh(&due, AUTO.lossless()).unwrap();
+        assert!(update.draws.iter().all(|draw| !draw.is_lossy()));
+        client.apply_all(&update);
+        client.assert_shows(&desktop);
+        lossy.clear(&due);
+        assert!(lossy.is_empty());
+    }
+
+    /// A draw of `rect` encoded as `encoding`, with no body.
+    fn draw(rect: Rectangle, encoding: Encoding) -> Draw {
+        Draw {
+            rect,
+            encoding,
+            body: Vec::new(),
+        }
+    }
+
+    fn region(size: Size, rects: &[Rectangle]) -> Region {
+        let mut region = Region::empty(size);
+        for &r in rects {
+            region.add(r);
+        }
+        region
+    }
+
+    #[test]
+    fn lossy_tiles_fall_due_after_the_delay() {
+        let delay = Duration::from_millis(500);
+        let start = Instant::now();
+        let mut lossy = LossyTiles::new(delay);
+        assert!(lossy.is_empty());
+        assert_eq!(lossy.next_due(), None);
+        lossy.reset(SIZE);
+        assert_eq!(lossy.size(), SIZE);
+
+        // A lossy draw across four tiles, partly.
+        lossy.record(&[draw(rect(60, 60, 10, 10), Encoding::Jpeg)], start);
+        let four = region(SIZE, &[rect(0, 0, 128, 128)]);
+        assert_eq!(lossy.region(), four);
+        assert_eq!(lossy.next_due(), Some(start + delay));
+        assert!(
+            lossy
+                .due(start + delay - Duration::from_millis(1))
+                .is_empty()
+        );
+        assert_eq!(lossy.due(start + delay), four);
+
+        // Damage on one of them postpones it alone.
+        let later = start + Duration::from_millis(300);
+        lossy.touch(&region(SIZE, &[rect(70, 70, 1, 1)]), later);
+        assert_eq!(
+            lossy.due(start + delay),
+            region(SIZE, &[rect(0, 0, 128, 64), rect(0, 64, 64, 64)])
+        );
+        assert_eq!(lossy.due(later + delay), four);
+        // Damage elsewhere touches nothing; so does damage of another size.
+        lossy.touch(&region(SIZE, &[rect(200, 100, 1, 1)]), later);
+        lossy.touch(&Region::full(size(64, 64)), later + delay);
+        assert_eq!(lossy.region(), four);
+        assert_eq!(lossy.next_due(), Some(start + delay));
+
+        lossy.clear(&region(SIZE, &[rect(0, 0, 1, 1)]));
+        assert_eq!(lossy.region().tile_count(), 3);
+        lossy.reset(SIZE);
+        assert!(lossy.is_empty());
+    }
+
+    #[test]
+    fn lossless_draws_clear_only_the_tiles_they_cover() {
+        let start = Instant::now();
+        let mut lossy = LossyTiles::new(Duration::from_millis(500));
+        lossy.reset(SIZE);
+        lossy.record(&[draw(Rectangle::full(SIZE), Encoding::Jpeg)], start);
+        assert_eq!(lossy.region(), Region::full(SIZE));
+
+        // Tile (1, 0) wholly, and tile (2, 0) in part; the clipped tile
+        // (3, 2) wholly, though it is 36 x 8.
+        lossy.record(
+            &[
+                draw(rect(64, 0, 100, 64), Encoding::Lz4),
+                draw(rect(192, 128, 36, 8), Encoding::Bitmap),
+            ],
+            start,
+        );
+        assert!(!lossy.region().contains_tile(1, 0));
+        assert!(lossy.region().contains_tile(2, 0));
+        assert!(!lossy.region().contains_tile(3, 2));
+        assert_eq!(lossy.region().tile_count(), 10);
+
+        // A frame with lossless and lossy draws on one tile leaves it
+        // lossy; a lossy draw re-dates the tiles it touches.
+        let later = start + Duration::from_millis(100);
+        lossy.record(
+            &[
+                draw(rect(64, 0, 64, 64), Encoding::Jpeg),
+                draw(rect(64, 0, 64, 64), Encoding::Lz4),
+            ],
+            later,
+        );
+        assert!(lossy.region().contains_tile(1, 0));
+        assert_eq!(
+            lossy.due(start + Duration::from_millis(500)).tile_count(),
+            10
+        );
     }
 
     /// The image id of each draw.

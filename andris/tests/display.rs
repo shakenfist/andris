@@ -1,11 +1,12 @@
 //! The display channel: its start sequence, the draws it sends and how
 //! they decode, compression choice, damage-driven frames and their
-//! `MARK`s, the rate cap, the ack window, the scrub, resizing and failed
-//! captures, against an in-process andris on the synthetic platform.
+//! `MARK`s, the rate cap, the ack window, the scrub, resizing, failed
+//! captures, and JPEG with its lossless refresh, against an in-process
+//! andris on the synthetic platform.
 //!
-//! Every draw is decoded, with ryll's `DrawCopy` reader and LZ4 decoder,
-//! onto a client-side copy of the surface, which is compared with what
-//! the synthetic desktop shows.
+//! Every draw is decoded, with ryll's `DrawCopy` reader and its LZ4 and
+//! JPEG decoders, onto a client-side copy of the surface, which is
+//! compared with what the synthetic desktop shows.
 
 // Test helpers, where a failed unwrap is a failed test. clippy's
 // allow-unwrap-in-tests covers only #[test] functions themselves.
@@ -18,8 +19,8 @@ use std::time::{Duration, Instant};
 use andris::platform::synthetic::{SQUARE_SIZE, SQUARE_TOP};
 use andris::platform::{DisplayGeometry, Frame, Rectangle, Region, Size};
 use andris::server::display::{CAPTURE_RETRY, MAX_CAPTURE_FAILURES};
-use andris::server::updates::MAX_RECTS_PER_FRAME;
-use shakenfist_spice_compression::decompress_spice_lz4;
+use andris::server::updates::{JpegQuality, MAX_RECTS_PER_FRAME};
+use shakenfist_spice_compression::{JpegDecoder, JpegDecoderRsDecoder, decompress_spice_lz4};
 use shakenfist_spice_protocol::constants::{
     bitmap_flags, bitmap_fmt, clip_type, image_compression, ropd, surface_fmt,
 };
@@ -32,7 +33,7 @@ use shakenfist_spice_protocol::{
     ChannelType, ImageType, capabilities, display_client, display_server,
 };
 
-use support::{TestClient, TestServer};
+use support::{TestClient, TestServer, Tuning};
 
 /// The frame interval of the servers here, unless a test says otherwise:
 /// short, so tests are quick.
@@ -155,6 +156,17 @@ fn decode_draw(message: &ReceivedMessage) -> Draw {
             decompress_spice_lz4(&data.data, width as usize, height as usize)
                 .unwrap()
                 .pixels
+        }
+        ImagePayload::Jpeg(data) => {
+            assert_eq!(descriptor.image_type, ImageType::Jpeg as u8);
+            assert!(data.data.starts_with(&[0xFF, 0xD8]), "no SOI marker");
+            let decoded = JpegDecoderRsDecoder::new().decode(&data.data).unwrap();
+            assert_eq!(
+                (decoded.width, decoded.height),
+                (width, height),
+                "the JPEG is the box's size"
+            );
+            decoded.rgba
         }
         ImagePayload::Bitmap(bitmap) => {
             assert_eq!(descriptor.image_type, ImageType::Pixmap as u8);
@@ -326,19 +338,28 @@ async fn expect_quiet_for(client: &mut TestClient, wait: Duration) {
 /// Read one frame onto `screen`: DRAW_COPYs until a `MARK`. Returns the
 /// draws' boxes.
 async fn expect_frame(client: &mut TestClient, screen: &mut Screen) -> Vec<Rect> {
-    let mut boxes = Vec::new();
+    expect_frame_images(client, screen)
+        .await
+        .into_iter()
+        .map(|(bbox, _)| bbox)
+        .collect()
+}
+
+/// [`expect_frame`], returning each draw's box and image type.
+async fn expect_frame_images(client: &mut TestClient, screen: &mut Screen) -> Vec<(Rect, u8)> {
+    let mut draws = Vec::new();
     loop {
         let message = client.recv().await;
         match message.header.message_type {
             display_server::DRAW_COPY => {
                 let draw = decode_draw(&message);
                 screen.apply(&draw);
-                boxes.push(draw.bbox);
+                draws.push((draw.bbox, draw.image_type));
             }
             display_server::MARK => {
                 assert!(message.payload().is_empty());
-                assert!(!boxes.is_empty(), "a MARK with no draws before it");
-                return boxes;
+                assert!(!draws.is_empty(), "a MARK with no draws before it");
+                return draws;
             }
             other => panic!("expected a DRAW_COPY or MARK, got opcode {other}"),
         }
@@ -841,4 +862,236 @@ async fn the_rate_cap_holds_under_continuous_damage() {
     assert!(marks <= 12, "{marks} frames in a second");
     assert!(marks >= 5, "only {marks} frames in a second");
     screen.assert_shows(&server.platform.desktop().unwrap());
+}
+
+/// The lossless delay of the servers the JPEG tests start: short, so the
+/// tests are quick, but long against the frame interval.
+const LOSSLESS: Duration = Duration::from_millis(200);
+
+/// Where the JPEG tests paint a photograph: four tiles, away from the
+/// square, which one rectangle covers.
+const PHOTO: Rectangle = Rectangle::new(128, 0, 128, 128);
+
+/// Whether `image_type` is lossless: LZ4 or a bitmap. Whether LZ4 beats
+/// a bitmap on the synthetic photograph, whose grain all but defeats it,
+/// depends on the rectangle.
+fn is_lossless(image_type: u8) -> bool {
+    image_type == ImageType::Lz4 as u8 || image_type == ImageType::Pixmap as u8
+}
+
+/// A server whose lossy areas are refreshed after [`LOSSLESS`], sending
+/// JPEG at `jpeg_quality`; its main channel; and a display channel with
+/// ryll's default capabilities, through its start sequence with
+/// `compression` as the client's preference.
+async fn start_jpeg(
+    jpeg_quality: Option<JpegQuality>,
+    compression: u8,
+) -> (TestServer, TestClient, TestClient, Screen) {
+    let server = TestServer::start_tuned(Tuning {
+        frame_interval: INTERVAL,
+        lossless_delay: LOSSLESS,
+        jpeg_quality,
+        ..Tuning::default()
+    })
+    .await;
+    let (server, main, mut client) = open_display_on(server, capabilities::DEFAULT_DISPLAY).await;
+    let screen = start(&server, &mut client, compression).await;
+    (server, main, client, screen)
+}
+
+/// Whether `screen` shows exactly `frame`.
+fn shows(screen: &Screen, frame: &Frame) -> bool {
+    (0..frame.height()).all(|y| {
+        let row = rgba(frame.row(y).unwrap());
+        let at = y as usize * screen.width as usize * 4;
+        screen.rgba[at..at + row.len()] == row[..]
+    })
+}
+
+/// Paint [`PHOTO`] and read the frame that sends it, which must be one
+/// JPEG of it. Returns when the frame's `MARK` arrived.
+async fn expect_photo_as_jpeg(
+    server: &TestServer,
+    client: &mut TestClient,
+    screen: &mut Screen,
+) -> Instant {
+    server.platform.paint_photo(PHOTO).unwrap();
+    let draws = expect_frame_images(client, screen).await;
+    let sent = Instant::now();
+    assert_eq!(draws, vec![(wire_rect(PHOTO), ImageType::Jpeg as u8)]);
+    let desktop = server.platform.desktop().unwrap();
+    assert!(!shows(screen, &desktop), "a JPEG of a photo is not exact");
+    sent
+}
+
+/// Read a lossless refresh of `rects` of [`PHOTO`]: their draws, and a
+/// `MARK`.
+async fn expect_photo_refresh(client: &mut TestClient, screen: &mut Screen, rects: &[Rectangle]) {
+    let draws = expect_frame_images(client, screen).await;
+    let boxes: Vec<Rect> = draws.iter().map(|&(bbox, _)| bbox).collect();
+    let expected: Vec<Rect> = rects.iter().map(|&rect| wire_rect(rect)).collect();
+    assert_eq!(boxes, expected);
+    for (bbox, image_type) in draws {
+        assert!(
+            is_lossless(image_type),
+            "{bbox:?} is image type {image_type}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_photograph_arrives_as_jpeg_and_then_exactly() {
+    for compression in [image_compression::AUTO_GLZ, image_compression::AUTO_LZ] {
+        let (server, _main, mut client, mut screen) =
+            start_jpeg(Some(JpegQuality::DEFAULT), compression).await;
+        let sent = expect_photo_as_jpeg(&server, &mut client, &mut screen).await;
+
+        // Nothing until the photograph has been still for LOSSLESS, and
+        // then a frame of its own sends it again losslessly.
+        expect_quiet_for(&mut client, LOSSLESS - Duration::from_millis(50)).await;
+        expect_photo_refresh(&mut client, &mut screen, &[PHOTO]).await;
+        screen.assert_shows(&server.platform.desktop().unwrap());
+        // The server's clock started as it sent the JPEG, a little before
+        // the client's.
+        let took = sent.elapsed();
+        assert!(
+            took >= LOSSLESS - Duration::from_millis(30),
+            "the refresh came after {took:?}"
+        );
+
+        // Once exact, nothing more.
+        expect_quiet_for(&mut client, LOSSLESS * 2).await;
+    }
+}
+
+/// Report damage that changes nothing on `area` every quarter of
+/// [`LOSSLESS`] for `spell`, asserting that nothing arrives meanwhile.
+/// Returns when the damage stopped.
+async fn damage_quietly(
+    server: &TestServer,
+    client: &mut TestClient,
+    area: Rectangle,
+    spell: Duration,
+) -> Instant {
+    let damaging = Instant::now();
+    while damaging.elapsed() < spell {
+        server.platform.report_damage(area).unwrap();
+        expect_quiet_for(client, LOSSLESS / 4).await;
+    }
+    Instant::now()
+}
+
+#[tokio::test]
+async fn damage_on_a_lossy_area_postpones_its_refresh() {
+    let (server, _main, mut client, mut screen) =
+        start_jpeg(Some(JpegQuality::DEFAULT), image_compression::AUTO_GLZ).await;
+    expect_photo_as_jpeg(&server, &mut client, &mut screen).await;
+
+    // Damage that changes nothing, on all of the photograph, for three
+    // times LOSSLESS: each postpones the refresh, and sends nothing.
+    let stopped = damage_quietly(&server, &mut client, PHOTO, LOSSLESS * 3).await;
+    expect_photo_refresh(&mut client, &mut screen, &[PHOTO]).await;
+    let took = stopped.elapsed();
+    assert!(
+        took >= LOSSLESS - LOSSLESS / 4,
+        "the refresh came {took:?} after the damage stopped"
+    );
+    screen.assert_shows(&server.platform.desktop().unwrap());
+    expect_quiet_for(&mut client, LOSSLESS * 2).await;
+}
+
+#[tokio::test]
+async fn a_still_lossy_tile_is_refreshed_while_another_is_damaged() {
+    let (server, _main, mut client, mut screen) =
+        start_jpeg(Some(JpegQuality::DEFAULT), image_compression::AUTO_GLZ).await;
+    expect_photo_as_jpeg(&server, &mut client, &mut screen).await;
+
+    // Damage on the photograph's bottom right tile alone: the other three
+    // are refreshed once still for LOSSLESS, while it is damaged still.
+    let damaged = Rectangle::new(192, 64, 64, 64);
+    let platform = server.platform.clone();
+    let damager = tokio::spawn(async move {
+        let start = Instant::now();
+        while start.elapsed() < LOSSLESS * 3 {
+            platform.report_damage(damaged).unwrap();
+            tokio::time::sleep(LOSSLESS / 4).await;
+        }
+    });
+    let still = [
+        Rectangle::new(128, 0, 128, 64),
+        Rectangle::new(128, 64, 64, 64),
+    ];
+    expect_photo_refresh(&mut client, &mut screen, &still).await;
+    assert!(!damager.is_finished(), "the refresh waited for the damage");
+    damager.await.unwrap();
+
+    // Then the damaged tile, once it too has been still for LOSSLESS.
+    expect_photo_refresh(&mut client, &mut screen, &[damaged]).await;
+    screen.assert_shows(&server.platform.desktop().unwrap());
+    expect_quiet_for(&mut client, LOSSLESS * 2).await;
+}
+
+#[tokio::test]
+async fn a_photograph_is_lossless_unless_the_server_may_choose_and_jpeg_is_on() {
+    for (quality, compression) in [
+        (Some(JpegQuality::DEFAULT), image_compression::LZ4),
+        (Some(JpegQuality::DEFAULT), image_compression::GLZ),
+        (Some(JpegQuality::DEFAULT), image_compression::OFF),
+        (None, image_compression::AUTO_GLZ),
+    ] {
+        let (server, _main, mut client, mut screen) = start_jpeg(quality, compression).await;
+        server.platform.paint_photo(PHOTO).unwrap();
+        let draws = expect_frame_images(&mut client, &mut screen).await;
+        let what = format!("quality {quality:?}, compression {compression}");
+        assert_eq!(draws.len(), 1, "{what}");
+        let (bbox, image_type) = draws[0];
+        assert_eq!(bbox, wire_rect(PHOTO), "{what}");
+        if compression == image_compression::OFF {
+            assert_eq!(image_type, ImageType::Pixmap as u8, "{what}");
+        } else {
+            assert!(is_lossless(image_type), "{what}: image type {image_type}");
+        }
+        screen.assert_shows(&server.platform.desktop().unwrap());
+        // Nothing was lossy, so nothing is refreshed.
+        expect_quiet_for(&mut client, LOSSLESS * 2).await;
+    }
+}
+
+#[tokio::test]
+async fn a_lossy_area_sent_again_losslessly_is_not_refreshed() {
+    let (server, _main, mut client, mut screen) =
+        start_jpeg(Some(JpegQuality::DEFAULT), image_compression::AUTO_GLZ).await;
+    expect_photo_as_jpeg(&server, &mut client, &mut screen).await;
+
+    // The photograph turns into something flat, which goes losslessly.
+    server.platform.paint(PHOTO, (10, 20, 30)).unwrap();
+    let draws = expect_frame_images(&mut client, &mut screen).await;
+    assert_eq!(draws, vec![(wire_rect(PHOTO), ImageType::Lz4 as u8)]);
+    screen.assert_shows(&server.platform.desktop().unwrap());
+    expect_quiet_for(&mut client, LOSSLESS * 2).await;
+}
+
+#[tokio::test]
+async fn a_resize_forgets_the_lossy_areas() {
+    let (server, _main, mut client, mut screen) =
+        start_jpeg(Some(JpegQuality::DEFAULT), image_compression::AUTO_GLZ).await;
+    expect_photo_as_jpeg(&server, &mut client, &mut screen).await;
+
+    let size = Size {
+        width: 320,
+        height: 200,
+    };
+    server.platform.set_size(size).unwrap();
+    let message = client.recv().await;
+    assert_eq!(message.header.message_type, display_server::SURFACE_DESTROY);
+    expect_surface_create(&mut client, size).await;
+    let mut screen = Screen::new(size);
+    // The new surface's complete frame is not photographic as a whole, so
+    // it goes losslessly, and there is nothing lossy left to refresh.
+    let images = expect_complete_frame(&mut client, &mut screen).await;
+    assert_eq!(images[0].0, ImageType::Lz4 as u8);
+    screen.assert_shows(&server.platform.desktop().unwrap());
+    expect_monitors_config(&mut client, size).await;
+    expect_mark(&mut client).await;
+    expect_quiet_for(&mut client, LOSSLESS * 2).await;
 }

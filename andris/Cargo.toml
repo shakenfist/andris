@@ -45,10 +45,12 @@ shakenfist-spice-compression = { version = "0.1.7", git = "https://github.com/sh
 
 [dev-dependencies]
 rcgen = "0.14"
-# The LZ4 decoder too, so tests can decode what the encoder produced.
-# Cargo unifies these features with the ones above in test builds.
+# The LZ4 and pure-Rust JPEG decoders too, so tests can decode what the
+# encoders produced. Cargo unifies these features with the ones above in
+# test builds.
 shakenfist-spice-compression = { version = "0.1.7", git = "https://github.com/shakenfist/ryll", rev = "502199e9b87789b2dd45cb9c13a8b6709e5ab7f8", default-features = false, features = [
     "encode",
+    "jpeg",
     "lz4",
 ] }
 tempfile = "3"

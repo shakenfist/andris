@@ -99,15 +99,45 @@
 //! room. A still desktop costs one slice's capture and comparison a tick,
 //! and sends nothing.
 //!
+//! # JPEG and the lossless refresh
+//!
+//! A rectangle that looks photographic may be sent as JPEG (see
+//! [`updates`] for the classifier), when the client leaves the choice of
+//! compression to the server and `--jpeg-quality` is not 0. The tiles a
+//! JPEG draws are then *lossy*: the client holds an approximation of the
+//! shadow's pixels there. Each lossy tile keeps its own time
+//! ([`LossyTiles`]):
+//!
+//! - a lossy draw makes the tiles it touches lossy, due for a refresh
+//!   `lossless_delay` ([`LOSSLESS_DELAY`] unless a test shortens it) later;
+//! - damage a frame takes postpones each lossy tile it touches to
+//!   `lossless_delay` after the frame;
+//! - a lossless draw that covers a tile makes it exact again.
+//!
+//! Once some lossy tiles are due, a *refresh* sends them again
+//! losslessly, from the shadow, which always holds the true pixels: their
+//! draws and then a `MARK`, a frame of its own. A refresh waits for the
+//! rate cap and for room in the ack window as a frame does, and a frame
+//! for pending damage goes first. So a still screen always ends up exact.
+//! A new surface starts with no lossy tiles.
+//!
 //! # What the client sends
 //!
-//! `PREFERRED_COMPRESSION` is honoured whenever it arrives: `OFF` means
-//! uncompressed bitmaps, and anything else means LZ4 when the client can
-//! decode it. `PREFERRED_VIDEO_CODEC_TYPE` and `STREAM_REPORT` are parsed
+//! `PREFERRED_COMPRESSION` is honoured whenever it arrives:
+//!
+//! - unset, `AUTO_GLZ` or `AUTO_LZ` leave the choice to the server: LZ4
+//!   when the client can decode it, and JPEG for photographic rectangles
+//!   unless `--jpeg-quality` is 0;
+//! - `OFF` means uncompressed bitmaps;
+//! - any other choice means lossless only: LZ4 when the client can decode
+//!   it, and bitmaps otherwise.
+//!
+//! `PREFERRED_VIDEO_CODEC_TYPE` and `STREAM_REPORT` are parsed
 //! and ignored, since andris sends no streams. A malformed message closes
 //! the channel; an unknown one is ignored.
 //!
 //! [`updates`]: super::updates
+//! [`LossyTiles`]: super::updates::LossyTiles
 
 use std::time::Duration;
 
@@ -123,7 +153,7 @@ use tracing::{debug, info, warn};
 
 use super::channel::{ACK_WINDOW, ChannelConn, ChannelContext};
 use super::opcodes::DisplayOpcode;
-use super::updates::{EncodeOptions, SURFACE_ID, UpdateEncoder};
+use super::updates::{Draw, EncodeOptions, LossyTiles, SURFACE_ID, UpdateEncoder};
 use crate::platform::{self, Capture, DamageSubscription, Rectangle, Region, Size, TILE};
 
 /// `SPICE_SURFACE_FLAGS_PRIMARY` (spice-protocol enums.h), which ryll's
@@ -153,6 +183,10 @@ pub const SCRUB_PERIOD: Duration = Duration::from_secs(4);
 /// How many ticks the scrub spreads one pass over the desktop across.
 pub const SCRUB_SLICES: u32 = 16;
 
+/// How long an area sent as JPEG must go without damage before it is
+/// sent again losslessly, unless the server's options say otherwise.
+pub const LOSSLESS_DELAY: Duration = Duration::from_millis(500);
+
 /// Serve a display channel until the client closes it.
 pub async fn run(ctx: ChannelContext, mut conn: ChannelConn<DisplayOpcode>) -> Result<()> {
     conn.start_acks(ACK_WINDOW).await?;
@@ -165,6 +199,7 @@ pub async fn run(ctx: ChannelContext, mut conn: ChannelConn<DisplayOpcode>) -> R
         .subscribe_damage()
         .context("subscribing to the desktop's damage")?;
     let scrub_every = scrub_tick(ctx.scrub_period);
+    let lossy = LossyTiles::new(ctx.lossless_delay);
     let mut display = Display {
         ctx,
         conn,
@@ -179,6 +214,7 @@ pub async fn run(ctx: ChannelContext, mut conn: ChannelConn<DisplayOpcode>) -> R
         capture_retry: Instant::now(),
         scrub_top: 0,
         scrub_tiles: 0,
+        lossy,
     };
 
     // Wait for INIT, handling whatever else arrives first.
@@ -192,21 +228,32 @@ pub async fn run(ctx: ChannelContext, mut conn: ChannelConn<DisplayOpcode>) -> R
     let mut scrub_ticks = tokio::time::interval_at(Instant::now() + scrub_every, scrub_every);
     scrub_ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
-        let cap_open = Instant::now() >= display.next_frame;
-        if display.damage_pending && cap_open && display.conn.may_send() {
+        let now = Instant::now();
+        let cap_open = now >= display.next_frame;
+        let room = display.conn.may_send();
+        if display.damage_pending && cap_open && room {
             display.frame().await?;
             continue;
         }
-        // Something blocks a frame, or nothing is pending. Wait for what
-        // would unblock it, for the client, and for the scrub, but never
-        // for damage already known to be pending: changed() would return
-        // at once, and the loop would spin.
+        // A refresh is a frame too, but pending damage goes first.
+        let refresh_at = display.lossy.next_due();
+        let refresh_due = refresh_at.is_some_and(|at| at <= now);
+        if refresh_due && cap_open && room {
+            display.refresh().await?;
+            continue;
+        }
+        // Something blocks a frame or a refresh, or neither is wanted.
+        // Wait for what would unblock it, for the client, for the next
+        // lossy tile to fall due, and for the scrub, but never for damage
+        // already known to be pending: changed() would return at once,
+        // and the loop would spin.
         let pending = display.damage_pending;
-        let await_room = pending && cap_open;
+        let wanted = pending || refresh_due;
+        let await_room = wanted && cap_open;
         let next_frame = display.next_frame;
         // Every branch is cancel-safe: next_incoming wraps recv() or
         // wait_for_room(), each of which keeps whatever it read; changed()
-        // loses nothing when dropped; a sleep is made afresh each time
+        // loses nothing when dropped; each sleep is made afresh each time
         // round; and an interval's tick() is cancel-safe.
         tokio::select! {
             incoming = next_incoming(&mut display.conn, await_room) => match incoming? {
@@ -215,7 +262,9 @@ pub async fn run(ctx: ChannelContext, mut conn: ChannelConn<DisplayOpcode>) -> R
                 Incoming::Room => {}
             },
             () = display.damage.changed(), if !pending => display.damage_pending = true,
-            () = tokio::time::sleep_until(next_frame), if pending && !cap_open => {}
+            () = tokio::time::sleep_until(next_frame), if wanted && !cap_open => {}
+            () = tokio::time::sleep_until(refresh_at.unwrap_or(now)),
+                if refresh_at.is_some() && !refresh_due => {}
             _ = scrub_ticks.tick() => display.scrub().await?,
         }
     }
@@ -290,6 +339,9 @@ struct Display {
     /// How many tiles the scrub has found changed that damage had not
     /// reported.
     scrub_tiles: u64,
+    /// The tiles last sent lossily, and when each is due to be sent again
+    /// losslessly.
+    lossy: LossyTiles,
 }
 
 impl Display {
@@ -338,14 +390,23 @@ impl Display {
     }
 
     /// How images may be encoded: LZ4 if the client can decode it and has
-    /// not asked for no compression.
+    /// not asked for no compression, and JPEG only if the client leaves
+    /// the choice to the server and `--jpeg-quality` allows it.
     fn encode_options(&self) -> EncodeOptions {
+        let preferred = self.preferred_compression;
+        let jpeg = match preferred {
+            None | Some(image_compression::AUTO_GLZ | image_compression::AUTO_LZ) => {
+                self.ctx.jpeg_quality
+            }
+            Some(_) => None,
+        };
         EncodeOptions {
             lz4: self
                 .ctx
                 .caps
                 .has_channel_mask(capabilities::DISPLAY_LZ4_COMPRESSION)
-                && self.preferred_compression != Some(image_compression::OFF),
+                && preferred != Some(image_compression::OFF),
+            jpeg,
         }
     }
 
@@ -432,7 +493,11 @@ impl Display {
         if region.is_empty() {
             return Ok(());
         }
-        self.next_frame = Instant::now() + self.ctx.frame_interval;
+        let now = Instant::now();
+        self.next_frame = now + self.ctx.frame_interval;
+        // Damage postpones the refresh of the lossy tiles it touches,
+        // whatever the capture finds.
+        self.lossy.touch(&region, now);
 
         // Without a surface of the region's size, the surface is created
         // afresh, which needs all of the desktop.
@@ -497,8 +562,9 @@ impl Display {
         .await?;
         self.surface = Some(size);
         // A new surface starts empty, so the client has nothing the old
-        // shadow describes.
+        // shadow describes, lossily or not.
         self.encoder.reset();
+        self.lossy.reset(size);
         self.send_update(capture).await?;
         if self
             .ctx
@@ -538,10 +604,54 @@ impl Display {
         .context("the encoding task failed")?;
         self.encoder = encoder;
         let draws = update?.draws;
-        for draw in &draws {
+        self.send_draws(&draws).await?;
+        Ok(draws.len())
+    }
+
+    /// Send `draws`, and record which tiles they leave lossy or exact.
+    async fn send_draws(&mut self, draws: &[Draw]) -> Result<()> {
+        for draw in draws {
             self.send(DisplayOpcode::DrawCopy, &draw.body).await?;
         }
-        Ok(draws.len())
+        self.lossy.record(draws, Instant::now());
+        Ok(())
+    }
+
+    /// Send the lossy tiles that are due again losslessly, from the
+    /// shadow, and then `MARK`: a frame of its own, which counts against
+    /// the rate cap as any frame does.
+    async fn refresh(&mut self) -> Result<()> {
+        let now = Instant::now();
+        let due = self.lossy.due(now);
+        if due.is_empty() {
+            return Ok(());
+        }
+        self.next_frame = now + self.ctx.frame_interval;
+        let options = self.encode_options().lossless();
+        let mut encoder = std::mem::take(&mut self.encoder);
+        let region = due.clone();
+        let (encoder, update) = tokio::task::spawn_blocking(move || {
+            let update = encoder.refresh(&region, options);
+            (encoder, update)
+        })
+        .await
+        .context("the refresh's encoding task failed")?;
+        self.encoder = encoder;
+        let draws = update?.draws;
+        debug!(
+            session = self.conn.session().id(),
+            tiles = due.tile_count(),
+            draws = draws.len(),
+            "sending lossy tiles again losslessly"
+        );
+        self.send_draws(&draws).await?;
+        // Every tile of the region was sent losslessly, whether or not a
+        // draw covered it wholly.
+        self.lossy.clear(&due);
+        if !draws.is_empty() {
+            self.send(DisplayOpcode::Mark, &[]).await?;
+        }
+        Ok(())
     }
 
     /// Re-read the scrub's next slice of the desktop, and add each tile

@@ -69,6 +69,8 @@ async fn serve(config: Config, platform: Platform) -> Result<()> {
         ticket: config.ticket,
         frame_interval: config.frame_interval,
         scrub_period: server::display::SCRUB_PERIOD,
+        lossless_delay: server::display::LOSSLESS_DELAY,
+        jpeg_quality: config.jpeg_quality,
         timeouts: HandshakeTimeouts::default(),
     };
     let mut handle = Server::bind(options, platform).await?.spawn()?;

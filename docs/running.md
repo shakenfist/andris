@@ -42,6 +42,7 @@ andris --ticket-file PATH [options]
 | `--tls-cert PATH` | none | The TLS certificate chain, as PEM, leaf first |
 | `--tls-key PATH` | none | The TLS private key, as PEM |
 | `--frame-interval-ms MS` | `33` | The shortest time between two frames, a cap on the frame rate; at least 20 |
+| `--jpeg-quality QUALITY` | `85` | The JPEG quality, 1 to 100, for areas that look photographic; `0` never sends JPEG (see [What a client gets](#what-a-client-gets)) |
 
 `andris --help` prints the same list. Logs go to stderr at `info`
 level; set `RUST_LOG` (for example `RUST_LOG=andris=debug`) to
@@ -194,7 +195,8 @@ damaged, compares them, in tiles of 64x64 pixels, with what it last
 sent, and sends only the tiles whose pixels changed, merged into at
 most 32 rectangles a frame and followed by a `MARK`, which ryll counts
 as a frame. A desktop that does not change sends nothing. Frames start
-at most once every `--frame-interval-ms`. Each rectangle is an
+at most once every `--frame-interval-ms`. Each rectangle is a JPEG
+when it looks photographic and JPEG is allowed (below), an
 LZ4-compressed image when the client can decode LZ4 and the result is
 smaller, and an uncompressed bitmap otherwise; a client that asks for
 no compression gets bitmaps.
@@ -208,6 +210,25 @@ catches up, when one frame brings it up to date. A capture that fails,
 as one can while the desktop is being resized, is retried and logged
 as a warning; the display channel closes after ten failures in a row,
 or at once if the connection to the X display has gone.
+
+**JPEG.** Andris sends JPEG, at `--jpeg-quality`,
+only when the client leaves the choice of compression to the server:
+it has asked for none, or for `auto-glz` (ryll's default) or
+`auto-lz`. A client that asks for a particular compression (`lz4`,
+say) gets lossless images only, and `--jpeg-quality 0` turns JPEG off
+for every client. A rectangle goes as JPEG when it is at least one
+64x64 tile, LZ4 would save less than half of its bytes, and the JPEG
+is at most half the size of what would otherwise be sent. Text and
+user interface compress far better than that, so they are never sent
+as JPEG; photographs are. Smooth gradients compress well
+enough with LZ4 that they stay lossless.
+
+A JPEG is approximate, so the tiles it drew are sent again
+losslessly once they have gone half a second without changing. That
+refresh is a frame of its own, followed by a `MARK`, and waits for the
+frame rate cap and for a slow client like any frame. A still screen
+therefore always ends up exact, while an area that keeps changing,
+such as a video, stays JPEG for as long as it changes.
 
 **Keys.** Keys are typed by position, not by character. The client's
 scancodes become evdev key codes, and those become whichever

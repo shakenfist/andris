@@ -18,7 +18,8 @@ use std::time::Duration;
 use andris::config::Ticket;
 use andris::platform::Size;
 use andris::platform::synthetic::SyntheticPlatform;
-use andris::server::display::SCRUB_PERIOD;
+use andris::server::display::{LOSSLESS_DELAY, SCRUB_PERIOD};
+use andris::server::updates::JpegQuality;
 use andris::server::{HandshakeTimeouts, Server, ServerHandle, ServerOptions, TlsOptions};
 use shakenfist_spice_protocol::link::{
     SpiceLinkMess, SpiceLinkReply, SpiceStream, default_channel_caps, perform_auth,
@@ -56,6 +57,32 @@ fn init_logging() {
         .try_init();
 }
 
+/// How a test server's display channels time their frames, and whether
+/// they may send JPEG.
+#[derive(Debug, Clone, Copy)]
+pub struct Tuning {
+    /// The shortest time between the starts of two frames.
+    pub frame_interval: Duration,
+    /// How long the scrub takes to re-read the whole desktop.
+    pub scrub_period: Duration,
+    /// How long a lossy area must be still before it is sent losslessly.
+    pub lossless_delay: Duration,
+    /// The JPEG quality, or `None` for none.
+    pub jpeg_quality: Option<JpegQuality>,
+}
+
+impl Default for Tuning {
+    /// What andris itself uses, but for [`FRAME_INTERVAL`].
+    fn default() -> Self {
+        Self {
+            frame_interval: FRAME_INTERVAL,
+            scrub_period: SCRUB_PERIOD,
+            lossless_delay: LOSSLESS_DELAY,
+            jpeg_quality: Some(JpegQuality::DEFAULT),
+        }
+    }
+}
+
 /// An andris serving a synthetic desktop on loopback. Dropping it shuts
 /// the server down.
 pub struct TestServer {
@@ -82,13 +109,18 @@ impl TestServer {
     /// most every `frame_interval`, whose scrub re-reads the whole
     /// desktop every `scrub_period`.
     pub async fn start_with_intervals(frame_interval: Duration, scrub_period: Duration) -> Self {
-        Self::start_full(
-            false,
+        let tuning = Tuning {
             frame_interval,
             scrub_period,
-            HandshakeTimeouts::default(),
-        )
-        .await
+            ..Tuning::default()
+        };
+        Self::start_full(false, tuning, HandshakeTimeouts::default()).await
+    }
+
+    /// A server with only a plain listener, whose display channels are
+    /// tuned as `tuning` says.
+    pub async fn start_tuned(tuning: Tuning) -> Self {
+        Self::start_full(false, tuning, HandshakeTimeouts::default()).await
     }
 
     /// A server with only a plain listener and the handshake time limits
@@ -109,15 +141,14 @@ impl TestServer {
     }
 
     async fn start_with(tls: bool, frame_interval: Duration, timeouts: HandshakeTimeouts) -> Self {
-        Self::start_full(tls, frame_interval, SCRUB_PERIOD, timeouts).await
+        let tuning = Tuning {
+            frame_interval,
+            ..Tuning::default()
+        };
+        Self::start_full(tls, tuning, timeouts).await
     }
 
-    async fn start_full(
-        tls: bool,
-        frame_interval: Duration,
-        scrub_period: Duration,
-        timeouts: HandshakeTimeouts,
-    ) -> Self {
+    async fn start_full(tls: bool, tuning: Tuning, timeouts: HandshakeTimeouts) -> Self {
         init_logging();
         let platform = SyntheticPlatform::new(Size {
             width: 256,
@@ -144,8 +175,10 @@ impl TestServer {
             listen: "127.0.0.1:0".parse().unwrap(),
             tls: tls_options,
             ticket: Ticket::new(TICKET).unwrap(),
-            frame_interval,
-            scrub_period,
+            frame_interval: tuning.frame_interval,
+            scrub_period: tuning.scrub_period,
+            lossless_delay: tuning.lossless_delay,
+            jpeg_quality: tuning.jpeg_quality,
             timeouts,
         };
         let handle = Server::bind(options, platform.platform())

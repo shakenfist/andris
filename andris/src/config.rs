@@ -12,6 +12,7 @@ use clap::{Parser, ValueEnum};
 use tracing::warn;
 
 use crate::platform::Size;
+use crate::server::updates::JpegQuality;
 
 /// The longest ticket SPICE allows, in bytes (`SPICE_MAX_PASSWORD_LENGTH`
 /// in spice-protocol's `protocol.h`).
@@ -27,6 +28,9 @@ pub const MIN_FRAME_INTERVAL_MS: u64 = 20;
 
 /// `--frame-interval-ms`'s default: at most about 30 frames a second.
 pub const DEFAULT_FRAME_INTERVAL_MS: u64 = 33;
+
+/// `--jpeg-quality`'s default, spice-server's.
+pub const DEFAULT_JPEG_QUALITY: u8 = JpegQuality::DEFAULT.get();
 
 /// Which display system andris exports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -88,6 +92,18 @@ pub struct Args {
         value_parser = clap::value_parser!(u64).range(MIN_FRAME_INTERVAL_MS..),
     )]
     pub frame_interval_ms: u64,
+
+    /// The JPEG quality, 1 to 100, for areas that look photographic, when
+    /// the client leaves the choice of compression to the server; 0 never
+    /// sends JPEG. An area sent as JPEG is sent again losslessly once it
+    /// has been still for half a second.
+    #[arg(
+        long,
+        value_name = "QUALITY",
+        default_value_t = DEFAULT_JPEG_QUALITY,
+        value_parser = clap::value_parser!(u8).range(0..=100),
+    )]
+    pub jpeg_quality: u8,
 }
 
 /// A TLS listener and the certificate it presents.
@@ -148,6 +164,8 @@ pub struct Config {
     pub ticket: Ticket,
     pub platform: PlatformConfig,
     pub frame_interval: Duration,
+    /// The quality to send JPEG at, or `None` for `--jpeg-quality 0`.
+    pub jpeg_quality: Option<JpegQuality>,
 }
 
 impl Args {
@@ -194,6 +212,8 @@ impl Args {
             ticket,
             platform,
             frame_interval: Duration::from_millis(self.frame_interval_ms),
+            // The parser allows 0 to 100, and 0 means none.
+            jpeg_quality: JpegQuality::new(self.jpeg_quality),
         })
     }
 }
@@ -376,6 +396,7 @@ mod tests {
             }
         );
         assert_eq!(config.frame_interval, Duration::from_millis(33));
+        assert_eq!(config.jpeg_quality, JpegQuality::new(85));
     }
 
     #[test]
@@ -652,6 +673,29 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(message.contains("--frame-interval-ms"), "{message}");
+    }
+
+    #[test]
+    fn jpeg_quality_range() {
+        let ticket = ticket_file(b"secret", 0o600);
+        for (given, expected) in [("0", None), ("1", Some(1)), ("100", Some(100))] {
+            let config = parse(&ticket, &["--jpeg-quality", given])
+                .validate()
+                .unwrap();
+            assert_eq!(
+                config.jpeg_quality.map(JpegQuality::get),
+                expected,
+                "--jpeg-quality {given}"
+            );
+        }
+        let path = ticket.path().to_str().unwrap();
+        for bad in ["101", "high"] {
+            let message =
+                Args::try_parse_from(["andris", "--ticket-file", path, "--jpeg-quality", bad])
+                    .unwrap_err()
+                    .to_string();
+            assert!(message.contains("--jpeg-quality"), "{bad}: {message}");
+        }
     }
 
     #[test]

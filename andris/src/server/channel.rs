@@ -31,6 +31,7 @@ use tracing::debug;
 
 use super::opcodes::{AckedOpcode, ServerOpcode};
 use super::session::Session;
+use super::updates::JpegQuality;
 use crate::platform::Platform;
 
 /// The ack window display and cursor ask for, as spice-server does.
@@ -103,6 +104,12 @@ pub struct ChannelContext {
     /// How long the display channel's scrub takes to re-read the whole
     /// desktop.
     pub scrub_period: Duration,
+    /// How long an area sent as JPEG must stay still before the display
+    /// channel sends it again losslessly.
+    pub lossless_delay: Duration,
+    /// The quality the display channel may send JPEG at, or `None` if it
+    /// must not.
+    pub jpeg_quality: Option<JpegQuality>,
 }
 
 impl ChannelContext {

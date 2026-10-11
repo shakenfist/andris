@@ -24,7 +24,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use tokio::sync::watch;
 
 use super::{
@@ -67,6 +67,8 @@ struct State {
     size: Size,
     square_x: u32,
     locks: LockState,
+    /// How many of the next captures fail.
+    failing_captures: u32,
 }
 
 /// The synthetic platform. Create it with [`SyntheticPlatform::new`] and
@@ -90,6 +92,7 @@ impl SyntheticPlatform {
                 size,
                 square_x: 0,
                 locks: LockState::default(),
+                failing_captures: 0,
             }),
             events: Mutex::new(VecDeque::new()),
             cursor: watch::Sender::new(Some(Arc::new(default_cursor()))),
@@ -149,6 +152,15 @@ impl SyntheticPlatform {
         Ok(std::mem::take(&mut *self.events()?).into())
     }
 
+    /// Make the next `count` captures fail, as a capture of a desktop
+    /// resized while it was read does. The failures are not [`Gone`].
+    ///
+    /// [`Gone`]: super::Gone
+    pub fn fail_captures(&self, count: u32) -> Result<()> {
+        self.state()?.failing_captures = count;
+        Ok(())
+    }
+
     /// Set the lock state directly, as if changed from outside andris.
     pub fn force_lock_state(&self, locks: LockState) -> Result<()> {
         self.state()?.locks = locks;
@@ -182,7 +194,11 @@ impl DisplayGeometry for SyntheticPlatform {
 impl FrameSource for SyntheticPlatform {
     fn capture(&self) -> Result<Frame> {
         let (size, square_x) = {
-            let state = self.state()?;
+            let mut state = self.state()?;
+            if state.failing_captures > 0 {
+                state.failing_captures -= 1;
+                bail!("a synthetic capture failure");
+            }
             (state.size, state.square_x)
         };
         render(size, square_x)
@@ -409,6 +425,17 @@ mod tests {
                 })
                 .is_err()
         );
+    }
+
+    #[test]
+    fn fail_captures_fails_that_many() {
+        let platform = SyntheticPlatform::new(SIZE).unwrap();
+        platform.fail_captures(2).unwrap();
+        for _ in 0..2 {
+            let error = platform.capture().unwrap_err();
+            assert!(!crate::platform::is_gone(&error));
+        }
+        assert_eq!(platform.capture().unwrap().size(), SIZE);
     }
 
     #[test]

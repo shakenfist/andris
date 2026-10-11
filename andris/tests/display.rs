@@ -1,6 +1,6 @@
 //! The display channel: its start sequence, the bands it sends and how
-//! they decode, compression choice, the ack window and resizing, against
-//! an in-process andris on the synthetic platform.
+//! they decode, compression choice, the ack window, resizing and failed
+//! captures, against an in-process andris on the synthetic platform.
 //!
 //! Every band is decoded, with ryll's `DrawCopy` reader and LZ4 decoder,
 //! onto a client-side copy of the surface, which is compared with what
@@ -14,7 +14,8 @@ mod support;
 
 use std::time::Duration;
 
-use andris::platform::{Frame, FrameSource, Size};
+use andris::platform::{DisplayGeometry, Frame, FrameSource, Size};
+use andris::server::display::MAX_CAPTURE_FAILURES;
 use shakenfist_spice_compression::decompress_spice_lz4;
 use shakenfist_spice_protocol::constants::{
     bitmap_flags, bitmap_fmt, clip_type, image_compression, ropd, surface_fmt,
@@ -296,7 +297,9 @@ async fn expect_quiet(client: &mut TestClient) {
 async fn start(server: &TestServer, client: &mut TestClient, compression: u8) -> Screen {
     expect_set_ack(client).await;
     send_init(client, compression).await;
-    let size = server.platform.capture().unwrap().size();
+    // The size, not a capture, which would take a failure meant for the
+    // server.
+    let size = server.platform.size().unwrap();
     expect_surface_create(client, size).await;
     let mut screen = Screen::new(size);
     expect_complete_frame(client, &mut screen).await;
@@ -551,5 +554,38 @@ async fn a_malformed_stream_report_closes_the_channel() {
     let (server, _main, mut client) = open_display(capabilities::DEFAULT_DISPLAY).await;
     start(&server, &mut client, image_compression::AUTO_GLZ).await;
     client.send(display_client::STREAM_REPORT, &[0; 4]).await;
+    client.expect_closed().await;
+}
+
+#[tokio::test]
+async fn failed_captures_skip_frames_and_the_count_resets() {
+    let (server, _main, mut client) = open_display(capabilities::DEFAULT_DISPLAY).await;
+    let mut screen = start(&server, &mut client, image_compression::AUTO_GLZ).await;
+
+    // One short of the limit, twice: the second run would pass the limit
+    // if a successful capture did not reset the count.
+    for _ in 0..2 {
+        server
+            .platform
+            .fail_captures(MAX_CAPTURE_FAILURES - 1)
+            .unwrap();
+        advance_and_expect_bands(&server, &mut client, &mut screen).await;
+    }
+    expect_quiet(&mut client).await;
+}
+
+#[tokio::test]
+async fn a_failed_first_capture_delays_the_surface() {
+    let (server, _main, mut client) = open_display(capabilities::DEFAULT_DISPLAY).await;
+    server.platform.fail_captures(3).unwrap();
+    let mut screen = start(&server, &mut client, image_compression::AUTO_GLZ).await;
+    advance_and_expect_bands(&server, &mut client, &mut screen).await;
+}
+
+#[tokio::test]
+async fn too_many_failed_captures_in_a_row_close_the_channel() {
+    let (server, _main, mut client) = open_display(capabilities::DEFAULT_DISPLAY).await;
+    start(&server, &mut client, image_compression::AUTO_GLZ).await;
+    server.platform.fail_captures(MAX_CAPTURE_FAILURES).unwrap();
     client.expect_closed().await;
 }

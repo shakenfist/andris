@@ -33,9 +33,9 @@ SPICE.
 Around the code: `Makefile` and `.devcontainer/` run cargo in a
 container; `scripts/e2e.sh` drives the end-to-end test;
 `.github/workflows/` holds the two-tier CI; `docs/plans/` holds the
-master plan and its phase plans; `AGENTS.md` carries conventions for
-AI coding assistants; `PLAN-TEMPLATE.md` and `PUSH-AUDIT.md` are the
-planning template and the pre-push audit runbook.
+plans; `AGENTS.md` carries conventions for AI coding assistants;
+`PLAN-TEMPLATE.md` and `PUSH-AUDIT.md` are the planning template and
+the pre-push audit runbook.
 
 ### How a frame reaches the wire
 

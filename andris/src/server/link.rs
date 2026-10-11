@@ -24,6 +24,7 @@ use shakenfist_spice_protocol::link::{
 };
 use shakenfist_spice_protocol::reader::LinkError;
 use shakenfist_spice_protocol::{ChannelType, SpiceError, capabilities};
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Semaphore;
 use tracing::{debug, info};
@@ -150,15 +151,11 @@ pub struct Linked {
 
 /// Whether the password a client sent is the ticket.
 ///
-/// A simple xor-fold over every byte of the ticket: the time it takes
-/// depends on the ticket's length, never on where the two first differ.
-/// That is all a ticket comparison needs to be constant-time against.
+/// Constant-time in the bytes compared, so the time it takes never says
+/// where the two first differ. A password of another length is refused
+/// at once, which reveals only the ticket's length.
 fn ticket_matches(password: &[u8], ticket: &[u8]) -> bool {
-    let mut diff = u8::from(password.len() != ticket.len());
-    for (i, want) in ticket.iter().enumerate() {
-        diff |= want ^ password.get(i).copied().unwrap_or(0);
-    }
-    diff == 0
+    password.ct_eq(ticket).into()
 }
 
 /// Whether a `read_auth_ticket` failure means the ticket blob was wrong,

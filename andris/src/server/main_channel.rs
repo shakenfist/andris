@@ -105,7 +105,7 @@ pub async fn serve(
                         }
                         let mode = MainMouseMode {
                             supported_modes: SUPPORTED_MOUSE_MODES,
-                            current_mode: session.mouse_mode().borrow().to_wire() as u16,
+                            current_mode: session.mouse_mode().borrow().to_wire_u16(),
                         };
                         conn.send_msg(MainOpcode::MouseMode, &mode).await?;
                     }

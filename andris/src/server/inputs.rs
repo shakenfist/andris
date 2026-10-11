@@ -37,11 +37,8 @@
 //!
 //! Clamping needs the desktop's size, which may block to read. The
 //! channel reads it when it opens and keeps it, reading it again before a
-//! clamp once it is [`GEOMETRY_MAX_AGE`] old. That bounds the cost to a
-//! few reads a second while the pointer moves, and none while it is
-//! still, and a resize reaches the clamp within that age. A timer would
-//! instead read the size all the time, even when nobody is moving the
-//! pointer.
+//! clamp once it is [`GEOMETRY_MAX_AGE`] old, so a resize reaches the
+//! clamp within that age.
 //!
 //! # Closing
 //!

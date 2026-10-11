@@ -28,6 +28,15 @@
 //! surface is always created at the size of the frame about to be drawn
 //! on it, even when the desktop resizes between the two.
 //!
+//! # Failed captures
+//!
+//! A failed capture skips the tick rather than closing the channel: a
+//! desktop resized while it is being captured (as RDP resizes an xrdp
+//! session) fails one capture, and the next succeeds. The first failure
+//! is logged as a warning and the recovery as information. The channel
+//! closes once [`MAX_CAPTURE_FAILURES`] captures in a row have failed,
+//! or at once if the platform says the desktop is gone for good.
+//!
 //! # What the client sends
 //!
 //! `PREFERRED_COMPRESSION` is honoured whenever it arrives: `OFF` means
@@ -46,16 +55,19 @@ use shakenfist_spice_protocol::messages::{
 };
 use shakenfist_spice_protocol::{capabilities, display_client};
 use tokio::time::{Instant, MissedTickBehavior};
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 use super::channel::{ACK_WINDOW, ChannelConn, ChannelContext};
 use super::frames::{FrameEncoder, SURFACE_ID};
 use super::opcodes::DisplayOpcode;
-use crate::platform::{Frame, Size};
+use crate::platform::{self, Frame, Size};
 
 /// `SPICE_SURFACE_FLAGS_PRIMARY` (spice-protocol enums.h), which ryll's
 /// protocol crate does not name: the surface is the display itself.
 pub const SURFACE_FLAGS_PRIMARY: u32 = 1 << 0;
+
+/// How many captures in a row may fail before the channel gives up.
+pub const MAX_CAPTURE_FAILURES: u32 = 10;
 
 /// Serve a display channel until the client closes it.
 pub async fn run(ctx: ChannelContext, mut conn: ChannelConn<DisplayOpcode>) -> Result<()> {
@@ -67,6 +79,7 @@ pub async fn run(ctx: ChannelContext, mut conn: ChannelConn<DisplayOpcode>) -> R
         initialised: false,
         surface: None,
         encoder: FrameEncoder::new(),
+        capture_failures: 0,
     };
 
     // Wait for INIT, handling whatever else arrives first.
@@ -77,8 +90,9 @@ pub async fn run(ctx: ChannelContext, mut conn: ChannelConn<DisplayOpcode>) -> R
         display.handle(&message)?;
     }
 
-    let frame = display.capture().await?;
-    display.start_surface(frame).await?;
+    // The first tick creates the surface; if its capture fails, a later
+    // tick does.
+    display.tick().await?;
 
     let interval = display.ctx.frame_interval;
     let mut ticks = tokio::time::interval_at(Instant::now() + interval, interval);
@@ -112,6 +126,8 @@ struct Display {
     /// The primary surface's size, once it has been created.
     surface: Option<Size>,
     encoder: FrameEncoder,
+    /// How many captures in a row have failed.
+    capture_failures: u32,
 }
 
 impl Display {
@@ -176,9 +192,8 @@ impl Display {
 
     /// [`Display::send`] for a typed body.
     async fn send_msg<T: WireType>(&mut self, op: DisplayOpcode, message: &T) -> Result<()> {
-        let mut body = Vec::new();
-        message.write(&mut body);
-        self.send(op, &body).await
+        self.conn.wait_for_room().await?;
+        self.conn.send_msg(op, message).await
     }
 
     /// Capture the desktop. Captures may block, so this runs on the
@@ -194,10 +209,50 @@ impl Display {
         }
     }
 
+    /// Capture, counting failures. `None` skips this tick. Fails if the
+    /// desktop is gone, or once [`MAX_CAPTURE_FAILURES`] captures in a
+    /// row have failed.
+    async fn capture_or_skip(&mut self) -> Result<Option<Frame>> {
+        let session = self.conn.session().id();
+        match self.capture().await {
+            Ok(frame) => {
+                if self.capture_failures > 0 {
+                    info!(
+                        session,
+                        failures = self.capture_failures,
+                        "capturing the desktop works again"
+                    );
+                    self.capture_failures = 0;
+                }
+                Ok(Some(frame))
+            }
+            Err(e) if platform::is_gone(&e) => Err(e),
+            Err(e) => {
+                self.capture_failures += 1;
+                if self.capture_failures >= MAX_CAPTURE_FAILURES {
+                    return Err(
+                        e.context(format!("{MAX_CAPTURE_FAILURES} captures in a row failed"))
+                    );
+                }
+                if self.capture_failures == 1 {
+                    warn!(
+                        session,
+                        error = format!("{e:#}"),
+                        "capturing the desktop failed; skipping frames until it works"
+                    );
+                }
+                Ok(None)
+            }
+        }
+    }
+
     /// Capture, and send what changed. A capture of another size than
-    /// the surface replaces the surface.
+    /// the surface, or the first capture, creates the surface. A failed
+    /// capture sends nothing.
     async fn tick(&mut self) -> Result<()> {
-        let frame = self.capture().await?;
+        let Some(frame) = self.capture_or_skip().await? else {
+            return Ok(());
+        };
         if self.surface == Some(frame.size()) {
             return self.send_frame(frame, false).await;
         }

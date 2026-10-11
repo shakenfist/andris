@@ -282,6 +282,27 @@ impl CursorShape {
     }
 }
 
+/// The error a seam returns once the desktop is gone for good: the
+/// connection to it has failed, or the thread serving it has stopped.
+/// Retrying cannot help. Any other error may be transient; a capture of a
+/// desktop resized while it was read fails, say, and the next succeeds.
+/// [`is_gone`] finds this in an error's chain.
+#[derive(Debug)]
+pub struct Gone(pub String);
+
+impl std::fmt::Display for Gone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Gone {}
+
+/// Whether `error`, or anything in its chain, is [`Gone`].
+pub fn is_gone(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<Gone>())
+}
+
 /// Reports the size of the desktop.
 pub trait DisplayGeometry: Send + Sync {
     /// The desktop's current size. May block.
@@ -291,7 +312,8 @@ pub trait DisplayGeometry: Send + Sync {
 /// Captures the desktop.
 pub trait FrameSource: Send + Sync {
     /// Capture the whole desktop at its current size. May block for as
-    /// long as a capture takes.
+    /// long as a capture takes. An error that is not [`Gone`] may pass:
+    /// a later capture can succeed.
     fn capture(&self) -> Result<Frame>;
 }
 
@@ -373,6 +395,16 @@ pub struct Platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gone_is_found_under_context() {
+        let gone = anyhow::Error::new(Gone("the X11 capture thread has stopped".to_string()))
+            .context("capturing the desktop");
+        assert!(is_gone(&gone));
+        assert!(format!("{gone:#}").contains("capture thread has stopped"));
+        let passing = anyhow::anyhow!("BadMatch").context("capturing the desktop");
+        assert!(!is_gone(&passing));
+    }
 
     #[test]
     fn size_limits() {

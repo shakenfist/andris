@@ -106,9 +106,10 @@ environment to bound build parallelism on a small machine.
 
 ## Lints and style
 
-`make lint` treats every clippy warning as an error. `clippy::unwrap_used` is on for
-the workspace: production code must not call `unwrap()`, while
-tests may (`clippy.toml` sets `allow-unwrap-in-tests`).
+`make lint` treats every clippy warning as an error.
+`clippy::unwrap_used` is on for the workspace: production code must
+not call `unwrap()`, while tests may (`clippy.toml` sets
+`allow-unwrap-in-tests`).
 
 Dependencies are checked by `cargo deny` against
 [`deny.toml`](https://github.com/shakenfist/andris/blob/develop/deny.toml):
@@ -181,10 +182,11 @@ the commit the queue has built from the pull request and the current
 tip of `develop`. The smoke tier's jobs do not run on `merge_group`.
 
 The other, `End to end`, runs `make e2e` on `merge_group` and on
-`workflow_dispatch`, and `Can merge` requires it too. It is in the merge tier because building ryll would add over a
-minute to every push; its cargo cache has a key prefix of its own, so
-that only a new ryll pin pays for the build, and so that the offline
-jobs never restore a cache the networked ryll build wrote. A retest
+`workflow_dispatch`, and `Can merge` requires it too. It is in the
+merge tier because building ryll would add over a minute to every
+push; its cargo cache has a key prefix of its own, so that only a new
+ryll pin pays for the build, and so that the offline jobs never
+restore a cache the networked ryll build wrote. A retest
 of a branch dispatches it, so it can be tried before the branch is
 enqueued; nothing gates on that run.
 
@@ -250,7 +252,7 @@ must contain the phrase `@shakenfist-bot` followed by the words:
 
 | Comment | Effect |
 |---------|--------|
-| `@shakenfist-bot please retest` | dispatches `ci.yml` on the pull request's branch, which runs the smoke tier again; the repository variable `RETEST_WORKFLOW` names the workflow |
+| `@shakenfist-bot please retest` | dispatches `ci.yml` on the pull request's branch, which runs the smoke tier and the end-to-end test again; the repository variable `RETEST_WORKFLOW` names the workflow |
 | `@shakenfist-bot please re-review` | runs the automated reviewer again over the pull request, even if it has already reviewed this head |
 
 Only a user with write or admin permission on the repository may use

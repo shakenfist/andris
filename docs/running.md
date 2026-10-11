@@ -185,7 +185,10 @@ client can decode LZ4 and the result is smaller, and an uncompressed
 bitmap otherwise; a client that asks for no compression gets bitmaps.
 If the desktop changes size, the display surface is recreated at the
 new size. A slow client is not flooded: a capture is skipped while
-too much is unacknowledged.
+too much is unacknowledged. A capture that fails, as one can while the
+desktop is being resized, is skipped and logged as a warning; the
+display channel closes after ten failures in a row, or at once if the
+connection to the X display has gone.
 
 **Keys.** Keys are typed by position, not by character. The client's
 scancodes become evdev key codes, and those become whichever

@@ -22,6 +22,7 @@ dependencies = [
  "rustls-pemfile",
  "shakenfist-spice-compression",
  "shakenfist-spice-protocol",
+ "subtle",
  "tempfile",
  "tokio",
  "tokio-rustls",

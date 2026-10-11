@@ -80,6 +80,18 @@ impl MouseMode {
         }
     }
 
+    /// The mode's `SPICE_MOUSE_MODE_*` value as the `u16` that
+    /// `MAIN_MOUSE_MODE` carries.
+    pub fn to_wire_u16(self) -> u16 {
+        // Both values are checked to fit when this compiles.
+        const SERVER: u16 = narrow(MOUSE_MODE_SERVER);
+        const CLIENT: u16 = narrow(MOUSE_MODE_CLIENT);
+        match self {
+            MouseMode::Server => SERVER,
+            MouseMode::Client => CLIENT,
+        }
+    }
+
     /// The mode a `SPICE_MOUSE_MODE_*` value names, if any.
     pub fn from_wire(value: u32) -> Option<Self> {
         match value {
@@ -88,6 +100,16 @@ impl MouseMode {
             _ => None,
         }
     }
+}
+
+/// `value` as a `u16`. Called only in constants, where a value that does
+/// not fit fails the build.
+const fn narrow(value: u32) -> u16 {
+    assert!(
+        value <= u16::MAX as u32,
+        "a mouse mode does not fit in 16 bits"
+    );
+    value as u16
 }
 
 /// One client's session: the channels linked with its id.
@@ -393,6 +415,7 @@ mod tests {
     fn mouse_mode_wire_values() {
         for mode in [MouseMode::Server, MouseMode::Client] {
             assert_eq!(MouseMode::from_wire(mode.to_wire()), Some(mode));
+            assert_eq!(u32::from(mode.to_wire_u16()), mode.to_wire());
         }
         assert_eq!(MouseMode::from_wire(0), None);
         let session = Session::new(1);

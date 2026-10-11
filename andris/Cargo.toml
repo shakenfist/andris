@@ -18,6 +18,8 @@ clap = { version = "4", features = ["derive", "env"] }
 # is built.
 rand = "0.8"
 rustls-pemfile = "2"
+# 2.6, the version rsa and rustls already pull in.
+subtle = "2.6"
 tokio = { version = "1", features = ["full"] }
 # 0.26, the version shakenfist-spice-protocol uses, so that only one
 # rustls is built.

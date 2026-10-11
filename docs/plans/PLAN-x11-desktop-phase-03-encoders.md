@@ -405,14 +405,14 @@ management session makes them after reviewing each sub-agent's diff.
 
 | Step | Effort | Model | Isolation | Status | Brief for sub-agent |
 |------|--------|-------|-----------|--------|---------------------|
-| 0 | low | management | none | Not started | Land this plan; create the ryll worktree. See brief 0. |
-| 1 | medium | sonnet | none | Not started | `--preferred-compression`, and LZ4 in `pcap-inspect.py`. See brief 1. |
-| 2 | high | opus | none | Not started | Capture spice-server LZ4, settle the framing, and build the fixtures. See brief 2. |
-| 3 | high | opus | none | Not started | Rewrite the LZ4 decoder; add `ImagePayload::Lz4`; re-point the renderer. See brief 3. |
-| 4 | medium | sonnet | none | Not started | The `encode` feature and the LZ4 encoder, with property tests. See brief 4. |
-| 5 | medium | sonnet | none | Not started | The JPEG encoder. See brief 5. |
-| 6 | medium | sonnet | none | Not started | The `fuzz_lz4_decode` target, and ryll documentation. See brief 6. |
-| 7 | medium | management | none | Not started | Push audit, kerbside check, pull request, queue. See brief 7. |
+| 0 | low | management | none | Complete | Land this plan; create the ryll worktree. See brief 0. |
+| 1 | medium | sonnet | none | Complete | `--preferred-compression`, and LZ4 in `pcap-inspect.py`. See brief 1. |
+| 2 | high | opus | none | Complete | Capture spice-server LZ4, settle the framing, and build the fixtures. See brief 2. |
+| 3 | high | opus | none | Complete | Rewrite the LZ4 decoder; add `ImagePayload::Lz4`; re-point the renderer. See brief 3. |
+| 4 | medium | sonnet | none | Complete | The `encode` feature and the LZ4 encoder, with property tests. See brief 4. |
+| 5 | medium | sonnet | none | Complete | The JPEG encoder. See brief 5. |
+| 6 | medium | sonnet | none | Complete | The `fuzz_lz4_decode` target, and ryll documentation. See brief 6. |
+| 7 | medium | management | none | Complete | Push audit, kerbside check, pull request, queue. See brief 7. |
 
 Step 2 is high effort because its result is a judgement: what
 spice-server actually sends. Every later step builds on that answer.
@@ -723,7 +723,72 @@ Commit subject: `Fuzz the LZ4 decoder and document the encoders.`
 
 ## Capture
 
-Not yet run. Step 2's findings go here.
+Run on 2026-10-10 against the UEFI latency guest from
+`make test-qemu`:
+
+- QXL at 1280x800;
+- Debian's QEMU 10.0.13 and libspice-server 0.15.2-1+b1;
+- liblz4 1.9.4 through python-lz4 4.4.5.
+
+**Survey finding 2 is confirmed.** Real traffic matched the reference
+reading in every check, and nothing disagreed.
+
+- **How it ran.** Ryll ran headless with
+  `--preferred-compression lz4 --capture`. Keys were sent over QMP,
+  with a `screendump` after each.
+- **What arrived.** Two captures carried 683 DRAW_COPY images, every
+  one of them type 109, including the first full-screen draw.
+- **The checks, for every image:**
+  - `data_size` equalled the bytes left in the message;
+  - byte 0 was 1 and byte 1 was 8;
+  - there was exactly one block, whose big-endian length plus 4 was
+    `data_size - 2`;
+  - liblz4 decoded exactly `width * height * 4` bytes.
+- **The pixels.** Replaying every decoded draw onto a framebuffer
+  reproduced all 18 screendumps with no differing pixel. Two negative
+  controls showed the comparison detects both errors it guards
+  against: a flipped row order and swapped R and B.
+- **What this guest does not exercise:**
+  - several dependent blocks;
+  - a bottom-up image;
+  - formats 6, 7 and 9.
+
+  The synthetic fixtures cover these. In the three-block fixture,
+  liblz4 ignored the dictionary for the plain formula, so pixels with
+  `x >= 18` repeat row `y % 5`. Its later blocks then fail without
+  the dictionary and decode with it.
+
+  The XFCE guest (`make test-qemu-desktop`) was not tried. It is the
+  next source if real multi-block or bottom-up traffic is wanted.
+- **Fixtures.** Three captured images and five synthetic streams are
+  in `shakenfist-spice-compression/tests/fixtures/lz4/`; the captured
+  files total 34 KiB. The expected pixels come from the screendumps,
+  not from a decode. The fixtures' `README.md` holds the scripts.
+- **A workaround was needed.** `ryll --headless --capture` panics at
+  startup, because `CaptureSession::new` spawns outside a tokio
+  runtime (ryll#399, open). The capture used a scratch build with a
+  six-line workaround. The branch does not carry it.
+
+## Departures from the briefs
+
+- **The renderer's image cache key** (step 3). Non-GLZ images flagged
+  `CACHE_ME` were cached under the decoded image's id. The LZ and LZ4
+  decoders leave that id at 0, so a later `FROM_CACHE` for the real
+  id missed. That bug predates this phase. Review of step 3 found it,
+  and the images are now cached under the descriptor's id, with tests
+  for LZ4 and pixmap images. Step 3 also added `warn_once` keys for
+  LZ4 decode failures, and a renderer test drives the LZ4 arm end to
+  end.
+- **Step 4 left `jpeg-encoder` to step 5**, so the `encode` feature
+  never named an unused dependency.
+- **Lockfiles were edited by hand** (steps 4 and 5). `make lock`
+  moved unrelated `windows-sys` versions, so only the new packages
+  were added, and `make fetch --locked` confirmed the result.
+- **`jpeg-encoder`'s `simd` feature is on** (step 5). It is pure Rust
+  AVX2, selected at run time. The unsafe code it brings is confined
+  to the crate's forward DCT.
+- **The compression crate's description and README** no longer call
+  it decompression only (step 6).
 
 ## Risks and mitigations
 
@@ -772,7 +837,42 @@ Not yet run. Step 2's findings go here.
 
 ## Result
 
-Not yet run.
+Ryll pull request #487 merged as `cd2fe41` and closed ryll#475.
+Its last commit, `0c22060`, responds to the automated review:
+
+- It adds an LZ `CACHE_ME` then `FROM_CACHE` test, so pixmap, LZ
+  and LZ4 each pin the descriptor-id cache key.
+- It points the link-up comment straight at
+  `docs/configuration.md`.
+- `make lint` now also runs clippy over the compression crate with
+  only `encode`, as andris will build it.
+
+The review's other suggestions were declined in that commit's
+message:
+
+- accepting LZ4 format byte 0;
+- a typed compression value in the renderer API;
+- encoder tests on macOS and Windows.
+
+The Definition of done was checked against ryll's `develop` after
+the merge:
+
+- ryll#475 is closed;
+- `lz4.rs` has no per-row framing or test encoder;
+- the renderer's "does NOT have a data_size" comment is gone;
+- the Makefile enables `compression/encode`;
+- `logging.rs` is unchanged;
+- `fuzz_lz4_decode` exists.
+
+Follow-ups:
+
+- **ryll#488:** a control socket that cannot bind only warns. Found
+  during the live run.
+- **ryll#499:** openh264 is an unconditional dependency of the
+  compression crate. Phase 4 will pull it in through the `encode`
+  feature until #499 lands.
+- **kerbside#556:** corrects kerbside's LZ4 row. Merged as
+  `aebbe92`.
 
 ## Back brief
 

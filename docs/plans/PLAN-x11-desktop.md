@@ -169,7 +169,7 @@ written with `/next-phase` as each phase comes up.
 | 0. Join the consistency audit | PLAN-x11-desktop-phase-00-audit.md | Complete | andris `60c0c4d..e89539f`; development `066d639` |
 | 1. Build and CI scaffold | PLAN-x11-desktop-phase-01-scaffold.md | Complete | andris `cf34d91` (#1) |
 | 2. Server-role wire types (ryll) | PLAN-x11-desktop-phase-02-wire-types.md | Complete | ryll `3763158` (#477); andris `a9e79cf` (#5) |
-| 3. Image encoders (ryll) | PLAN-x11-desktop-phase-03-encoders.md | In progress | |
+| 3. Image encoders (ryll) | PLAN-x11-desktop-phase-03-encoders.md | Complete | ryll `cd2fe41` (#487); andris `591e062` (#6) |
 | 4. Server skeleton | Not yet written | Not started | |
 | 5. Damage and flow control | Not yet written | Not started | |
 | 6. Sharing the xrdp session | Not yet written | Not started | |

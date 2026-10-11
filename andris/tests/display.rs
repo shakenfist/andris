@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use andris::platform::synthetic::{SQUARE_SIZE, SQUARE_TOP};
 use andris::platform::{DisplayGeometry, Frame, Rectangle, Region, Size};
-use andris::server::display::{CAPTURE_RETRY, MAX_CAPTURE_FAILURES};
+use andris::server::display::{CAPTURE_RETRY, DisplayOptions, MAX_CAPTURE_FAILURES};
 use andris::server::updates::{JpegQuality, MAX_RECTS_PER_FRAME};
 use shakenfist_spice_compression::{JpegDecoder, JpegDecoderRsDecoder, decompress_spice_lz4};
 use shakenfist_spice_protocol::constants::{
@@ -33,7 +33,7 @@ use shakenfist_spice_protocol::{
     ChannelType, ImageType, capabilities, display_client, display_server,
 };
 
-use support::{TestClient, TestServer, Tuning, wait_until};
+use support::{TestClient, TestServer, display_options, wait_until};
 
 /// The frame interval of the servers here, unless a test says otherwise:
 /// short, so tests are quick.
@@ -697,6 +697,28 @@ async fn a_malformed_stream_report_closes_the_channel() {
 }
 
 #[tokio::test]
+async fn a_malformed_preferred_compression_closes_the_channel() {
+    let (server, _main, mut client) = open_display(capabilities::DEFAULT_DISPLAY).await;
+    start(&server, &mut client, image_compression::AUTO_GLZ).await;
+    // The body is one byte, the compression; none is malformed.
+    client
+        .send(display_client::PREFERRED_COMPRESSION, &[])
+        .await;
+    client.expect_closed().await;
+}
+
+#[tokio::test]
+async fn a_malformed_preferred_video_codec_type_closes_the_channel() {
+    let (server, _main, mut client) = open_display(capabilities::DEFAULT_DISPLAY).await;
+    start(&server, &mut client, image_compression::AUTO_GLZ).await;
+    // Three codecs claimed, one sent.
+    client
+        .send(display_client::PREFERRED_VIDEO_CODEC_TYPE, &[3, 1])
+        .await;
+    client.expect_closed().await;
+}
+
+#[tokio::test]
 async fn failed_captures_skip_frames_and_the_count_resets() {
     let (server, _main, mut client) = open_display(capabilities::DEFAULT_DISPLAY).await;
     let mut screen = start(&server, &mut client, image_compression::AUTO_GLZ).await;
@@ -858,9 +880,12 @@ async fn the_rate_cap_holds_under_continuous_damage() {
     mover.await.unwrap();
 
     // A second at one frame per 100 ms is at most eleven frames, and one
-    // more for damage after the last of them.
+    // more for damage after the last of them. The upper bound is the
+    // rate cap, and holds however slow the machine. The lower bound only
+    // shows that frames kept flowing, so it is loose: a loaded CI runner
+    // may run the mover, or the server, well behind time.
     assert!(marks <= 12, "{marks} frames in a second");
-    assert!(marks >= 5, "only {marks} frames in a second");
+    assert!(marks >= 3, "only {marks} frames in a second");
     screen.assert_shows(&server.platform.desktop().unwrap());
 }
 
@@ -887,11 +912,11 @@ async fn start_jpeg(
     jpeg_quality: Option<JpegQuality>,
     compression: u8,
 ) -> (TestServer, TestClient, TestClient, Screen) {
-    let server = TestServer::start_tuned(Tuning {
+    let server = TestServer::start_tuned(DisplayOptions {
         frame_interval: INTERVAL,
         lossless_delay: LOSSLESS,
         jpeg_quality,
-        ..Tuning::default()
+        ..display_options()
     })
     .await;
     let (server, main, mut client) = open_display_on(server, capabilities::DEFAULT_DISPLAY).await;

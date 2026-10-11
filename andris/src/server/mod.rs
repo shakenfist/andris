@@ -63,6 +63,7 @@ use tracing::{debug, info, warn};
 use crate::config::Ticket;
 use crate::platform::Platform;
 use channel::{ChannelConn, ChannelContext, drive};
+pub use display::DisplayOptions;
 pub use link::HandshakeTimeouts;
 use link::{HandshakeContext, Linked, ServedChannel, timed};
 use opcodes::{CursorOpcode, DisplayOpcode, InputsOpcode, MainOpcode};
@@ -115,18 +116,9 @@ pub struct ServerOptions {
     pub listen: SocketAddr,
     pub tls: Option<TlsOptions>,
     pub ticket: Ticket,
-    /// The shortest time between the starts of two display frames.
-    pub frame_interval: Duration,
-    /// How long the display channel's scrub takes to re-read the whole
-    /// desktop: [`display::SCRUB_PERIOD`], unless a test shortens it.
-    pub scrub_period: Duration,
-    /// How long an area sent as JPEG must stay still before it is sent
-    /// again losslessly: [`display::LOSSLESS_DELAY`], unless a test
-    /// shortens it.
-    pub lossless_delay: Duration,
-    /// The quality the display channel may send JPEG at, or `None` if it
-    /// must not (`--jpeg-quality 0`).
-    pub jpeg_quality: Option<updates::JpegQuality>,
+    /// How display channels pace their frames, and whether they may send
+    /// JPEG.
+    pub display: DisplayOptions,
     /// The handshake's time limits; tests shorten them.
     pub timeouts: HandshakeTimeouts,
 }
@@ -248,10 +240,7 @@ struct HandshakeSlot {
 struct Shared {
     ticket: Ticket,
     platform: Platform,
-    frame_interval: Duration,
-    scrub_period: Duration,
-    lossless_delay: Duration,
-    jpeg_quality: Option<updates::JpegQuality>,
+    display: DisplayOptions,
     timeouts: HandshakeTimeouts,
     registry: SessionRegistry,
     handshakes: Arc<Semaphore>,
@@ -305,10 +294,7 @@ impl Server {
             shared: Arc::new(Shared {
                 ticket: options.ticket,
                 platform,
-                frame_interval: options.frame_interval,
-                scrub_period: options.scrub_period,
-                lossless_delay: options.lossless_delay,
-                jpeg_quality: options.jpeg_quality,
+                display: options.display,
                 timeouts: options.timeouts,
                 registry: SessionRegistry::new(),
                 handshakes: Arc::new(Semaphore::new(MAX_HANDSHAKES)),
@@ -643,10 +629,7 @@ async fn serve_channel(stream: SpiceStream, linked: Linked, shared: &Shared) {
         platform: shared.platform.clone(),
         caps: linked.caps,
         channel_id: linked.channel_id,
-        frame_interval: shared.frame_interval,
-        scrub_period: shared.scrub_period,
-        lossless_delay: shared.lossless_delay,
-        jpeg_quality: shared.jpeg_quality,
+        display: shared.display,
     };
     match linked.channel {
         ServedChannel::Main => {

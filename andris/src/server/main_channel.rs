@@ -199,6 +199,7 @@ mod tests {
     use crate::platform::Size;
     use crate::platform::synthetic::SyntheticPlatform;
     use crate::server::channel::ClientCaps;
+    use crate::server::display::DisplayOptions;
     use crate::server::opcodes::ServerOpcode;
     use crate::server::session::SessionRegistry;
 
@@ -217,10 +218,7 @@ mod tests {
             platform: platform.platform(),
             caps: ClientCaps::default(),
             channel_id: 0,
-            frame_interval: Duration::from_millis(50),
-            scrub_period: Duration::from_secs(4),
-            lossless_delay: Duration::from_millis(500),
-            jpeg_quality: None,
+            display: DisplayOptions::default(),
         };
         let (server_end, mut client_end) = tokio::io::duplex(64 * 1024);
         let conn = ChannelConn::<MainOpcode>::new(server_end, session);

@@ -28,15 +28,30 @@
 //! photograph: smooth gradients and waves with a fixed grain, which LZ4
 //! shrinks little and JPEG a lot. The latest paint is on top.
 //!
+//! Paints are kept, not flattened into the pattern: each adds an overlay
+//! that every later capture checks, pixel by pixel, so rendering costs
+//! the pixels captured times the overlays painted. Paints are for tests
+//! that make a few of them; a long load run should drive the desktop
+//! with [`SyntheticPlatform::advance`], which costs nothing extra.
+//!
 //! # Damage
 //!
 //! [`SyntheticPlatform::advance`] reports the square's old and new
 //! rectangles as damage, [`SyntheticPlatform::paint`] and
 //! [`SyntheticPlatform::paint_photo`] the rectangle they paint, and
-//! [`SyntheticPlatform::set_size`] the whole desktop at its new size. [`SyntheticPlatform::paint_undamaged`]
-//! changes pixels and reports nothing, as a change XDamage missed would,
-//! and [`SyntheticPlatform::report_damage`] reports damage and changes
+//! [`SyntheticPlatform::set_size`] the whole desktop at its new size.
+//! [`SyntheticPlatform::paint_undamaged`] changes pixels and reports
+//! nothing, as a change XDamage missed would, and
+//! [`SyntheticPlatform::report_damage`] reports damage and changes
 //! nothing. A capture renders only the rectangles asked for.
+//!
+//! Every change is reported while the state lock is still held, so
+//! damage and resizes reach the hub in the order the changes were made:
+//! two racing [`SyntheticPlatform::set_size`] calls cannot leave the hub
+//! believing in the size that lost. A capture woken by the damage waits
+//! for the lock, so it sees the change. The lock order is the state lock,
+//! then the hub's locks; the hub never calls back into the platform, so
+//! nothing takes them the other way round.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -199,9 +214,9 @@ impl SyntheticPlatform {
     }
 
     fn paint_damaged(&self, rect: Rectangle, fill: Fill) -> Result<()> {
-        // The lock is released before damage is reported, so a capture
-        // the damage starts sees the paint.
-        self.state()?.overlays.push((rect, fill));
+        // Reported under the lock, as every change is: see the module.
+        let mut state = self.state()?;
+        state.overlays.push((rect, fill));
         self.damage.damage(&[rect])
     }
 

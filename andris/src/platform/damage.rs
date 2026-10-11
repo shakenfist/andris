@@ -6,7 +6,9 @@
 //!   one size. Damage is rounded out to whole tiles, so a region is
 //!   disjoint by construction, small (one bit a tile), and cheap to
 //!   union. [`Region::rectangles`] merges its tiles into at most a given
-//!   number of rectangles.
+//!   number of rectangles, and [`Region::tiles`] lists them one by one.
+//!   [`Rectangle::tiles`] lists the tiles a rectangle touches, so callers
+//!   need not re-derive the grid's geometry.
 //! - [`DamageHub`] is the platform's side. It holds every live
 //!   [`DamageSubscription`], and adds each damaged rectangle to all of
 //!   them.
@@ -129,6 +131,56 @@ impl Rectangle {
             && u64::from(self.y) < other.bottom()
             && u64::from(other.y) < self.bottom()
     }
+
+    /// The column and row of each [`TILE`] x [`TILE`] tile the rectangle
+    /// touches, counted from the desktop's origin, top first and then
+    /// left first. An empty rectangle touches none. Nothing is clipped:
+    /// a rectangle reaching past a desktop touches tiles outside its
+    /// grid.
+    pub fn tiles(&self) -> impl Iterator<Item = (u32, u32)> + use<> {
+        let tile = u64::from(TILE);
+        let (cols, rows) = if self.is_empty() {
+            (0..0, 0..0)
+        } else {
+            // A right or bottom edge is below 2^33, so its tile index is
+            // below 2^27 and fits a u32.
+            (
+                self.x / TILE..self.right().div_ceil(tile) as u32,
+                self.y / TILE..self.bottom().div_ceil(tile) as u32,
+            )
+        };
+        rows.flat_map(move |row| cols.clone().map(move |col| (col, row)))
+    }
+
+    /// The part of the rectangle within tile (`col`, `row`), or `None`
+    /// if it does not touch that tile.
+    pub fn tile_part(&self, col: u32, row: u32) -> Option<Rectangle> {
+        let tile = u64::from(TILE);
+        let left = (u64::from(col) * tile).max(u64::from(self.x));
+        let top = (u64::from(row) * tile).max(u64::from(self.y));
+        let right = ((u64::from(col) + 1) * tile).min(self.right());
+        let bottom = ((u64::from(row) + 1) * tile).min(self.bottom());
+        if right <= left || bottom <= top {
+            return None;
+        }
+        // The part lies within the rectangle, so each of these fits a u32.
+        Some(Rectangle::new(
+            left as u32,
+            top as u32,
+            (right - left) as u32,
+            (bottom - top) as u32,
+        ))
+    }
+
+    /// Whether `other` lies wholly within this rectangle. An empty
+    /// `other` lies within any rectangle.
+    pub fn contains(&self, other: &Rectangle) -> bool {
+        other.is_empty()
+            || (other.x >= self.x
+                && other.y >= self.y
+                && other.right() <= self.right()
+                && other.bottom() <= self.bottom())
+    }
 }
 
 impl std::fmt::Display for Rectangle {
@@ -187,16 +239,9 @@ impl Region {
         let Some(rect) = rect.clip(self.size) else {
             return;
         };
-        // A clipped rectangle is not empty, and its right and bottom are
-        // within the desktop, so these are valid tile indices.
-        let first_col = rect.x / TILE;
-        let last_col = ((rect.right() - 1) / u64::from(TILE)) as u32;
-        let first_row = rect.y / TILE;
-        let last_row = ((rect.bottom() - 1) / u64::from(TILE)) as u32;
-        for row in first_row..=last_row {
-            for col in first_col..=last_col {
-                self.set(col, row);
-            }
+        // Clipped, so every tile it touches is within the grid.
+        for (col, row) in rect.tiles() {
+            self.insert_tile(col, row);
         }
     }
 
@@ -228,16 +273,68 @@ impl Region {
             .sum()
     }
 
+    /// The pixels of the region's tiles, clipped to its desktop.
+    pub fn area(&self) -> u64 {
+        self.tiles()
+            .map(|(col, row)| self.tile_rect(col, row).area())
+            .sum()
+    }
+
     /// Whether tile (`col`, `row`) is in the region; `false` outside the
     /// grid.
     pub fn contains_tile(&self, col: u32, row: u32) -> bool {
-        if col >= self.columns || row >= self.rows {
+        let Some(bit) = self.bit(col, row) else {
             return false;
-        }
-        let bit = self.bit(col, row);
+        };
         self.bits
             .get(bit / 64)
             .is_some_and(|word| word & (1 << (bit % 64)) != 0)
+    }
+
+    /// Add tile (`col`, `row`). A tile outside the grid adds nothing.
+    pub fn insert_tile(&mut self, col: u32, row: u32) {
+        if let Some(bit) = self.bit(col, row)
+            && let Some(word) = self.bits.get_mut(bit / 64)
+        {
+            *word |= 1 << (bit % 64);
+        }
+    }
+
+    /// Remove tile (`col`, `row`). A tile outside the grid removes
+    /// nothing.
+    pub fn remove_tile(&mut self, col: u32, row: u32) {
+        if let Some(bit) = self.bit(col, row)
+            && let Some(word) = self.bits.get_mut(bit / 64)
+        {
+            *word &= !(1 << (bit % 64));
+        }
+    }
+
+    /// The column and row of each of the region's tiles, top first and
+    /// then left first. Skips empty stretches a word of 64 tiles at a
+    /// time, and allocates nothing.
+    pub fn tiles(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        let columns = self.columns.max(1) as usize;
+        self.bits.iter().enumerate().flat_map(move |(at, &word)| {
+            let mut word = word;
+            std::iter::from_fn(move || {
+                if word == 0 {
+                    return None;
+                }
+                let index = at * 64 + word.trailing_zeros() as usize;
+                word &= word - 1;
+                // Only bits within the grid are ever set, so both fit
+                // a u32.
+                Some(((index % columns) as u32, (index / columns) as u32))
+            })
+        })
+    }
+
+    /// The pixels of tile (`col`, `row`), clipped to the desktop: a whole
+    /// [`TILE`] x [`TILE`] tile except in the last column and row. A tile
+    /// outside the grid is an empty rectangle at the desktop's edge.
+    pub fn tile_rect(&self, col: u32, row: u32) -> Rectangle {
+        self.span_rect(col, col.saturating_add(1), row, row.saturating_add(1))
     }
 
     /// The region's tiles as at most `max` disjoint rectangles, clipped
@@ -287,18 +384,13 @@ impl Region {
             left = left.min(first);
             right = right.max(end);
         }
-        Some(self.tile_rect(left, right, top, bottom + 1))
+        Some(self.span_rect(left, right, top, bottom + 1))
     }
 
-    fn bit(&self, col: u32, row: u32) -> usize {
-        row as usize * self.columns as usize + col as usize
-    }
-
-    fn set(&mut self, col: u32, row: u32) {
-        let bit = self.bit(col, row);
-        if let Some(word) = self.bits.get_mut(bit / 64) {
-            *word |= 1 << (bit % 64);
-        }
+    /// Tile (`col`, `row`)'s bit, or `None` outside the grid.
+    fn bit(&self, col: u32, row: u32) -> Option<usize> {
+        (col < self.columns && row < self.rows)
+            .then(|| row as usize * self.columns as usize + col as usize)
     }
 
     /// The runs of consecutive tiles in tile row `row`, as half-open
@@ -349,32 +441,34 @@ impl Region {
             }
             done.extend(
                 open.drain(..)
-                    .map(|(first, end, top)| self.tile_rect(first, end, top, row)),
+                    .map(|(first, end, top)| self.span_rect(first, end, top, row)),
             );
             open = next;
         }
         done.extend(
             open.into_iter()
-                .map(|(first, end, top)| self.tile_rect(first, end, top, self.rows)),
+                .map(|(first, end, top)| self.span_rect(first, end, top, self.rows)),
         );
         done.sort_by_key(|rect| (rect.y, rect.x));
         done
     }
 
     /// The pixels of tile columns `first..end` and tile rows
-    /// `top..bottom`, clipped to the desktop.
-    fn tile_rect(&self, first: u32, end: u32, top: u32, bottom: u32) -> Rectangle {
-        let x = first * TILE;
-        let y = top * TILE;
-        let right = (u64::from(end) * u64::from(TILE)).min(u64::from(self.size.width));
-        let bottom = (u64::from(bottom) * u64::from(TILE)).min(u64::from(self.size.height));
-        // Tile indices come from the grid, so these are within the
-        // desktop and fit a u32.
+    /// `top..bottom`, clipped to the desktop. Columns and rows beyond the
+    /// grid clip to an empty rectangle at its edge.
+    fn span_rect(&self, first: u32, end: u32, top: u32, bottom: u32) -> Rectangle {
+        let tile = u64::from(TILE);
+        let (width, height) = (u64::from(self.size.width), u64::from(self.size.height));
+        let x = (u64::from(first) * tile).min(width);
+        let y = (u64::from(top) * tile).min(height);
+        let right = (u64::from(end) * tile).min(width);
+        let bottom = (u64::from(bottom) * tile).min(height);
+        // Each is at most a side of the desktop, so fits a u32.
         Rectangle::new(
-            x,
-            y,
-            (right - u64::from(x)) as u32,
-            (bottom - u64::from(y)) as u32,
+            x as u32,
+            y as u32,
+            right.saturating_sub(x) as u32,
+            bottom.saturating_sub(y) as u32,
         )
     }
 }
@@ -490,9 +584,14 @@ struct Hub {
 }
 
 impl Hub {
+    /// Forget the subscriptions that have been dropped.
+    fn prune(&mut self) {
+        self.subscribers.retain(|weak| weak.strong_count() > 0);
+    }
+
     /// The live subscriptions, forgetting those that have been dropped.
     fn live(&mut self) -> Vec<Arc<Shared>> {
-        self.subscribers.retain(|weak| weak.strong_count() > 0);
+        self.prune();
         self.subscribers.iter().filter_map(Weak::upgrade).collect()
     }
 }
@@ -518,12 +617,15 @@ impl DamageHub {
     }
 
     /// A new subscription whose pending damage is the whole desktop.
-    /// Fails with [`Gone`] once the desktop has gone.
+    /// Fails with [`Gone`] once the desktop has gone. Dropped
+    /// subscriptions are forgotten here too, so clients that connect and
+    /// leave while the desktop reports no damage cannot grow the list.
     pub fn subscribe(&self) -> Result<DamageSubscription> {
         let mut hub = self.hub()?;
         if let Some(why) = &hub.gone {
             return Err(anyhow::Error::new(Gone(why.clone())));
         }
+        hub.prune();
         let shared = Arc::new(Shared {
             pending: Mutex::new(Pending {
                 region: Region::full(hub.size),
@@ -847,6 +949,93 @@ mod tests {
         assert_eq!(region, tiles(&["#...", "....", "...."]));
     }
 
+    #[test]
+    fn a_rectangle_lists_the_tiles_it_touches() {
+        assert_eq!(
+            rect(63, 10, 2, 60).tiles().collect::<Vec<_>>(),
+            vec![(0, 0), (1, 0), (0, 1), (1, 1)]
+        );
+        assert_eq!(
+            rect(64, 64, 64, 64).tiles().collect::<Vec<_>>(),
+            vec![(1, 1)]
+        );
+        // Unaligned, but empty.
+        assert_eq!(rect(10, 10, 0, 5).tiles().count(), 0);
+        assert_eq!(rect(10, 10, 5, 0).tiles().count(), 0);
+        // Nothing overflows at the far edge of the coordinates.
+        let far = rect(u32::MAX, u32::MAX, u32::MAX, u32::MAX);
+        assert_eq!(far.tiles().next(), Some((u32::MAX / TILE, u32::MAX / TILE)));
+    }
+
+    #[test]
+    fn a_rectangle_is_cut_into_its_tile_parts() {
+        let r = rect(60, 0, 10, 70);
+        assert_eq!(r.tile_part(0, 0), Some(rect(60, 0, 4, 64)));
+        assert_eq!(r.tile_part(1, 0), Some(rect(64, 0, 6, 64)));
+        assert_eq!(r.tile_part(0, 1), Some(rect(60, 64, 4, 6)));
+        assert_eq!(r.tile_part(2, 0), None);
+        assert_eq!(rect(0, 0, 0, 0).tile_part(0, 0), None);
+        let parts: u64 = r
+            .tiles()
+            .filter_map(|(col, row)| r.tile_part(col, row))
+            .map(|part| part.area())
+            .sum();
+        assert_eq!(parts, r.area());
+    }
+
+    #[test]
+    fn rectangle_containment() {
+        let outer = rect(10, 10, 20, 20);
+        assert!(outer.contains(&outer));
+        assert!(outer.contains(&rect(15, 15, 15, 15)));
+        assert!(!outer.contains(&rect(15, 15, 16, 15)));
+        assert!(!outer.contains(&rect(9, 15, 2, 2)));
+        assert!(outer.contains(&rect(500, 500, 0, 0)), "empty");
+    }
+
+    #[test]
+    fn tiles_lists_the_region_top_first_then_left() {
+        let region = tiles(&["#..#", ".#..", "...#"]);
+        assert_eq!(
+            region.tiles().collect::<Vec<_>>(),
+            vec![(0, 0), (3, 0), (1, 1), (3, 2)]
+        );
+        assert_eq!(Region::empty(SIZE).tiles().count(), 0);
+        // Across the word boundaries of the largest desktop.
+        let size = Size {
+            width: MAX_IMAGE_DIMENSION,
+            height: MAX_IMAGE_DIMENSION,
+        };
+        let full = Region::full(size);
+        assert_eq!(full.tiles().count(), 65536);
+        assert_eq!(full.tiles().last(), Some((255, 255)));
+    }
+
+    #[test]
+    fn tile_rect_clips_to_the_desktop() {
+        let region = Region::empty(SIZE);
+        assert_eq!(region.tile_rect(0, 0), rect(0, 0, 64, 64));
+        assert_eq!(region.tile_rect(3, 1), rect(192, 64, 36, 64));
+        assert_eq!(region.tile_rect(3, 2), rect(192, 128, 36, 8));
+        assert!(region.tile_rect(4, 0).is_empty(), "outside the grid");
+        assert!(region.tile_rect(u32::MAX, u32::MAX).is_empty());
+    }
+
+    #[test]
+    fn tiles_are_inserted_and_removed_one_at_a_time() {
+        let mut region = Region::empty(SIZE);
+        region.insert_tile(3, 2);
+        region.insert_tile(1, 0);
+        // Outside the grid: not taken as a tile of the next row.
+        region.insert_tile(4, 0);
+        assert_eq!(region, tiles(&[".#..", "....", "...#"]));
+        assert_eq!(region.area(), 64 * 64 + 36 * 8);
+        region.remove_tile(1, 0);
+        region.remove_tile(4, 0);
+        assert_eq!(region, tiles(&["....", "....", "...#"]));
+        assert_eq!(Region::full(SIZE).area(), Rectangle::full(SIZE).area());
+    }
+
     /// Whether `changed` returns within a short wait.
     async fn returns(subscription: &DamageSubscription) -> bool {
         tokio::time::timeout(Duration::from_millis(50), subscription.changed())
@@ -1065,5 +1254,17 @@ mod tests {
         assert_eq!(hub.hub().unwrap().subscribers.len(), 1);
         drop(kept);
         assert_eq!(hub.subscribers().unwrap(), 0);
+    }
+
+    #[test]
+    fn subscribing_prunes_dropped_subscriptions() {
+        // No damage is reported, so only subscribing can prune.
+        let hub = DamageHub::new(SIZE);
+        let kept = hub.subscribe().unwrap();
+        for _ in 0..100 {
+            drop(hub.subscribe().unwrap());
+        }
+        assert_eq!(hub.hub().unwrap().subscribers.len(), 2);
+        drop(kept);
     }
 }

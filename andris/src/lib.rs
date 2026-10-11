@@ -25,7 +25,7 @@ use config::{Config, PlatformConfig};
 use platform::Platform;
 use platform::synthetic::SyntheticPlatform;
 use platform::x11::X11Platform;
-use server::{HandshakeTimeouts, STOP_GRACE, Server, ServerOptions, TlsOptions};
+use server::{DisplayOptions, HandshakeTimeouts, STOP_GRACE, Server, ServerOptions, TlsOptions};
 
 /// Andris's name and version, as `--version` prints them.
 pub fn banner() -> String {
@@ -67,10 +67,11 @@ async fn serve(config: Config, platform: Platform) -> Result<()> {
         listen: config.listen,
         tls,
         ticket: config.ticket,
-        frame_interval: config.frame_interval,
-        scrub_period: server::display::SCRUB_PERIOD,
-        lossless_delay: server::display::LOSSLESS_DELAY,
-        jpeg_quality: config.jpeg_quality,
+        display: DisplayOptions {
+            frame_interval: config.frame_interval,
+            jpeg_quality: config.jpeg_quality,
+            ..DisplayOptions::default()
+        },
         timeouts: HandshakeTimeouts::default(),
     };
     let mut handle = Server::bind(options, platform).await?.spawn()?;

@@ -29,9 +29,9 @@ use shakenfist_spice_protocol::messages::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::debug;
 
+use super::display::DisplayOptions;
 use super::opcodes::{AckedOpcode, ServerOpcode};
 use super::session::Session;
-use super::updates::JpegQuality;
 use crate::platform::Platform;
 
 /// The ack window display and cursor ask for, as spice-server does.
@@ -48,6 +48,20 @@ pub const MAX_PENDING: usize = 64;
 
 /// How much the receive buffer grows by for each read.
 const READ_CHUNK: usize = 16 * 1024;
+
+/// The longest `PING` round trip recorded. The round trip is taken from
+/// the timestamp the client echoes, so a longer one, like one from a
+/// timestamp in the future, says only that the client sent a timestamp
+/// andris never did, and is discarded rather than skewing the metrics.
+pub const MAX_PLAUSIBLE_RTT: Duration = Duration::from_secs(60);
+
+/// The round trip of a `PING` stamped `sent_ns` whose `PONG` arrived at
+/// `now_ns`, both on the session clock, or `None` if it is implausible:
+/// sent in the future, or longer than [`MAX_PLAUSIBLE_RTT`].
+fn round_trip(now_ns: u64, sent_ns: u64) -> Option<Duration> {
+    let rtt = Duration::from_nanos(now_ns.checked_sub(sent_ns)?);
+    (rtt <= MAX_PLAUSIBLE_RTT).then_some(rtt)
+}
 
 /// A byte stream a channel runs over: TCP, TLS, or an in-memory pipe in
 /// tests.
@@ -99,17 +113,9 @@ pub struct ChannelContext {
     pub caps: ClientCaps,
     /// The channel id the client linked; always 0 today.
     pub channel_id: u8,
-    /// The shortest time between the starts of two display frames.
-    pub frame_interval: Duration,
-    /// How long the display channel's scrub takes to re-read the whole
-    /// desktop.
-    pub scrub_period: Duration,
-    /// How long an area sent as JPEG must stay still before the display
-    /// channel sends it again losslessly.
-    pub lossless_delay: Duration,
-    /// The quality the display channel may send JPEG at, or `None` if it
-    /// must not.
-    pub jpeg_quality: Option<JpegQuality>,
+    /// How a display channel paces its frames, and whether it may send
+    /// JPEG.
+    pub display: DisplayOptions,
 }
 
 impl ChannelContext {
@@ -381,16 +387,23 @@ impl<O: ServerOpcode> ChannelConn<O> {
         match message.header.message_type {
             main_client::PONG => {
                 let pong = Pong::decode(message.payload()).context("a malformed PONG")?;
-                let rtt = self.session.clock_ns().saturating_sub(pong.timestamp);
-                self.session
-                    .counters()
-                    .ping_round_trip(Duration::from_nanos(rtt));
-                debug!(
-                    channel,
-                    id = pong.id,
-                    rtt_us = rtt / 1000,
-                    "PONG round trip"
-                );
+                match round_trip(self.session.clock_ns(), pong.timestamp) {
+                    Some(rtt) => {
+                        self.session.counters().ping_round_trip(rtt);
+                        debug!(
+                            channel,
+                            id = pong.id,
+                            rtt_us = rtt.as_micros(),
+                            "PONG round trip"
+                        );
+                    }
+                    None => debug!(
+                        channel,
+                        id = pong.id,
+                        timestamp = pong.timestamp,
+                        "a PONG with an implausible timestamp; not recorded"
+                    ),
+                }
                 Ok(Common::Handled)
             }
             main_client::ACK_SYNC => {
@@ -515,6 +528,41 @@ mod tests {
         let mut body = vec![0; header.message_size as usize];
         client.read_exact(&mut body).await.unwrap();
         (header.message_type, body)
+    }
+
+    #[test]
+    fn implausible_round_trips_are_discarded() {
+        let second = 1_000_000_000;
+        assert_eq!(
+            round_trip(5 * second, 4 * second),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(round_trip(5, 5), Some(Duration::ZERO));
+        assert_eq!(round_trip(4 * second, 5 * second), None, "the future");
+        assert_eq!(
+            round_trip(61 * second, second),
+            Some(MAX_PLAUSIBLE_RTT),
+            "exactly the limit"
+        );
+        assert_eq!(round_trip(62 * second, second), None, "over a minute");
+        assert_eq!(round_trip(u64::MAX, 0), None);
+    }
+
+    #[tokio::test]
+    async fn only_plausible_pongs_are_recorded() {
+        let (mut conn, mut client) = pair::<DisplayOpcode>();
+        for (id, timestamp) in [(1, u64::MAX), (2, 0)] {
+            client_send_msg(&mut client, main_client::PONG, &Pong { id, timestamp }).await;
+        }
+        client_send(&mut client, display_client::INIT, &[0; 14]).await;
+        let message = tokio::time::timeout(WAIT, conn.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.header.message_type, display_client::INIT);
+        // Only the second: the session began moments ago.
+        assert_eq!(conn.session().stats().ping.count, 1);
     }
 
     #[test]

@@ -25,8 +25,21 @@ pub const STATS_INTERVAL: Duration = Duration::from_secs(10);
 
 const RELAXED: Ordering = Ordering::Relaxed;
 
-/// The slot of `encoding` in the per-encoding counters.
-fn encoding_slot(encoding: Encoding) -> usize {
+/// How many per-encoding counters there are: one for each [`Encoding`].
+///
+/// [`encoding_slot`] matches every encoding without a wildcard, so a new
+/// [`Encoding`] does not compile until it has a slot, and
+/// [`Stats::snapshot`] destructures the counters by this length, so
+/// giving it one means naming it there too.
+const ENCODINGS: usize = 3;
+
+/// How many per-channel byte counters there are: one for each channel
+/// type andris serves.
+const CHANNELS: usize = 4;
+
+/// The slot of `encoding` in the per-encoding counters, below
+/// [`ENCODINGS`].
+const fn encoding_slot(encoding: Encoding) -> usize {
     match encoding {
         Encoding::Lz4 => 0,
         Encoding::Bitmap => 1,
@@ -34,9 +47,9 @@ fn encoding_slot(encoding: Encoding) -> usize {
     }
 }
 
-/// The slot of `channel` in the per-channel byte counters, if andris
-/// serves it.
-fn channel_slot(channel: ChannelType) -> Option<usize> {
+/// The slot of `channel` in the per-channel byte counters, below
+/// [`CHANNELS`], if andris serves it.
+const fn channel_slot(channel: ChannelType) -> Option<usize> {
     match channel {
         ChannelType::Main => Some(0),
         ChannelType::Display => Some(1),
@@ -46,9 +59,34 @@ fn channel_slot(channel: ChannelType) -> Option<usize> {
     }
 }
 
+/// Every counter of `counters`, read at once.
+fn load<const N: usize>(counters: &[AtomicU64; N]) -> [u64; N] {
+    counters.each_ref().map(|counter| counter.load(RELAXED))
+}
+
+/// Add `value` to `counter`, stopping at `u64::MAX` rather than wrapping.
+fn saturating_add(counter: &AtomicU64, value: u64) {
+    let mut total = counter.load(RELAXED);
+    loop {
+        let sum = total.saturating_add(value);
+        match counter.compare_exchange_weak(total, sum, RELAXED, RELAXED) {
+            Ok(_) => return,
+            Err(now) => total = now,
+        }
+    }
+}
+
 /// A duration in whole microseconds, saturating.
 fn micros(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+/// `duration` in milliseconds to one decimal place, or `-` for `None`.
+fn ms(duration: Option<Duration>) -> String {
+    duration.map_or_else(
+        || '-'.to_string(),
+        |d| format!("{:.1}", d.as_secs_f64() * 1e3),
+    )
 }
 
 /// A total and a count of timed events, with the latest.
@@ -60,10 +98,12 @@ struct Timing {
 }
 
 impl Timing {
+    /// Record one event that took `duration`. The total and the count
+    /// stop at `u64::MAX` rather than wrapping.
     fn record(&self, duration: Duration) {
         let us = micros(duration);
-        self.total_us.fetch_add(us, RELAXED);
-        self.count.fetch_add(1, RELAXED);
+        saturating_add(&self.total_us, us);
+        saturating_add(&self.count, 1);
         self.last_us.store(us, RELAXED);
     }
 
@@ -88,10 +128,22 @@ pub struct TimingSnapshot {
 }
 
 impl TimingSnapshot {
-    /// The mean duration, if any has been recorded.
+    /// The mean duration, if any has been recorded. Any count works,
+    /// however large.
     pub fn mean(&self) -> Option<Duration> {
-        let count = u32::try_from(self.count).ok().filter(|&c| c > 0)?;
-        Some(self.total / count)
+        if self.count == 0 {
+            return None;
+        }
+        let nanos = self.total.as_nanos() / u128::from(self.count);
+        // The mean is at most the total, so its seconds fit a u64.
+        let secs = u64::try_from(nanos / 1_000_000_000).unwrap_or(u64::MAX);
+        Some(Duration::new(secs, (nanos % 1_000_000_000) as u32))
+    }
+
+    /// The mean in milliseconds to one decimal place, or `-` if nothing
+    /// has been recorded.
+    fn mean_ms(&self) -> String {
+        ms(self.mean())
     }
 
     /// The latest duration, if any has been recorded.
@@ -114,9 +166,9 @@ impl TimingSnapshot {
 pub struct Stats {
     frames: AtomicU64,
     refreshes: AtomicU64,
-    draws: [AtomicU64; 3],
-    draw_bytes: [AtomicU64; 3],
-    channel_bytes: [AtomicU64; 4],
+    draws: [AtomicU64; ENCODINGS],
+    draw_bytes: [AtomicU64; ENCODINGS],
+    channel_bytes: [AtomicU64; CHANNELS],
     capture: Timing,
     encode: Timing,
     captured_area: AtomicU64,
@@ -172,9 +224,9 @@ impl Stats {
     }
 
     /// Count `tiles` the scrub found changed that damage had not
-    /// reported.
-    pub fn scrub_found(&self, tiles: u64) {
-        self.scrub_tiles.fetch_add(tiles, RELAXED);
+    /// reported, and return how many it has found in all.
+    pub fn scrub_found(&self, tiles: u64) -> u64 {
+        self.scrub_tiles.fetch_add(tiles, RELAXED) + tiles
     }
 
     /// Record the time from sending the message that completed an ack
@@ -191,25 +243,23 @@ impl Stats {
     /// Read every metric. The reads are independent, so a snapshot taken
     /// while channels run may be a message or two out of step.
     pub fn snapshot(&self) -> StatsSnapshot {
-        let load = |counters: &[AtomicU64]| -> Vec<u64> {
-            counters.iter().map(|c| c.load(RELAXED)).collect()
-        };
-        let draws = load(&self.draws);
-        let draw_bytes = load(&self.draw_bytes);
-        let bytes = load(&self.channel_bytes);
+        // In slot order: see encoding_slot and channel_slot.
+        let [lz4_draws, bitmap_draws, jpeg_draws] = load(&self.draws);
+        let [lz4_bytes, bitmap_bytes, jpeg_bytes] = load(&self.draw_bytes);
+        let [main_bytes, display_bytes, inputs_bytes, cursor_bytes] = load(&self.channel_bytes);
         StatsSnapshot {
             frames: self.frames.load(RELAXED),
             refreshes: self.refreshes.load(RELAXED),
-            lz4_draws: draws[0],
-            bitmap_draws: draws[1],
-            jpeg_draws: draws[2],
-            lz4_bytes: draw_bytes[0],
-            bitmap_bytes: draw_bytes[1],
-            jpeg_bytes: draw_bytes[2],
-            main_bytes: bytes[0],
-            display_bytes: bytes[1],
-            inputs_bytes: bytes[2],
-            cursor_bytes: bytes[3],
+            lz4_draws,
+            bitmap_draws,
+            jpeg_draws,
+            lz4_bytes,
+            bitmap_bytes,
+            jpeg_bytes,
+            main_bytes,
+            display_bytes,
+            inputs_bytes,
+            cursor_bytes,
             capture: self.capture.read(),
             encode: self.encode.read(),
             captured_area: self.captured_area.load(RELAXED),
@@ -287,44 +337,28 @@ impl StatsSnapshot {
     /// session. Counters and totals are differences; the latest ack lag
     /// and ping are this snapshot's.
     pub fn since(&self, prev: &Self) -> Self {
-        let d = |now: u64, then: u64| now.saturating_sub(then);
-        Self {
-            frames: d(self.frames, prev.frames),
-            refreshes: d(self.refreshes, prev.refreshes),
-            lz4_draws: d(self.lz4_draws, prev.lz4_draws),
-            bitmap_draws: d(self.bitmap_draws, prev.bitmap_draws),
-            jpeg_draws: d(self.jpeg_draws, prev.jpeg_draws),
-            lz4_bytes: d(self.lz4_bytes, prev.lz4_bytes),
-            bitmap_bytes: d(self.bitmap_bytes, prev.bitmap_bytes),
-            jpeg_bytes: d(self.jpeg_bytes, prev.jpeg_bytes),
-            main_bytes: d(self.main_bytes, prev.main_bytes),
-            display_bytes: d(self.display_bytes, prev.display_bytes),
-            inputs_bytes: d(self.inputs_bytes, prev.inputs_bytes),
-            cursor_bytes: d(self.cursor_bytes, prev.cursor_bytes),
-            capture: self.capture.since(&prev.capture),
-            encode: self.encode.since(&prev.encode),
-            captured_area: d(self.captured_area, prev.captured_area),
-            changed_area: d(self.changed_area, prev.changed_area),
-            scrub_tiles: d(self.scrub_tiles, prev.scrub_tiles),
-            ack_lag: self.ack_lag.since(&prev.ack_lag),
-            ping: self.ping.since(&prev.ping),
+        // Every field is named once: a field added to the struct and not
+        // here is a missing field in the struct expression below.
+        macro_rules! since {
+            (counters: $($counter:ident),*; timings: $($timing:ident),*) => {
+                Self {
+                    $($counter: self.$counter.saturating_sub(prev.$counter),)*
+                    $($timing: self.$timing.since(&prev.$timing),)*
+                }
+            };
         }
+        since!(
+            counters: frames, refreshes, lz4_draws, bitmap_draws, jpeg_draws, lz4_bytes,
+                bitmap_bytes, jpeg_bytes, main_bytes, display_bytes, inputs_bytes, cursor_bytes,
+                captured_area, changed_area, scrub_tiles;
+            timings: capture, encode, ack_lag, ping
+        )
     }
 
     /// The one-line summary of this snapshot (normally a
     /// [`StatsSnapshot::since`] difference) over `elapsed`.
     pub fn summary(&self, elapsed: Duration) -> String {
         let secs = elapsed.as_secs_f64().max(f64::EPSILON);
-        let ms = |t: &TimingSnapshot| {
-            t.mean().map_or_else(
-                || '-'.to_string(),
-                |d| format!("{:.1}", d.as_secs_f64() * 1e3),
-            )
-        };
-        let ping = self.ping.latest().map_or_else(
-            || '-'.to_string(),
-            |d| format!("{:.1}", d.as_secs_f64() * 1e3),
-        );
         let changed = if self.captured_area > 0 {
             format!(
                 "{:.1}%",
@@ -343,10 +377,10 @@ impl StatsSnapshot {
             self.bitmap_draws,
             self.jpeg_draws,
             self.display_bytes as f64 * 8.0 / 1000.0 / secs,
-            ms(&self.capture),
-            ms(&self.encode),
-            ms(&self.ack_lag),
-            ping,
+            self.capture.mean_ms(),
+            self.encode.mean_ms(),
+            self.ack_lag.mean_ms(),
+            ms(self.ping.latest()),
             self.scrub_tiles,
             changed,
         )
@@ -471,6 +505,60 @@ mod tests {
         let line = StatsSnapshot::default().summary(Duration::from_secs(10));
         assert!(line.contains("capture - ms"), "{line}");
         assert!(line.contains("changed - of captured"), "{line}");
+    }
+
+    #[test]
+    fn every_slot_is_in_range_and_its_own() {
+        let encodings = [Encoding::Lz4, Encoding::Bitmap, Encoding::Jpeg].map(encoding_slot);
+        let mut sorted = encodings;
+        sorted.sort_unstable();
+        assert_eq!(sorted, [0, 1, 2]);
+        assert_eq!(encodings.len(), ENCODINGS);
+        let channels = [
+            ChannelType::Main,
+            ChannelType::Display,
+            ChannelType::Inputs,
+            ChannelType::Cursor,
+        ]
+        .map(|channel| channel_slot(channel).unwrap());
+        assert_eq!(channels, [0, 1, 2, 3]);
+        assert_eq!(channels.len(), CHANNELS);
+    }
+
+    #[test]
+    fn the_mean_works_for_any_count() {
+        let many = TimingSnapshot {
+            total: Duration::from_secs(u64::from(u32::MAX) * 2),
+            count: u64::from(u32::MAX) * 2,
+            last: Duration::ZERO,
+        };
+        assert_eq!(many.mean(), Some(Duration::from_secs(1)));
+        let most = TimingSnapshot {
+            total: Duration::from_micros(u64::MAX),
+            count: u64::MAX,
+            last: Duration::ZERO,
+        };
+        assert_eq!(most.mean(), Some(Duration::from_micros(1)));
+        assert_eq!(TimingSnapshot::default().mean(), None);
+    }
+
+    #[test]
+    fn timing_totals_saturate() {
+        let stats = Stats::default();
+        stats.ping_round_trip(Duration::MAX);
+        stats.ping_round_trip(Duration::from_secs(1));
+        let ping = stats.snapshot().ping;
+        assert_eq!(ping.total, Duration::from_micros(u64::MAX));
+        assert_eq!(ping.count, 2);
+        assert_eq!(ping.latest(), Some(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn the_scrub_count_returns_the_total() {
+        let stats = Stats::default();
+        assert_eq!(stats.scrub_found(3), 3);
+        assert_eq!(stats.scrub_found(4), 7);
+        assert_eq!(stats.snapshot().scrub_tiles, 7);
     }
 
     #[test]

@@ -82,7 +82,7 @@ ryll afresh.
 
 `andris/tests/jpeg_corpus.rs` is an ignored test that measures real
 screen content, to justify the constants of the JPEG classifier in
-`server/updates.rs`. It asserts nothing about andris's behaviour; it
+`server/updates/encode.rs`. It asserts nothing about andris's behaviour; it
 prints, per image and rectangle size, the LZ4 and JPEG sizes and encode
 rates, and the share of rectangles and of area the classifier would
 send as JPEG.

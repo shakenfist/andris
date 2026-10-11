@@ -1,0 +1,244 @@
+# Running andris
+
+How to build andris, point it at an X display, and connect to it with
+ryll, directly or through kerbside. For building and testing the
+code itself, see [development.md](development.md).
+
+Andris exports a display that is already running. It never starts or
+configures a desktop: it connects to the X server as an ordinary
+client, captures the root window, and injects keys and pointer events
+with the XTEST extension.
+
+## Building
+
+```bash
+make release
+```
+
+builds `target/release/andris` inside the devcontainer; `make build`
+makes a debug binary at `target/debug/andris`. See
+[development.md](development.md) for why the build runs in Docker.
+The binary is an ordinary dynamically linked executable, so copy it
+to the machine whose desktop you want to export.
+
+Ryll's `shakenfist-spice-compression` crate bundles openh264, so the
+first build also compiles it even though andris only encodes images
+([ryll#499](https://github.com/shakenfist/ryll/issues/499)).
+
+## Options
+
+```text
+andris --ticket-file PATH [options]
+```
+
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `--ticket-file PATH` | none; required | File holding the SPICE ticket (password) clients must present |
+| `--platform x11\|synthetic` | `x11` | The display system to export |
+| `--display DISPLAY` | the `DISPLAY` environment variable | The X display to export, such as `:10`; used by `--platform x11` |
+| `--synthetic-size WxH` | `1024x768` | The test pattern's size; used by `--platform synthetic` |
+| `--listen ADDR:PORT` | `127.0.0.1:5900` | The plain TCP listener |
+| `--tls-listen ADDR:PORT` | none | A TLS listener; needs `--tls-cert` and `--tls-key` |
+| `--tls-cert PATH` | none | The TLS certificate chain, as PEM, leaf first |
+| `--tls-key PATH` | none | The TLS private key, as PEM |
+| `--frame-interval-ms MS` | `200` | How often the desktop is captured; at least 20 |
+
+`andris --help` prints the same list. Logs go to stderr at `info`
+level; set `RUST_LOG` (for example `RUST_LOG=andris=debug`) to
+change that. Ctrl-C (SIGINT) shuts andris down.
+
+Options are checked together before anything starts, and each error
+names the option at fault and how to fix it. The three TLS options go
+together: give all or none.
+
+## Exporting an X display
+
+```bash
+printf '%s\n' 'a-secret' > ticket && chmod 600 ticket
+DISPLAY=:10 XAUTHORITY=$HOME/.Xauthority \
+    target/release/andris --ticket-file ticket
+```
+
+Andris must run as a user the X server will accept, which for an
+xrdp session is the session's user. The display comes from
+`--display`, or failing that `DISPLAY`; with neither, andris refuses
+to start. Authorisation uses the usual X mechanisms, so set
+`XAUTHORITY` if the session's cookie is not in `~/.Xauthority`.
+
+Before it listens, andris checks the X server and refuses to start,
+naming every problem it found, unless:
+
+- the root window's depth is 24 or 32, stored at 32 bits a pixel;
+- the image byte order is LSBFirst and the root visual is TrueColor
+  with the usual BGRX masks (`0xff0000`, `0x00ff00`, `0x0000ff`);
+- the XTEST, XFIXES and XKEYBOARD extensions are present.
+
+Xvfb at 24 bits meets these, and the end-to-end test runs against
+it. The server's keyboard layout is read once at startup, so a layout changed
+afterwards with `setxkbmap` is not noticed until andris restarts.
+
+## The synthetic platform
+
+```bash
+target/release/andris --platform synthetic --ticket-file ticket
+```
+
+exports a generated test pattern instead of a display: eight colour
+bars with an orange square that moves along them. It needs no X
+server and records the input it is given rather than injecting it.
+It is for trying a client, load testing, and the tests.
+`--synthetic-size` sets its size.
+
+## The ticket file
+
+Clients authenticate with a SPICE ticket, which is a password
+andris reads from `--ticket-file`. The file must:
+
+- be a regular file whose mode gives group and other no access, so
+  `chmod 600` it; andris refuses a file with any group or other bit
+  set;
+- hold 1 to 60 bytes (SPICE's limit), not counting one trailing
+  newline, which is stripped.
+
+The ticket is read once at startup, and is never logged.
+
+## Listeners, TLS and the loopback rule
+
+By default andris listens for plain TCP on `127.0.0.1:5900`. Because
+SPICE sends the ticket over the connection, andris refuses to start
+with a `--listen` address that is not a loopback address (`127.0.0.0/8`
+or `::1`) unless a TLS listener is also configured.
+
+To serve beyond the local machine, add a TLS listener:
+
+```bash
+target/release/andris --ticket-file ticket \
+    --listen 127.0.0.1:5900 \
+    --tls-listen 0.0.0.0:5901 --tls-cert cert.pem --tls-key key.pem
+```
+
+With TLS configured, the plain listener stops serving sessions: it
+answers every link with "need secured", which sends a SPICE client
+to the TLS listener. With TLS configured, `--listen` may be any
+address. Clients are not asked for certificates.
+
+At most 8 connections may be in their handshake at once, across both
+listeners; further ones are closed immediately, and the refusals are
+logged at most every 10 seconds. Every step of the handshake has a
+10 second limit.
+
+Andris serves one client at a time. A client that authenticates
+replaces the one before it, whose channels are closed.
+
+## What a client gets
+
+A connection opens four channels, and ryll opens all four:
+
+| Channel | What andris sends or does |
+|---------|---------------------------|
+| main | Opens the session, lists the other channels, applies the client's mouse mode request, and pings every 30 seconds |
+| display | The desktop as images (below) |
+| inputs | Applies the client's keys and pointer events to the desktop, and reports the desktop's lock-key state |
+| cursor | The pointer's shape as it changes, as an alpha cursor |
+
+**Display.** Every `--frame-interval-ms` andris captures the whole
+desktop and cuts it into bands of 64 rows. It sends the first frame
+whole, and after that only the bands whose pixels changed since the
+previous capture. Each band is an LZ4-compressed image when the
+client can decode LZ4 and the result is smaller, and an uncompressed
+bitmap otherwise; a client that asks for no compression gets bitmaps.
+If the desktop changes size, the display surface is recreated at the
+new size. A slow client is not flooded: a capture is skipped while
+too much is unacknowledged.
+
+**Keys.** Keys are typed by position, not by character. The client's
+scancodes become evdev key codes, and those become whichever
+keycodes this X server uses for the same keys, so they work whatever
+keycodes the server was configured with.
+
+**Mouse modes.** The session starts in client mouse mode: the client
+sends absolute positions and draws the pointer itself. A client may
+ask for server mode, in which it sends relative motion. Andris applies
+absolute positions only in client mode and relative motion only in
+server mode.
+
+### Not supported
+
+- No guest agent, so no clipboard sharing and no resizing the
+  desktop from the client.
+- No video streams: the desktop is always sent as images.
+- No audio.
+- One client at a time.
+
+### Known client gaps
+
+Two quirks of ryll shape what andris sends:
+
+- Ryll waits for a ping after the main channel's `INIT` before it asks
+  for the channel list, so andris sends one straight after `INIT`
+  ([ryll#502](https://github.com/shakenfist/ryll/issues/502)).
+- Ryll stops reading the channel list at the inputs channel, so andris
+  lists inputs last
+  ([ryll#509](https://github.com/shakenfist/ryll/issues/509)); any
+  channel listed after it would never be opened.
+
+Ryll's protocol crate also does not yet name the inputs channel's
+`KEY_SCANCODE` capability, so andris defines the constant itself
+([ryll#503](https://github.com/shakenfist/ryll/issues/503)).
+
+## Connecting with ryll
+
+Ryll's `--direct` option has no password, so a ticket needs a
+virt-viewer `.vv` file. Write one:
+
+```ini
+[virt-viewer]
+type=spice
+host=127.0.0.1
+port=5900
+password=a-secret
+```
+
+and open it:
+
+```bash
+ryll --file andris.vv
+```
+
+`password` is the contents of the ticket file. The file holds the
+ticket, so keep it private (`chmod 600`). Ryll's documentation covers
+the `.vv` keys it understands for TLS. If the machine running
+andris is remote, forward its port instead of opening the listener:
+`ssh -L 5900:127.0.0.1:5900 host`.
+
+## Fronting andris with kerbside
+
+Kerbside can front andris with its static console source, which maps
+a console entry onto a SPICE server it does not manage. The fields
+map to andris's options like this:
+
+| Kerbside field | Andris |
+|----------------|--------|
+| `hypervisor_ip` | The address andris is reachable at; `127.0.0.1` if kerbside runs on the same machine |
+| `insecure_port` | The port of `--listen`, such as `5900` |
+| `secure_port` | The port of `--tls-listen`, optional; kerbside also needs the source's `ca_cert` to verify the certificate |
+| `ticket` | The contents of the ticket file |
+
+```yaml
+- source: andris
+  type: static
+  consoles:
+    - uuid: "6f4e2c1a-0000-0000-0000-0000000000a1"
+      name: "xrdp-desktop"
+      hypervisor: "localhost"
+      hypervisor_ip: "127.0.0.1"
+      insecure_port: 5900
+      ticket: "a-secret"
+```
+
+Kerbside's own documentation covers the source and its
+other fields, and warns that the static source is not intended for
+production use:
+[console-sources.md](https://github.com/shakenfist/kerbside/blob/develop/docs/console-sources.md).
+Andris sends only message types that kerbside's allowlist accepts,
+so a session through kerbside needs no special configuration.

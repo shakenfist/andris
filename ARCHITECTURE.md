@@ -1,32 +1,65 @@
 # Architecture
 
-This document is the map of andris: what the repository holds, how
-it relates to the repositories around it, and the shape it is meant
-to grow into. The documentation index is
-[`docs/index.md`](docs/index.md).
+This document is the map of andris: its components and how data
+moves between them, how it relates to the repositories around it, and
+the design commitments behind it. The documentation index is
+[`docs/index.md`](docs/index.md); how to run andris is in
+[`docs/running.md`](docs/running.md), and how to build, test and land
+a change is in [`docs/development.md`](docs/development.md).
 
-## The repository today
+## Components
 
-Andris holds a design, a stub binary and the build and CI scaffold
-around it. The binary prints its name and version and does nothing
-else, so there are no components and no data flow to describe yet.
-How to build, test and land a change is in
-[`docs/development.md`](docs/development.md). What exists is:
+Andris is one crate, `andris`: a library with a thin binary
+(`main.rs`) that parses the command line and logs to stderr. The
+server (`andris/src/server/`) knows SPICE and nothing of X11; the
+platform (`andris/src/platform/`) knows the desktop and nothing of
+SPICE.
 
-| Path | What it is |
-|------|------------|
-| `docs/plans/PLAN-x11-desktop.md` | The master plan: why andris exists, its design commitments, open questions and the order of work |
-| `docs/plans/` (other files) | Phase plans for that master plan, and `index.md`, which lists every plan with its status |
-| `Cargo.toml`, `andris/` | The Cargo workspace and its one crate, `andris`, a stub binary |
-| `Makefile`, `.devcontainer/` | Build, test and lint targets that run cargo in a container |
-| `docs/index.md` | The documentation index |
-| `docs/development.md` | Building, testing, CI and the merge queue |
-| `README.md` | The pitch and current status |
-| `AGENTS.md` | Conventions for AI coding assistants |
-| `PLAN-TEMPLATE.md`, `PUSH-AUDIT.md` | The planning template and the pre-push audit runbook |
-| `.pre-commit-config.yaml`, `deny.toml`, `renovate.json`, `.github/workflows/` | Repository tooling: commit-time linters, dependency policy, the two-tier CI and supply-chain workflows, dependency updates, and the repository-configuration-export workflow |
+| Component | Where | What it does |
+|-----------|-------|--------------|
+| Configuration | `config.rs` | Command-line options and the checks across them: the TLS options go together, a plain listener must be loopback, the ticket file must be private and at most 60 bytes |
+| Listener and link | `server/mod.rs`, `link.rs`, `tls.rs` | One accept task per listener. A connection holds one of 8 handshake permits while it links and authenticates with the ticket, with a time limit on every step. With TLS configured the plain listener only redirects clients to the TLS listener |
+| Session registry | `server/session.rs` | Holds the one session served at a time. A main-channel link that authenticates begins a session and cancels the previous one; secondary channels must name the session's id. The session carries the mouse mode and a cancel signal every channel task races against |
+| Channel framing | `server/channel.rs`, `opcodes.rs` | Mini-header message framing, the messages every channel shares, and the ack window. Each channel sends only variants of its own opcode enum |
+| Main channel | `server/main_channel.rs` | `INIT`, the channel list, mouse mode and pings |
+| Display channel | `server/display.rs` | The primary surface and the frame timer |
+| Frames | `server/frames.rs` | Cuts a captured frame into 64-row bands, keeps the previous frame to find the changed ones, and encodes each as LZ4 or an uncompressed bitmap |
+| Inputs channel | `server/inputs.rs`, `keymap.rs` | Decodes set-1 scancodes to evdev codes, tracks lock keys, applies pointer events according to the mouse mode |
+| Cursor channel | `server/cursor.rs` | Sends each cursor shape the platform reports as an alpha cursor |
+| Platform traits | `platform/mod.rs` | `DisplayGeometry`, `FrameSource`, `InputSink` and `CursorSource`, bundled as a `Platform`. They use no SPICE types, and keys cross them as Linux evdev codes |
+| Synthetic platform | `platform/synthetic.rs` | A deterministic test pattern, an input sink that records events, and one cursor shape; for tests, load testing and `--platform synthetic` |
+| X11 platform | `platform/x11/` | `GetImage` capture, XTEST input, XFIXES cursor and XKB key names, each on its own connection and thread; refuses an X server it cannot read as BGRX |
 
-When the server lands, a component inventory replaces this table.
+Around the code: `Makefile` and `.devcontainer/` run cargo in a
+container; `scripts/e2e.sh` drives the end-to-end test;
+`.github/workflows/` holds the two-tier CI; `docs/plans/` holds the
+master plan and its phase plans; `AGENTS.md` carries conventions for
+AI coding assistants; `PLAN-TEMPLATE.md` and `PUSH-AUDIT.md` are the
+planning template and the pre-push audit runbook.
+
+### How a frame reaches the wire
+
+A timer in the display channel fires every `--frame-interval-ms`. It
+calls the platform's `FrameSource`, on a blocking thread, which
+returns the whole desktop as BGRX. The frame encoder compares it row
+by row with the frame it sent last and cuts it into bands of 64 rows;
+each changed band becomes one `DRAW_COPY` message carrying an LZ4 image
+(or an uncompressed bitmap when LZ4 would not help or the client asked
+for none). The channel writes them as the ack window allows, and skips
+a tick rather than queue frames for a client that is behind. A capture
+of a new size re-creates the surface first.
+
+### How a key reaches the X server
+
+The inputs channel receives set-1 scancode bytes, and its `KeyDecoder`
+turns them into evdev key codes, handling the `E0` and `E1` prefixes.
+They cross the platform seam as `InputEvent`s to the `InputSink`, which
+only queues them. The X11 backend's input thread maps each evdev code to
+an XKB key name through a table generated from xkeyboard-config, finds
+the keycode the attached X server uses for that name (read once with
+XKB `GetNames` at startup), and sends the press or release to the
+server with XTEST. Using names rather than numbers is what makes keys
+land correctly whichever keycode set the server was configured with.
 
 ## Relationship to ryll and kerbside
 
@@ -36,17 +69,15 @@ from the other two rather than be written again here.
 
 | Repository | Role | What andris takes from it |
 |------------|------|---------------------------|
-| [ryll](https://github.com/shakenfist/ryll) | SPICE client, and the home of the shared `shakenfist-spice-*` crates | `shakenfist-spice-protocol`: the link handshake and ticket authentication, which already implement the server role; message constants; the `logging::message_names` tables. `shakenfist-spice-compression`: image codecs, which today only decode. Ryll is also the reference client andris is tested against. |
+| [ryll](https://github.com/shakenfist/ryll) | SPICE client, and the home of the shared `shakenfist-spice-*` crates | `shakenfist-spice-protocol`: the link handshake and ticket authentication, which already implement the server role; message constants; the `logging::message_names` tables. `shakenfist-spice-compression`: the LZ4 image encoder. Ryll is also the reference client andris is tested against, by `make e2e`. |
 | [kerbside](https://github.com/shakenfist/kerbside) | SPICE proxy | The constraints on what andris may say. Kerbside authenticates to a backend with SPICE ticket auth, offers clients spice-server's channel capability set, and terminates a session on any message type absent from ryll's `logging::message_names`. Its proxy already consumes `shakenfist-spice-protocol` for the server role. |
 
 The boundaries that follow from this:
 
-- **Wire types live in ryll, not here.** Ryll's display, cursor and
-  main-channel message structures currently sit in
-  `shakenfist-spice-renderer`, ryll's client substrate, and are
-  parse-only. Andris must not depend on the renderer, so the types
-  it needs are to move into `shakenfist-spice-protocol` and gain
-  writers there, where kerbside can use them too.
+- **Wire types live in ryll, not here.** Andris must not depend on
+  `shakenfist-spice-renderer`, ryll's client substrate, so the message
+  structures it needs live in `shakenfist-spice-protocol`, with
+  writers, where kerbside can use them too.
 - **Encoders live in ryll, not here.** An encoder belongs beside the
   decoder it round-trips against, in `shakenfist-spice-compression`.
 - **Kerbside compatibility is by construction.** Because andris only
@@ -55,28 +86,33 @@ The boundaries that follow from this:
 
 The intended deployment is ryll connecting to kerbside, and kerbside
 connecting to andris, which is attached to the X server of an
-existing desktop session.
+existing desktop session. Kerbside's static console source can front
+andris today; [`docs/running.md`](docs/running.md) shows how. Ryll
+also connects to andris directly.
 
-## Intended shape
+Andris pins ryll's crates to one revision in `Cargo.toml`, and
+`make ryll-headless` builds the client for the end-to-end test at the
+same revision.
 
-None of this is built. It summarises the design commitments of
+## Design commitments
+
+These are the commitments of
 [`docs/plans/PLAN-x11-desktop.md`](docs/plans/PLAN-x11-desktop.md),
-which is the authority; read the plan for the reasoning and the
-order of work.
+which is the authority for the reasoning and for what is still to be
+built.
 
 - **Attach, do not own.** Andris connects to a running X server as
   an ordinary client of the session user's display. It never starts
   or configures the desktop.
-- **Pixels, not draw ops.** Capture is damage-driven pixel reads,
-  sent as `DRAW_COPY` images and video streams, with no QXL draw-op
-  emulation.
-- **Platform seams.** Capture, input injection, display control,
-  clipboard and audio sit behind traits, with X11 implementations
-  first and a synthetic test-pattern frame source beside them, so
+- **Pixels, not draw ops.** Capture is pixel reads, sent as
+  `DRAW_COPY` images, with no QXL draw-op emulation. Changed regions
+  are found by comparing frames; damage events and video streams
+  are yet to come.
+- **Platform seams.** Capture, input injection and the cursor sit
+  behind traits, with an X11 implementation and a synthetic one, so
   that a Wayland backend can be added later without restructuring.
-- **Ryll is the reference client.** Images are encoded as LZ4 or
-  JPEG and streams as H.264; other SPICE clients work only where
-  they support those encodings.
+  Display control, clipboard and audio are yet to be added.
+- **Ryll is the reference client.** Images are LZ4 or uncompressed;
+  other SPICE clients work only where they support those encodings.
 - **One client at a time.** A new connection replaces the old one.
-- **Linux only.** The plan leaves the crate layout open, defaulting
-  to a single binary crate with a module per backend.
+- **Linux only.** A single binary crate with a module per backend.

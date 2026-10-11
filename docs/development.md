@@ -5,9 +5,9 @@ integration works. For the conventions AI coding assistants follow
 see
 [AGENTS.md](https://github.com/shakenfist/andris/blob/develop/AGENTS.md).
 
-Andris today is a build and CI scaffold around a stub binary: the
-workspace has one crate, `andris`, which prints its name and
-version. What andris is meant to become is set out in the
+The workspace has one crate, `andris`, a library and the binary
+that runs it. How to run andris is in [running.md](running.md), and
+what it is meant to become is set out in the
 [master plan](plans/PLAN-x11-desktop.md).
 
 ## Prerequisites
@@ -27,6 +27,8 @@ make build      # debug build of the whole workspace
 make release    # release build
 make test       # cargo test across the workspace
 make lint       # cargo fmt --check, then clippy with -D warnings
+make ryll-headless  # build ryll's headless client at the pinned revision
+make e2e        # run andris against Xvfb, driven by ryll
 make lint-fix   # rustfmt and clippy --fix
 make fetch      # pre-download crates into the cargo cache
 make lock       # refresh Cargo.lock after editing a Cargo.toml
@@ -36,6 +38,28 @@ make help       # list the targets
 
 `make devcontainer` builds the `andris-dev` image; the other targets
 depend on it.
+
+### The end-to-end test
+
+`make e2e` runs andris against a real X server and a real client.
+Inside the devcontainer, with no network and a read-only checkout,
+[`scripts/e2e.sh`](https://github.com/shakenfist/andris/blob/develop/scripts/e2e.sh)
+starts Xvfb and a full-screen window that logs the keys it receives,
+starts the debug andris against that display, and connects ryll's
+headless client through a `.vv` file. It then asserts, over ryll's
+control socket, that a frame of the window arrived and that two keys
+reached it; checks ryll's log for all four channels; and stops ryll
+and andris with SIGINT, which must exit 0. It fails if andris logs an
+`ERROR`, and prints every log on failure.
+
+It needs nothing on the host beyond Docker: Xvfb and Python are in
+the devcontainer image, and `make ryll-headless`, which `make e2e`
+depends on, builds ryll with `--no-default-features` (no GUI, audio or
+capture) at the revision `Cargo.lock` pins for
+`shakenfist-spice-protocol`. That build needs the network, installs
+into `ryll/<revision>/` under the cargo cache, and is skipped when the
+binary for that revision is already there. Moving the ryll pin builds
+ryll afresh.
 
 ### Why compiling targets are offline
 
@@ -151,10 +175,18 @@ reviewing its code.
 
 ### The merge tier
 
-Runs only on `merge_group` and gates `Can merge`. The single job,
-`Build and test the merge commit`, runs `make release test` against
+Runs only on `merge_group` and gates `Can merge`. Two jobs run.
+`Build and test the merge commit` runs `make release test` against
 the commit the queue has built from the pull request and the current
 tip of `develop`. The smoke tier's jobs do not run on `merge_group`.
+
+The other, `End to end`, runs `make e2e` on `merge_group` and on
+`workflow_dispatch`, and `Can merge` requires it too. It is in the merge tier because building ryll would add over a
+minute to every push; its cargo cache has a key prefix of its own, so
+that only a new ryll pin pays for the build, and so that the offline
+jobs never restore a cache the networked ryll build wrote. A retest
+of a branch dispatches it, so it can be tried before the branch is
+enqueued; nothing gates on that run.
 
 ### Gates and path filtering
 
@@ -164,7 +196,7 @@ Three jobs are the required status checks on `develop`:
 |------|---------|-------------|
 | `Can see status` | every event | always; it only proves status reporting works |
 | `Can enqueue` | not `merge_group` | every smoke job succeeded or was skipped |
-| `Can merge` | `merge_group` | the merge-tier job succeeded or was skipped |
+| `Can merge` | `merge_group` | both merge-tier jobs succeeded or were skipped |
 
 A `Check paths` job skips the lint, build and supply-chain jobs
 when a pull request changes only `docs/**` and `LICENSE`. Other
@@ -201,8 +233,8 @@ pass. The sequence is:
 1. The pull request's smoke tier passes, so `Can enqueue` is green.
 2. The pull request is added to the queue.
 3. The queue builds a merge commit and runs `ci.yml` on
-   `merge_group`. `Build and test the merge commit` and `Can merge`
-   run against it.
+   `merge_group`. `Build and test the merge commit`, `End to end`
+   and `Can merge` run against it.
 4. If they pass, the queue merges. If not, the pull request is
    ejected and the failure is in the `merge_group` run's log.
 

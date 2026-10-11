@@ -9,8 +9,8 @@
 //!
 //! After the first, complete frame, [`FrameEncoder`] sends only the bands
 //! whose pixels differ from the frame it saw last. That is a byte
-//! comparison of two captures, not damage tracking; phase 5 replaces it
-//! with XDamage.
+//! comparison of two captures, not damage tracking, which XDamage is to
+//! replace.
 //!
 //! A band is LZ4 when the client may take LZ4 and the result is smaller
 //! than the raw pixels, and an uncompressed top-down 32-bit `BITMAP`

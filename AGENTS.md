@@ -6,12 +6,11 @@ this file points you there rather than restating it.
 
 ## What andris is
 
-Andris is intended to be a Linux-only SPICE *server*, written in
-Rust, that exports an existing X11 desktop (such as an xrdp
-session's Xorg server) to SPICE clients. **Today the repository
-holds plans, a stub binary and the build and CI scaffold around
-it**: a Cargo workspace, a `Makefile` and CI, but no server yet. What
-andris is meant to become is set out in the master plan,
+Andris is a Linux-only SPICE *server*, written in Rust, that
+exports an existing X11 desktop (such as an xrdp session's Xorg
+server) to SPICE clients. It serves the main, display, inputs and
+cursor channels to one client at a time; what it does not yet do, and
+what it is meant to become, is in the master plan,
 [`docs/plans/PLAN-x11-desktop.md`](docs/plans/PLAN-x11-desktop.md).
 
 Describe what exists. Every document outside `docs/plans/` states
@@ -33,6 +32,7 @@ Related repositories:
 |----------|----------|
 | What is in the repository, and how does it relate to ryll and kerbside? | [`ARCHITECTURE.md`](ARCHITECTURE.md) |
 | What documentation exists? | [`docs/index.md`](docs/index.md) |
+| How do I run andris and connect to it? | [`docs/running.md`](docs/running.md) |
 | How do I build, test and land a change? | [`docs/development.md`](docs/development.md) |
 | What is andris for, and how will it be built? | [`docs/plans/PLAN-x11-desktop.md`](docs/plans/PLAN-x11-desktop.md) |
 | What has been planned, and what is its status? | [`docs/plans/index.md`](docs/plans/index.md) |
@@ -84,6 +84,16 @@ locally:
   host.** Use `make build`,
   `make test` and `make lint`, which wrap cargo in a devcontainer as
   ryll's do. Do not install a Rust toolchain on the host.
+- **`make e2e` runs andris against Xvfb and ryll's headless client.**
+  It needs nothing on the host beyond Docker, and runs in CI's merge
+  tier.
+- **Server opcodes come from the per-channel enums in
+  `server/opcodes.rs`**, never raw numbers. Its test checks that
+  ryll names every variant.
+- **Keys cross the platform seam as Linux evdev codes**, not SPICE
+  scancodes or X keycodes.
+- **`platform/` carries no SPICE or ryll types.** Mapping to and from
+  SPICE happens in `server/`.
 - **No `unwrap()` in production code.** `clippy::unwrap_used` is on
   for the workspace; tests may unwrap.
 - **Commits go through `pre-commit run --all-files`.** Run it, and

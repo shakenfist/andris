@@ -9,7 +9,8 @@
 //!
 //! 1. `SURFACE_CREATE` for the primary surface, 32-bit XRGB, at the
 //!    desktop's size;
-//! 2. a complete frame, as one `DRAW_COPY` per band (see [`frames`]);
+//! 2. a complete frame: all of the desktop, in as few `DRAW_COPY`s as
+//!    fit (see [`updates`]);
 //! 3. `MONITORS_CONFIG` with one head, if the client has that capability;
 //! 4. `MARK`.
 //!
@@ -17,8 +18,9 @@
 //!
 //! # Frames
 //!
-//! Every `frame_interval` andris captures the desktop and sends the bands
-//! that changed. A tick is skipped, not queued, while more than twice the
+//! Every `frame_interval` andris captures the desktop and sends the 64x64
+//! tiles that differ from what it last sent, merged into rectangles (see
+//! [`updates`]). A tick is skipped, not queued, while more than twice the
 //! ack window is unacknowledged, and every message waits for room in the
 //! window before it is sent. If the capture is a different size from the
 //! surface, the surface is destroyed and the start sequence re-run from
@@ -45,7 +47,7 @@
 //! and ignored, since andris sends no streams. A malformed message closes
 //! the channel; an unknown one is ignored.
 //!
-//! [`frames`]: super::frames
+//! [`updates`]: super::updates
 
 use anyhow::{Context, Result, bail};
 use shakenfist_spice_protocol::constants::{image_compression, surface_fmt};
@@ -58,9 +60,9 @@ use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
 use super::channel::{ACK_WINDOW, ChannelConn, ChannelContext};
-use super::frames::{FrameEncoder, SURFACE_ID};
 use super::opcodes::DisplayOpcode;
-use crate::platform::{self, Frame, Size};
+use super::updates::{EncodeOptions, SURFACE_ID, UpdateEncoder};
+use crate::platform::{self, Capture, Size};
 
 /// `SPICE_SURFACE_FLAGS_PRIMARY` (spice-protocol enums.h), which ryll's
 /// protocol crate does not name: the surface is the display itself.
@@ -78,7 +80,7 @@ pub async fn run(ctx: ChannelContext, mut conn: ChannelConn<DisplayOpcode>) -> R
         preferred_compression: None,
         initialised: false,
         surface: None,
-        encoder: FrameEncoder::new(),
+        encoder: UpdateEncoder::new(),
         capture_failures: 0,
     };
 
@@ -125,7 +127,8 @@ struct Display {
     initialised: bool,
     /// The primary surface's size, once it has been created.
     surface: Option<Size>,
-    encoder: FrameEncoder,
+    /// The shadow of what the client's surface holds.
+    encoder: UpdateEncoder,
     /// How many captures in a row have failed.
     capture_failures: u32,
 }
@@ -175,13 +178,16 @@ impl Display {
         Ok(())
     }
 
-    /// Whether bands may be LZ4: the client can decode it and has not
-    /// asked for no compression.
-    fn lz4_allowed(&self) -> bool {
-        self.ctx
-            .caps
-            .has_channel_mask(capabilities::DISPLAY_LZ4_COMPRESSION)
-            && self.preferred_compression != Some(image_compression::OFF)
+    /// How images may be encoded: LZ4 if the client can decode it and has
+    /// not asked for no compression.
+    fn encode_options(&self) -> EncodeOptions {
+        EncodeOptions {
+            lz4: self
+                .ctx
+                .caps
+                .has_channel_mask(capabilities::DISPLAY_LZ4_COMPRESSION)
+                && self.preferred_compression != Some(image_compression::OFF),
+        }
     }
 
     /// Wait for room in the ack window, then send one message.
@@ -199,10 +205,10 @@ impl Display {
     /// Capture the whole desktop. Captures may block, so this runs on
     /// the blocking pool. It borrows `self` only to start, so the future
     /// stays `Send` although the connection is not `Sync`.
-    fn capture(&self) -> impl Future<Output = Result<Frame>> + Send + 'static {
+    fn capture(&self) -> impl Future<Output = Result<Capture>> + Send + 'static {
         let screen = self.ctx.platform.screen.clone();
         async move {
-            tokio::task::spawn_blocking(move || screen.capture_all()?.into_whole())
+            tokio::task::spawn_blocking(move || screen.capture_all())
                 .await
                 .context("the capture task failed")?
                 .context("capturing the desktop")
@@ -212,10 +218,10 @@ impl Display {
     /// Capture, counting failures. `None` skips this tick. Fails if the
     /// desktop is gone, or once [`MAX_CAPTURE_FAILURES`] captures in a
     /// row have failed.
-    async fn capture_or_skip(&mut self) -> Result<Option<Frame>> {
+    async fn capture_or_skip(&mut self) -> Result<Option<Capture>> {
         let session = self.conn.session().id();
         match self.capture().await {
-            Ok(frame) => {
+            Ok(capture) => {
                 if self.capture_failures > 0 {
                     info!(
                         session,
@@ -224,7 +230,7 @@ impl Display {
                     );
                     self.capture_failures = 0;
                 }
-                Ok(Some(frame))
+                Ok(Some(capture))
             }
             Err(e) if platform::is_gone(&e) => Err(e),
             Err(e) => {
@@ -250,17 +256,17 @@ impl Display {
     /// the surface, or the first capture, creates the surface. A failed
     /// capture sends nothing.
     async fn tick(&mut self) -> Result<()> {
-        let Some(frame) = self.capture_or_skip().await? else {
+        let Some(capture) = self.capture_or_skip().await? else {
             return Ok(());
         };
-        if self.surface == Some(frame.size()) {
-            return self.send_frame(frame, false).await;
+        if self.surface == Some(capture.size()) {
+            return self.send_update(capture).await;
         }
         if let Some(old) = self.surface.take() {
             debug!(
                 session = self.conn.session().id(),
                 from = %old,
-                to = %frame.size(),
+                to = %capture.size(),
                 "the desktop changed size; replacing the surface"
             );
             self.send_msg(
@@ -271,13 +277,14 @@ impl Display {
             )
             .await?;
         }
-        self.start_surface(frame).await
+        self.start_surface(capture).await
     }
 
-    /// Create the primary surface at `frame`'s size and draw all of it,
-    /// then describe the monitor and mark the display ready.
-    async fn start_surface(&mut self, frame: Frame) -> Result<()> {
-        let size = frame.size();
+    /// Create the primary surface at `capture`'s size and draw all of it,
+    /// then describe the monitor and mark the display ready. `capture`
+    /// must be of the whole desktop.
+    async fn start_surface(&mut self, capture: Capture) -> Result<()> {
+        let size = capture.size();
         self.send_msg(
             DisplayOpcode::SurfaceCreate,
             &SurfaceCreate {
@@ -290,7 +297,10 @@ impl Display {
         )
         .await?;
         self.surface = Some(size);
-        self.send_frame(frame, true).await?;
+        // A new surface starts empty, so the client has nothing the old
+        // shadow describes.
+        self.encoder.reset();
+        self.send_update(capture).await?;
         if self
             .ctx
             .caps
@@ -314,21 +324,21 @@ impl Display {
         self.send(DisplayOpcode::Mark, &[]).await
     }
 
-    /// Send `frame`'s bands: all of them if `complete`, otherwise those
-    /// that changed. Encoding is CPU-bound, so it runs on the blocking
-    /// pool.
-    async fn send_frame(&mut self, frame: Frame, complete: bool) -> Result<()> {
-        let lz4 = self.lz4_allowed();
+    /// Send what in `capture` differs from what the client was last
+    /// sent: all of it after [`UpdateEncoder::reset`]. Comparing and
+    /// encoding are CPU-bound, so they run on the blocking pool.
+    async fn send_update(&mut self, capture: Capture) -> Result<()> {
+        let options = self.encode_options();
         let mut encoder = std::mem::take(&mut self.encoder);
-        let (encoder, bodies) = tokio::task::spawn_blocking(move || {
-            let bodies = encoder.encode(frame, complete, lz4);
-            (encoder, bodies)
+        let (encoder, update) = tokio::task::spawn_blocking(move || {
+            let update = encoder.update(&capture, options);
+            (encoder, update)
         })
         .await
         .context("the encoding task failed")?;
         self.encoder = encoder;
-        for body in bodies? {
-            self.send(DisplayOpcode::DrawCopy, &body).await?;
+        for draw in update?.draws {
+            self.send(DisplayOpcode::DrawCopy, &draw.body).await?;
         }
         Ok(())
     }

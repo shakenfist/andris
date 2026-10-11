@@ -181,11 +181,12 @@ A connection opens four channels, and ryll opens all four:
 | cursor | The pointer's shape as it changes, as an alpha cursor |
 
 **Display.** Every `--frame-interval-ms` andris captures the whole
-desktop and cuts it into bands of 64 rows. It sends the first frame
-whole, and after that only the bands whose pixels changed since the
-previous capture. Each band is an LZ4-compressed image when the
-client can decode LZ4 and the result is smaller, and an uncompressed
-bitmap otherwise; a client that asks for no compression gets bitmaps.
+desktop and compares it, in tiles of 64x64 pixels, with what it last
+sent. It sends the first frame whole, and after that only the tiles
+whose pixels changed, merged into at most 32 rectangles a frame. Each
+rectangle is an LZ4-compressed image when the client can decode LZ4
+and the result is smaller, and an uncompressed bitmap otherwise; a
+client that asks for no compression gets bitmaps.
 If the desktop changes size, the display surface is recreated at the
 new size. A slow client is not flooded: a capture is skipped while
 too much is unacknowledged. A capture that fails, as one can while the

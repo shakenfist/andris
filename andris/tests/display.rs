@@ -1,8 +1,8 @@
-//! The display channel: its start sequence, the bands it sends and how
+//! The display channel: its start sequence, the draws it sends and how
 //! they decode, compression choice, the ack window, resizing and failed
 //! captures, against an in-process andris on the synthetic platform.
 //!
-//! Every band is decoded, with ryll's `DrawCopy` reader and LZ4 decoder,
+//! Every draw is decoded, with ryll's `DrawCopy` reader and LZ4 decoder,
 //! onto a client-side copy of the surface, which is compared with what
 //! the synthetic desktop shows.
 
@@ -14,8 +14,10 @@ mod support;
 
 use std::time::Duration;
 
-use andris::platform::{DisplayGeometry, Frame, Size};
+use andris::platform::synthetic::{SQUARE_SIZE, SQUARE_TOP};
+use andris::platform::{DisplayGeometry, Frame, Rectangle, Region, Size};
 use andris::server::display::MAX_CAPTURE_FAILURES;
+use andris::server::updates::MAX_RECTS_PER_FRAME;
 use shakenfist_spice_compression::decompress_spice_lz4;
 use shakenfist_spice_protocol::constants::{
     bitmap_flags, bitmap_fmt, clip_type, image_compression, ropd, surface_fmt,
@@ -48,7 +50,7 @@ fn body<T: WireType>(message: &T) -> Vec<u8> {
 }
 
 /// What the client knows of the primary surface: its size and RGBA
-/// pixels, drawn from the bands it was sent.
+/// pixels, drawn from the draws it was sent.
 struct Screen {
     width: u32,
     height: u32,
@@ -123,7 +125,6 @@ fn decode_draw(message: &ReceivedMessage) -> Draw {
     let bbox = draw.base.bbox;
     let width = (bbox.right - bbox.left) as u32;
     let height = (bbox.bottom - bbox.top) as u32;
-    assert_eq!(bbox.left, 0, "bands span the full width");
     assert_eq!(
         draw.src_area,
         Rect {
@@ -138,7 +139,7 @@ fn decode_draw(message: &ReceivedMessage) -> Draw {
     assert_eq!(
         (descriptor.width, descriptor.height),
         (width, height),
-        "the image descriptor is the band's size"
+        "the image descriptor is the box's size"
     );
     assert_eq!(descriptor.flags, 0, "no image is cached");
 
@@ -234,26 +235,42 @@ async fn expect_surface_create(client: &mut TestClient, size: Size) {
     );
 }
 
-/// Read a complete frame of `size` onto `screen`: one DRAW_COPY per
-/// 64-row band, top first. Returns each band's image type and id.
-async fn expect_complete_frame(client: &mut TestClient, screen: &mut Screen) -> Vec<(u8, u64)> {
+/// `rect` as a DRAW_COPY's box.
+fn wire_rect(rect: Rectangle) -> Rect {
+    Rect {
+        top: rect.y as i32,
+        left: rect.x as i32,
+        bottom: (rect.y + rect.height) as i32,
+        right: (rect.x + rect.width) as i32,
+    }
+}
+
+/// Read one DRAW_COPY for each of `expected`, in order, onto `screen`.
+/// Returns each draw's image type and id.
+async fn expect_draws(
+    client: &mut TestClient,
+    screen: &mut Screen,
+    expected: &[Rectangle],
+) -> Vec<(u8, u64)> {
     let mut images = Vec::new();
-    for top in (0..screen.height).step_by(64) {
+    for &rect in expected {
         let draw = decode_draw(&client.recv().await);
-        let rows = 64.min(screen.height - top);
-        assert_eq!(
-            draw.bbox,
-            Rect {
-                top: top as i32,
-                left: 0,
-                bottom: (top + rows) as i32,
-                right: screen.width as i32,
-            }
-        );
+        assert_eq!(draw.bbox, wire_rect(rect));
         screen.apply(&draw);
         images.push((draw.image_type, draw.image_id));
     }
     images
+}
+
+/// Read a complete frame onto `screen`: one DRAW_COPY of the whole
+/// surface, which at the sizes these tests use is too small to split.
+/// Returns its image type and id.
+async fn expect_complete_frame(client: &mut TestClient, screen: &mut Screen) -> Vec<(u8, u64)> {
+    let size = Size {
+        width: screen.width,
+        height: screen.height,
+    };
+    expect_draws(client, screen, &[Rectangle::full(size)]).await
 }
 
 /// Read `MONITORS_CONFIG` and check it has one head of `size`.
@@ -308,21 +325,30 @@ async fn start(server: &TestServer, client: &mut TestClient, compression: u8) ->
     screen
 }
 
-/// Move the square, and read the two bands it crosses onto `screen`.
-/// Returns each band's image type and id.
-async fn advance_and_expect_bands(
+/// Move the square, and return the rectangles andris should send: the
+/// tiles the square left and entered, merged. Every one of those tiles
+/// changes, since the square moves by less than a tile.
+fn advance(server: &TestServer) -> Vec<Rectangle> {
+    let size = server.platform.desktop().unwrap().size();
+    let before = server.platform.square_x().unwrap();
+    server.platform.advance().unwrap();
+    let after = server.platform.square_x().unwrap();
+    let mut tiles = Region::empty(size);
+    for x in [before, after] {
+        tiles.add(Rectangle::new(x, SQUARE_TOP, SQUARE_SIZE, SQUARE_SIZE));
+    }
+    tiles.rectangles(MAX_RECTS_PER_FRAME)
+}
+
+/// Move the square, and read the draws of the tiles it crossed onto
+/// `screen`. Returns each draw's image type and id.
+async fn advance_and_expect_draws(
     server: &TestServer,
     client: &mut TestClient,
     screen: &mut Screen,
 ) -> Vec<(u8, u64)> {
-    server.platform.advance().unwrap();
-    let mut images = Vec::new();
-    for top in [64, 128] {
-        let draw = decode_draw(&client.recv().await);
-        assert_eq!(draw.bbox.top, top, "only the square's bands are sent");
-        screen.apply(&draw);
-        images.push((draw.image_type, draw.image_id));
-    }
+    let expected = advance(server);
+    let images = expect_draws(client, screen, &expected).await;
     screen.assert_shows(&server.platform.desktop().unwrap());
     images
 }
@@ -342,7 +368,7 @@ async fn start_sequence_waits_for_init_and_runs_in_order() {
     let mut screen = Screen::new(size);
     let images = expect_complete_frame(&mut client, &mut screen).await;
     let lz4 = ImageType::Lz4 as u8;
-    assert_eq!(images, vec![(lz4, 1), (lz4, 2), (lz4, 3)]);
+    assert_eq!(images, vec![(lz4, 1)]);
     screen.assert_shows(&server.platform.desktop().unwrap());
     expect_monitors_config(&mut client, size).await;
     expect_mark(&mut client).await;
@@ -365,14 +391,41 @@ async fn no_monitors_config_without_the_capability() {
 }
 
 #[tokio::test]
-async fn advance_sends_only_the_bands_the_square_crossed() {
+async fn advance_sends_only_the_tiles_the_square_crossed() {
     let (server, _main, mut client) = open_display(capabilities::DEFAULT_DISPLAY).await;
     let mut screen = start(&server, &mut client, image_compression::AUTO_GLZ).await;
     let lz4 = ImageType::Lz4 as u8;
-    for (first, second) in [(4, 5), (6, 7), (8, 9)] {
-        let images = advance_and_expect_bands(&server, &mut client, &mut screen).await;
-        assert_eq!(images, vec![(lz4, first), (lz4, second)]);
+    // Within the first two tile columns, each step is one rectangle of
+    // those columns' two tile rows that the square crosses.
+    for id in [2, 3, 4] {
+        let rects = advance(&server);
+        assert_eq!(rects, vec![Rectangle::new(0, 64, 128, 128)]);
+        let images = expect_draws(&mut client, &mut screen, &rects).await;
+        assert_eq!(images, vec![(lz4, id)]);
+        screen.assert_shows(&server.platform.desktop().unwrap());
     }
+    expect_quiet(&mut client).await;
+}
+
+#[tokio::test]
+async fn a_wrapping_square_sends_two_rectangles() {
+    let (server, _main, mut client) = open_display(capabilities::DEFAULT_DISPLAY).await;
+    let mut screen = start(&server, &mut client, image_compression::AUTO_GLZ).await;
+    // The square's left edge reaches 192, the last place a 64-pixel
+    // square fits on a 256-pixel desktop, and then wraps to 0.
+    while server.platform.square_x().unwrap() < 192 {
+        advance_and_expect_draws(&server, &mut client, &mut screen).await;
+    }
+    let rects = advance(&server);
+    assert_eq!(
+        rects,
+        vec![
+            Rectangle::new(0, 64, 64, 128),
+            Rectangle::new(192, 64, 64, 128),
+        ]
+    );
+    expect_draws(&mut client, &mut screen, &rects).await;
+    screen.assert_shows(&server.platform.desktop().unwrap());
     expect_quiet(&mut client).await;
 }
 
@@ -392,7 +445,7 @@ async fn bitmaps_for_a_client_without_lz4() {
     expect_monitors_config(&mut client, size).await;
     expect_mark(&mut client).await;
 
-    let images = advance_and_expect_bands(&server, &mut client, &mut screen).await;
+    let images = advance_and_expect_draws(&server, &mut client, &mut screen).await;
     assert!(images.iter().all(|&(image_type, _)| image_type == pixmap));
 }
 
@@ -421,46 +474,43 @@ async fn preferred_compression_off_is_honoured_whenever_it_arrives() {
     // desktop changes.
     send_compression(&mut client, image_compression::AUTO_GLZ).await;
     tokio::time::sleep(INTERVAL).await;
-    let images = advance_and_expect_bands(&server, &mut client, &mut screen).await;
+    let images = advance_and_expect_draws(&server, &mut client, &mut screen).await;
     assert!(images.iter().all(|&(image_type, _)| image_type == lz4));
 
     send_compression(&mut client, image_compression::OFF).await;
     tokio::time::sleep(INTERVAL).await;
-    let images = advance_and_expect_bands(&server, &mut client, &mut screen).await;
+    let images = advance_and_expect_draws(&server, &mut client, &mut screen).await;
     assert!(images.iter().all(|&(image_type, _)| image_type == pixmap));
 }
 
 #[tokio::test]
 async fn nothing_is_sent_beyond_twice_the_ack_window_until_acks_arrive() {
     let (server, _main, mut client) = open_display(capabilities::DEFAULT_DISPLAY).await;
-    // SET_ACK, SURFACE_CREATE, three bands, MONITORS_CONFIG and MARK.
+    // SET_ACK, SURFACE_CREATE, one draw, MONITORS_CONFIG and MARK.
     let mut screen = start(&server, &mut client, image_compression::AUTO_GLZ).await;
-    let mut unacked = 7;
+    let mut unacked = 5;
 
-    // Two bands a step, until the server has sent one more than twice
-    // the window, as many as it may.
+    // One draw a step, or two as the square wraps, until the server has
+    // sent one more than twice the window, as many as it may. The wrap
+    // comes at 31 unacknowledged, well short of the limit.
     let limit = 2 * WINDOW + 1;
     while unacked < limit {
-        advance_and_expect_bands(&server, &mut client, &mut screen).await;
-        unacked += 2;
+        let images = advance_and_expect_draws(&server, &mut client, &mut screen).await;
+        unacked += images.len() as u32;
     }
     assert_eq!(unacked, limit);
 
     // The desktop changes, but the server holds back.
-    server.platform.advance().unwrap();
+    let rects = advance(&server);
     expect_quiet(&mut client).await;
 
-    // One window acknowledged: the latest frame's bands follow, and no
+    // One window acknowledged: the latest frame's draws follow, and no
     // ticks were queued meanwhile.
     client
         .send(display_client::ACK_SYNC, &body(&AckSync { generation: 1 }))
         .await;
     client.send(display_client::ACK, &[]).await;
-    for top in [64, 128] {
-        let draw = decode_draw(&client.recv().await);
-        assert_eq!(draw.bbox.top, top);
-        screen.apply(&draw);
-    }
+    expect_draws(&mut client, &mut screen, &rects).await;
     screen.assert_shows(&server.platform.desktop().unwrap());
     expect_quiet(&mut client).await;
 }
@@ -471,7 +521,7 @@ async fn a_size_change_replaces_the_surface() {
     let screen = start(&server, &mut client, image_compression::AUTO_GLZ).await;
     assert_eq!(screen.height, 192);
 
-    // 200 rows: the last band is 8 rows.
+    // 200 rows: the last tile row is 8 rows.
     let size = Size {
         width: 320,
         height: 200,
@@ -485,8 +535,7 @@ async fn a_size_change_replaces_the_surface() {
     );
     expect_surface_create(&mut client, size).await;
     let mut screen = Screen::new(size);
-    let images = expect_complete_frame(&mut client, &mut screen).await;
-    assert_eq!(images.len(), 4);
+    expect_complete_frame(&mut client, &mut screen).await;
     screen.assert_shows(&server.platform.desktop().unwrap());
     expect_monitors_config(&mut client, size).await;
     expect_mark(&mut client).await;
@@ -546,7 +595,7 @@ async fn stream_reports_codecs_and_unknown_opcodes_are_ignored() {
     client.send(60000, &[1, 2, 3]).await;
 
     // The channel still serves frames.
-    advance_and_expect_bands(&server, &mut client, &mut screen).await;
+    advance_and_expect_draws(&server, &mut client, &mut screen).await;
 }
 
 #[tokio::test]
@@ -569,7 +618,7 @@ async fn failed_captures_skip_frames_and_the_count_resets() {
             .platform
             .fail_captures(MAX_CAPTURE_FAILURES - 1)
             .unwrap();
-        advance_and_expect_bands(&server, &mut client, &mut screen).await;
+        advance_and_expect_draws(&server, &mut client, &mut screen).await;
     }
     expect_quiet(&mut client).await;
 }
@@ -579,7 +628,7 @@ async fn a_failed_first_capture_delays_the_surface() {
     let (server, _main, mut client) = open_display(capabilities::DEFAULT_DISPLAY).await;
     server.platform.fail_captures(3).unwrap();
     let mut screen = start(&server, &mut client, image_compression::AUTO_GLZ).await;
-    advance_and_expect_bands(&server, &mut client, &mut screen).await;
+    advance_and_expect_draws(&server, &mut client, &mut screen).await;
 }
 
 #[tokio::test]

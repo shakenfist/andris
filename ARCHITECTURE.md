@@ -23,7 +23,7 @@ SPICE.
 | Channel framing | `server/channel.rs`, `opcodes.rs` | Mini-header message framing, the messages every channel shares, and the ack window. Each channel sends only variants of its own opcode enum |
 | Main channel | `server/main_channel.rs` | `INIT`, the channel list, mouse mode and pings |
 | Display channel | `server/display.rs` | The primary surface and the frame timer |
-| Frames | `server/frames.rs` | Cuts a captured frame into 64-row bands, keeps the previous frame to find the changed ones, and encodes each as LZ4 or an uncompressed bitmap |
+| Updates | `server/updates.rs` | Keeps a shadow of what the client was last sent, compares each capture with it in 64x64 tiles, merges the changed tiles into at most 32 rectangles, splits any over 4 MiB, and encodes each from the shadow as LZ4 or an uncompressed bitmap |
 | Inputs channel | `server/inputs.rs`, `keymap.rs` | Decodes set-1 scancodes to evdev codes, tracks lock keys, applies pointer events according to the mouse mode |
 | Cursor channel | `server/cursor.rs` | Sends each cursor shape the platform reports as an alpha cursor |
 | Platform traits | `platform/mod.rs`, `damage.rs` | `DisplayGeometry`, `ScreenSource`, `InputSink` and `CursorSource`, bundled as a `Platform`. They use no SPICE types, and keys cross them as Linux evdev codes. `ScreenSource` captures rectangles or the whole desktop, and hands each subscriber the damage reported since it last took some, as a region of 64x64 tiles |
@@ -41,13 +41,15 @@ the pre-push audit runbook.
 
 A timer in the display channel fires every `--frame-interval-ms`. It
 captures the whole desktop through the platform's `ScreenSource`, on a
-blocking thread, as BGRX. The frame encoder compares it row
-by row with the frame it sent last and cuts it into bands of 64 rows;
-each changed band becomes one `DRAW_COPY` message carrying an LZ4 image
-(or an uncompressed bitmap when LZ4 would not help or the client asked
-for none). The channel writes them as the ack window allows, and skips
-a tick rather than queue frames for a client that is behind. A capture
-of a new size re-creates the surface first.
+blocking thread, as BGRX. The update encoder compares it, one 64x64
+tile at a time, with its shadow of what the client was last sent, and
+copies the changed tiles into the shadow. It merges those tiles into
+at most 32 rectangles, and each becomes one `DRAW_COPY` message, drawn
+from the shadow, carrying an LZ4 image (or an uncompressed bitmap when
+LZ4 would not help or the client asked for none). The channel writes
+them as the ack window allows, and skips a tick rather than queue
+frames for a client that is behind. A capture of a new size re-creates
+the surface first.
 
 ### How a key reaches the X server
 

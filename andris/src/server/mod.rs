@@ -7,8 +7,8 @@
 //! - [`opcodes`] lists what each channel may send;
 //! - [`main_channel`], [`display`], [`inputs`] and [`cursor`] serve the
 //!   four channels;
-//! - [`frames`] cuts captured frames into the display channel's
-//!   `DRAW_COPY` bands;
+//! - [`updates`] compares captures with what the display channel last
+//!   sent, and encodes what changed as `DRAW_COPY`s;
 //! - [`keymap`] decodes the inputs channel's set-1 scancodes to evdev
 //!   codes;
 //! - [`tls`] loads the TLS listener's certificate.
@@ -37,7 +37,6 @@
 pub mod channel;
 pub mod cursor;
 pub mod display;
-pub mod frames;
 pub mod inputs;
 pub mod keymap;
 pub mod link;
@@ -45,6 +44,7 @@ pub mod main_channel;
 pub mod opcodes;
 pub mod session;
 pub mod tls;
+pub mod updates;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};

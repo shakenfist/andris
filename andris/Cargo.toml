@@ -31,7 +31,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-x11rb = { version = "0.13", features = ["damage", "shm", "xfixes", "xkb", "xtest"] }
+x11rb = { version = "0.14", features = ["damage", "shm", "xfixes", "xkb", "xtest"] }
 
 # ryll's shared crates, pinned to ryll's develop at 502199e (2026-10-11).
 # Both crates come from one ryll workspace, so they must always carry the
@@ -57,4 +57,4 @@ tempfile = "3"
 # X-Resource, so the X11 test can find andris's MIT-SHM segment as another
 # client of the display would, and detach it. Cargo unifies these features
 # with the ones above in test builds.
-x11rb = { version = "0.13", features = ["res"] }
+x11rb = { version = "0.14", features = ["res"] }

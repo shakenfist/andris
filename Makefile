@@ -266,15 +266,18 @@ ryll-headless: ensure-cache
 
 # Run andris against Xvfb and drive it with ryll's headless client; see
 # scripts/e2e.sh. Offline, with the checkout read-only, like the compile
-# targets: the script writes only under the container's /tmp. Ryll's
-# binary is mounted read-only from the cargo cache.
+# targets: the script writes only under the container's /tmp, and cargo
+# only under target/. Ryll's binary is mounted read-only from the cargo
+# cache. The X11 backend's test (andris/tests/x11.rs), which the script
+# runs against its Xvfb, is compiled first, so that the script's own run
+# of it costs only the test.
 e2e: build ryll-headless
 	$(DOCKER_RUN_OFFLINE) \
 		-v "$(dir $(RYLL_BIN))":/build/ryll-bin:ro \
 		-e RYLL=/build/ryll-bin/ryll \
 		-e ANDRIS=/workspace/target/debug/andris \
 		$(ANDRIS_IMAGE) \
-		scripts/e2e.sh
+		sh -c "cargo test --frozen --no-run --test x11 && scripts/e2e.sh"
 
 # Clean build artifacts.
 #

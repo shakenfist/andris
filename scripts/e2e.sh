@@ -5,14 +5,19 @@
 # it writes (ticket, .vv, logs, the control socket) goes in a directory
 # under /tmp.
 #
-# It starts, in order: Xvfb; scripts/e2e-keylogger.py, a full-screen window
+# It starts Xvfb and first runs the X11 backend's own test against its bare
+# root window (andris/tests/x11.rs, through cargo test, which the Makefile
+# has already built): damage from a drawing, and the drawing captured
+# through MIT-SHM and through GetImage.
+#
+# It then starts, in order: scripts/e2e-keylogger.py, a full-screen window
 # of a known colour that prints each key's keysym name; andris against that
-# display; and ryll --headless against andris, through a .vv file because a
-# password needs one. scripts/e2e-drive.py then asserts over ryll's control
-# socket that a frame of the window arrived and that two keys reached it.
-# It also checks ryll's log for all four channels, since nothing else uses
-# the cursor channel. Last, ryll and andris are stopped with SIGINT and
-# must exit 0.
+# display, reporting which capture method andris chose; and ryll --headless
+# against andris, through a .vv file because a password needs one.
+# scripts/e2e-drive.py then asserts over ryll's control socket that a
+# frame of the window arrived and that two keys reached it. It also checks
+# ryll's log for all four channels, since nothing else uses the cursor
+# channel. Last, ryll and andris are stopped with SIGINT and must exit 0.
 #
 # It fails if any step fails or times out, if any process exits before it
 # is stopped, or if andris logged an ERROR. On failure it prints every log.
@@ -20,11 +25,13 @@
 # Environment:
 #   RYLL    the ryll binary, built by `make ryll-headless` (required)
 #   ANDRIS  the andris binary (default target/debug/andris)
+#   CARGO   the cargo that runs the X11 backend's test (default cargo)
 
 set -euo pipefail
 
 RYLL=${RYLL:?RYLL must name the ryll binary; run this through make e2e}
 ANDRIS=${ANDRIS:-target/debug/andris}
+CARGO=${CARGO:-cargo}
 X_DISPLAY=:99
 GEOMETRY=1024x768
 PORT=5930
@@ -118,7 +125,7 @@ cleanup() {
         { wait "${pids[$name]}"; } 2>/dev/null || true
     done
     if ! $passed; then
-        for name in "${names[@]}" drive; do
+        for name in x11-test "${names[@]}" drive; do
             if [ -f "$work/$name.log" ]; then
                 echo "===== $name.log ====="
                 cat "$work/$name.log"
@@ -143,26 +150,36 @@ say "$("$RYLL" --version 2>&1 | head -n1 || true); $("$ANDRIS" --version 2>&1 | 
 start xvfb Xvfb "$X_DISPLAY" -screen 0 "${GEOMETRY}x24" -nolisten tcp
 wait_until "$XVFB_BOUND" xvfb "Xvfb answering on $X_DISPLAY" xdpyinfo -display "$X_DISPLAY"
 
-# 2. The window that keys are typed into.
+# 2. The X11 backend's test, while nothing else draws on the display.
+say "running the X11 backend's test"
+if ! ANDRIS_TEST_DISPLAY=$X_DISPLAY "$CARGO" test --frozen --quiet --test x11 \
+    >"$work/x11-test.log" 2>&1; then
+    say "FAIL: the X11 backend's test failed"
+    exit 1
+fi
+say "the X11 backend's test passed"
+
+# 3. The window that keys are typed into.
 start keylogger python3 -u "$here/e2e-keylogger.py" --display "$X_DISPLAY"
 wait_until "$KEYLOGGER_BOUND" keylogger "keylogger mapped" grep -qx READY "$work/keylogger.log"
 
-# 3. The ticket, 0600 as andris requires.
+# 4. The ticket, 0600 as andris requires.
 ticket=$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')
 (umask 077 && printf '%s\n' "$ticket" >"$work/ticket")
 
-# 4. Andris.
+# 5. Andris.
 start andris env RUST_LOG=info NO_COLOR=1 "$ANDRIS" --platform x11 --display "$X_DISPLAY" \
     --listen "127.0.0.1:$PORT" --ticket-file "$work/ticket"
 wait_until "$ANDRIS_BOUND" andris "andris listening on $PORT" grep -q "plain listener ready" "$work/andris.log"
+say "andris is $(sed 's/\x1b\[[0-9;]*m//g' "$work/andris.log" | grep -o 'capturing the screen with [A-Za-z-]*' | head -n1 || true)"
 
-# 5. Ryll, headless. The password needs a .vv file: --direct has no
+# 6. Ryll, headless. The password needs a .vv file: --direct has no
 # password option.
 (umask 077 && printf '[virt-viewer]\ntype=spice\nhost=127.0.0.1\nport=%s\npassword=%s\n' \
     "$PORT" "$ticket" >"$work/andris.vv")
 start ryll env NO_COLOR=1 "$RYLL" --headless --file "$work/andris.vv" --control-socket "$sock" --verbose
 
-# 6. The assertions. The driver bounds its own waits, and gives up early
+# 7. The assertions. The driver bounds its own waits, and gives up early
 # if a process it depends on exits.
 rc=0
 python3 "$here/e2e-drive.py" --socket "$sock" --keylog "$work/keylogger.log" \
@@ -198,13 +215,13 @@ for name in "${names[@]}"; do
     fi
 done
 
-# 7. Stop everything, clients first.
+# 8. Stop everything, clients first.
 stop ryll INT
 stop andris INT
 stop keylogger TERM any
 stop xvfb TERM any
 
-# 8. Andris must not have logged an error. Colour is off, but strip any
+# 9. Andris must not have logged an error. Colour is off, but strip any
 # escape codes anyway so the match cannot be split by one.
 if sed 's/\x1b\[[0-9;]*m//g' "$work/andris.log" | grep ' ERROR ' >/dev/null; then
     say "FAIL: andris logged an ERROR"

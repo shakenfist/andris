@@ -9,10 +9,10 @@ use tracing::{debug, warn};
 use x11rb::connection::Connection;
 use x11rb::protocol::Event;
 use x11rb::protocol::xfixes;
-use x11rb::protocol::xproto::{self, CreateWindowAux, Window, WindowClass};
+use x11rb::protocol::xproto::Window;
 use x11rb::rust_connection::RustConnection;
 
-use super::{Fault, log_lost, x_error};
+use super::{Fault, create_wake_window, log_lost, x_error};
 use crate::platform::CursorShape;
 
 /// Set up the cursor connection: make the XFixes handshake, create the
@@ -25,21 +25,7 @@ pub(super) fn start_cursor(
     xfixes::query_version(conn, 5, 0)?
         .reply()
         .context("the XFIXES QueryVersion handshake")?;
-    let wake_window = conn.generate_id()?;
-    xproto::create_window(
-        conn,
-        x11rb::COPY_FROM_PARENT as u8,
-        wake_window,
-        root,
-        0,
-        0,
-        1,
-        1,
-        0,
-        WindowClass::INPUT_ONLY,
-        x11rb::COPY_FROM_PARENT,
-        &CreateWindowAux::new(),
-    )?;
+    let wake_window = create_wake_window(conn, root)?;
     xfixes::select_cursor_input(conn, root, xfixes::CursorNotifyMask::DISPLAY_CURSOR)?;
     let shape = match read_cursor(conn) {
         Ok(shape) => Some(shape),

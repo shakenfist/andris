@@ -44,11 +44,16 @@ depend on it.
 `make e2e` runs andris against a real X server and a real client.
 Inside the devcontainer, with no network and a read-only checkout,
 [`scripts/e2e.sh`](https://github.com/shakenfist/andris/blob/develop/scripts/e2e.sh)
-starts Xvfb and a full-screen window that logs the keys it receives,
-starts the debug andris against that display, and connects ryll's
-headless client through a `.vv` file. It then asserts, over ryll's
-control socket, that a frame of the window arrived and that two keys
-reached it; checks ryll's log for all four channels; and stops ryll
+starts Xvfb and runs the X11 backend's integration test,
+`andris/tests/x11.rs`, against its bare root window: it draws a
+rectangle, waits for the damage, and captures it through both MIT-SHM
+and `GetImage`. That test reads the display from
+`ANDRIS_TEST_DISPLAY`, and passes without doing anything when it is
+unset, as under `make test`. The script then starts a full-screen
+window that logs the keys it receives, starts the debug andris against
+that display, and connects ryll's headless client through a `.vv`
+file. Last, it asserts, over ryll's control socket, that a frame of
+the window arrived and that two keys reached it; checks ryll's log for all four channels; and stops ryll
 and andris with SIGINT, which must exit 0. It fails if andris logs an
 `ERROR`, and prints every log on failure.
 

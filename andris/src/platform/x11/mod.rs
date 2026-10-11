@@ -3,20 +3,28 @@
 //!
 //! # Threads
 //!
-//! x11rb's `RustConnection` is synchronous, so the backend opens three
+//! x11rb's `RustConnection` is synchronous, so the backend opens four
 //! connections to the display, each owned by its own thread:
 //!
-//! - **capture** answers size and capture requests with `GetGeometry` and
-//!   `GetImage` on the root window. Every capture reads the whole root
-//!   window, and a capture of rectangles cuts them from it;
+//! - **capture** answers size and capture requests with `GetGeometry` on
+//!   the root window, and one image per rectangle asked for: with
+//!   MIT-SHM's `ShmGetImage` into a memfd shared with the server where
+//!   that works, and with `GetImage` otherwise (see [`capture`] and
+//!   [`shm`]). Which is used, and why, is logged once at startup;
 //! - **input** injects events with XTest and reads the lock state from
 //!   XKB's indicators. Both go through one queue, so a lock-state read
 //!   sees every event queued before it;
 //! - **cursor** blocks on XFixes cursor events, and publishes each new
-//!   shape through a `watch` channel.
+//!   shape through a `watch` channel;
+//! - **damage** blocks on XDamage events from a `RawRectangles` damage
+//!   object on the root window, and on the root window's
+//!   `ConfigureNotify`, and reports them to the platform's
+//!   [`DamageHub`]: damage as damage, a new size as a resize (see
+//!   [`damage`]).
 //!
 //! Separate connections keep a key press from queueing behind a
-//! multi-megabyte `GetImage`. The threads talk to the rest of andris
+//! multi-megabyte capture, and let the cursor and damage threads block
+//! on events while the capture thread serves round trips. The threads talk to the rest of andris
 //! through `std::sync::mpsc` queues, so [`InputSink::inject`] only
 //! enqueues and never blocks.
 //!
@@ -29,18 +37,17 @@
 //!
 //! [`InputQueue`]: input::InputQueue
 //!
-//! Nothing reports damage yet: a [`DamageSubscription`] starts with the
-//! whole desktop, sized from the root window at connect time, and sees
-//! nothing after that.
-//!
 //! A thread whose connection fails logs that once and exits; every later
-//! call to it returns an error. An error the X server returns for one
-//! request fails that request only.
+//! call to it returns an error. When the damage thread's fails, the hub
+//! is told the desktop has [`Gone`], so every [`DamageSubscription`]
+//! learns of it. An error the X server returns for one request fails that
+//! request only.
 //!
 //! Dropping the platform closes the capture and input queues, and those
-//! threads exit. The cursor thread is blocked waiting for an X event, so
-//! the drop also sends a `ClientMessage` to an unmapped window only that
-//! thread knows, which wakes it to exit.
+//! threads exit; the capture thread detaches its MIT-SHM segment as it
+//! goes. The cursor and damage threads are blocked waiting for X events,
+//! so the drop also sends each a `ClientMessage` to an unmapped window
+//! only that thread knows, which wakes it to exit.
 //!
 //! # Keys
 //!
@@ -51,11 +58,18 @@
 mod capture;
 mod checks;
 mod cursor;
+mod damage;
 mod evdev_names;
 mod input;
 mod keymap;
+// The crate's only unsafe code: the shared memory mapping. See the
+// module's documentation for why it is sound.
+#[allow(unsafe_code)]
+mod shm;
 
+use std::os::fd::AsFd;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender, SyncSender};
 use std::thread;
 
@@ -63,11 +77,12 @@ use anyhow::{Context, Result, anyhow};
 use tokio::sync::watch;
 use tracing::{error, info};
 use x11rb::connection::{Connection, RequestConnection};
-use x11rb::errors::{ConnectionError, ReplyError};
+use x11rb::errors::{ConnectionError, ReplyError, ReplyOrIdError};
 use x11rb::protocol::xproto::{
-    self, AtomEnum, ClientMessageEvent, EventMask, ImageOrder, VisualClass, Window,
+    self, AtomEnum, ClientMessageEvent, CreateWindowAux, EventMask, ImageOrder, VisualClass,
+    Window, WindowClass,
 };
-use x11rb::protocol::{xfixes, xkb, xtest};
+use x11rb::protocol::{damage as xdamage, shm as xshm, xfixes, xkb, xtest};
 use x11rb::rust_connection::RustConnection;
 use x11rb::x11_utils::X11Error;
 
@@ -75,9 +90,10 @@ use super::{
     Capture, CursorReceiver, CursorSource, DamageHub, DamageSubscription, DisplayGeometry, Gone,
     InputEvent, InputSink, LockState, Platform, Rectangle, ScreenSource, Size,
 };
-use capture::{CaptureRequest, serve_capture};
+use capture::{CaptureRequest, Capturer, serve_capture};
 use checks::ServerFacts;
 use cursor::{serve_cursor, start_cursor};
+use damage::{DamageThread, serve_damage, start_damage};
 use input::{Injector, InputQueue, InputRequest, serve_input};
 
 /// How many events [`InputSink::inject`] lets wait for the input thread.
@@ -87,28 +103,80 @@ pub const INPUT_QUEUE_LIMIT: usize = 8192;
 /// [`INPUT_QUEUE_LIMIT`]. Ample for every key and button held at once.
 pub const RELEASE_RESERVE: usize = 512;
 
+/// How [`X11Platform::connect_with`] sets the backend up. The default is
+/// what [`X11Platform::connect`] uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct X11Options {
+    /// Whether capture may use MIT-SHM. With `false` it always uses
+    /// `GetImage`, which tests use to compare the two.
+    pub shm: bool,
+}
+
+impl Default for X11Options {
+    fn default() -> Self {
+        Self { shm: true }
+    }
+}
+
+/// How the X11 platform reads the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureMethod {
+    /// `ShmGetImage` into a memfd shared with the X server.
+    Shm,
+    /// `GetImage`, whose pixels cross the X socket.
+    GetImage,
+}
+
+/// A thread blocked on X events, and how to wake it: a `ClientMessage`
+/// to a window only it knows, sent on its own connection.
+struct Waker {
+    conn: Arc<RustConnection>,
+    window: Window,
+}
+
+impl Waker {
+    /// Wake the thread. If its connection has gone the thread has already
+    /// stopped, so a failure does not matter.
+    fn wake(&self) {
+        let event = ClientMessageEvent::new(32, self.window, AtomEnum::NONE, [0u32; 5]);
+        let sent = xproto::send_event(&*self.conn, false, self.window, EventMask::NO_EVENT, event);
+        if sent.is_ok() {
+            let _ = self.conn.flush();
+        }
+    }
+}
+
 /// The X11 platform. Create it with [`X11Platform::connect`] and hand the
 /// server [`X11Platform::platform`].
 pub struct X11Platform {
     capture: Sender<CaptureRequest>,
     input: InputQueue,
     cursor: CursorReceiver,
-    /// The cursor thread's connection, kept to wake that thread on drop.
-    cursor_conn: Arc<RustConnection>,
-    /// The window the wake-up is sent to.
-    wake_window: Window,
-    /// The desktop's damage, for every subscriber.
-    damage: DamageHub,
+    /// Wakes the cursor thread on drop.
+    cursor_waker: Waker,
+    /// Wakes the damage thread on drop.
+    damage_waker: Waker,
+    /// The desktop's damage, for every subscriber; the damage thread
+    /// reports to it.
+    damage: Arc<DamageHub>,
+    /// Whether the capture thread is using MIT-SHM.
+    using_shm: Arc<AtomicBool>,
 }
 
 impl X11Platform {
     /// Connect to X display `name` (`:10`, say), check that andris can
-    /// export it, and start the backend's threads.
+    /// export it, and start the backend's threads, with the default
+    /// [`X11Options`].
     ///
     /// Fails, saying why, if the display cannot be reached, if its root
-    /// window is not 32-bit BGRX, or if it lacks XTEST, XFIXES or
-    /// XKEYBOARD.
+    /// window is not 32-bit BGRX, or if it lacks XTEST, XFIXES, XKEYBOARD
+    /// or DAMAGE.
     pub fn connect(name: &str) -> Result<Arc<Self>> {
+        Self::connect_with(name, X11Options::default())
+    }
+
+    /// [`X11Platform::connect`], set up as `options` says.
+    pub fn connect_with(name: &str, options: X11Options) -> Result<Arc<Self>> {
         // The input connection first: the checks need its XKB handshake.
         let (input_conn, screen) = open(name, "input")?;
         let screen = input_conn
@@ -121,27 +189,41 @@ impl X11Platform {
             .with_context(|| format!("asking X display {name} what it supports"))?;
         checks::check(name, &facts)?;
         let root = screen.root;
-        let damage = DamageHub::new(Size {
-            width: screen.width_in_pixels.into(),
-            height: screen.height_in_pixels.into(),
-        });
         info!(
             depth = screen.root_depth,
             "connected to X display {name}; it can be exported"
         );
         let injector = Injector::new(input_conn, root)?;
 
+        // Damage before capture, so the size the capture segment is made
+        // for is one whose changes are already followed.
+        let (damage_conn, _) = open(name, "damage")?;
+        let damage_conn = Arc::new(damage_conn);
+        let (damage_window, damage_object, size) = start_damage(&damage_conn, root)
+            .with_context(|| format!("following damage on X display {name}"))?;
+        let damage = Arc::new(DamageHub::new(size));
+
         let (capture_conn, _) = open(name, "capture")?;
+        let unix = shm::is_unix_socket(capture_conn.stream().as_fd());
+        let using_shm = Arc::new(AtomicBool::new(false));
+        let capturer = Capturer::new(
+            capture_conn,
+            root,
+            size,
+            shm::refusal(options.shm, facts.shm_fd, unix),
+            using_shm.clone(),
+        )
+        .with_context(|| format!("setting up capture of X display {name}"))?;
 
         let (cursor_conn, _) = open(name, "the cursor")?;
         let cursor_conn = Arc::new(cursor_conn);
-        let (wake_window, first_shape) = start_cursor(&cursor_conn, root)
+        let (cursor_window, first_shape) = start_cursor(&cursor_conn, root)
             .with_context(|| format!("following the cursor on X display {name}"))?;
         let (shapes, cursor) = watch::channel(first_shape.map(Arc::new));
 
         let (capture, capture_queue) = mpsc::channel();
         spawn("andris-x11-capture", move || {
-            serve_capture(capture_conn, root, capture_queue)
+            serve_capture(capturer, capture_queue)
         })?;
         let (input, input_queue) = InputQueue::new();
         spawn("andris-x11-input", move || {
@@ -149,17 +231,44 @@ impl X11Platform {
         })?;
         let thread_conn = cursor_conn.clone();
         spawn("andris-x11-cursor", move || {
-            serve_cursor(thread_conn, wake_window, shapes)
+            serve_cursor(thread_conn, cursor_window, shapes)
         })?;
+        let thread = DamageThread {
+            conn: damage_conn.clone(),
+            root,
+            wake_window: damage_window,
+            damage: damage_object,
+            size,
+            hub: damage.clone(),
+        };
+        spawn("andris-x11-damage", move || serve_damage(thread))?;
 
         Ok(Arc::new(Self {
             capture,
             input,
             cursor,
-            cursor_conn,
-            wake_window,
+            cursor_waker: Waker {
+                conn: cursor_conn,
+                window: cursor_window,
+            },
+            damage_waker: Waker {
+                conn: damage_conn,
+                window: damage_window,
+            },
             damage,
+            using_shm,
         }))
+    }
+
+    /// How the screen is being read. MIT-SHM can give way to `GetImage`
+    /// after startup, if the desktop grows and the server refuses a
+    /// larger segment.
+    pub fn capture_method(&self) -> CaptureMethod {
+        if self.using_shm.load(Ordering::Relaxed) {
+            CaptureMethod::Shm
+        } else {
+            CaptureMethod::GetImage
+        }
     }
 
     /// This platform as all four seams.
@@ -176,20 +285,10 @@ impl X11Platform {
 impl Drop for X11Platform {
     fn drop(&mut self) {
         // The capture and input threads stop when their queues close,
-        // which happens as the fields drop. Wake the cursor thread, which
-        // is waiting for an X event. If its connection has gone it has
-        // already stopped, so a failure here does not matter.
-        let event = ClientMessageEvent::new(32, self.wake_window, AtomEnum::NONE, [0u32; 5]);
-        let sent = xproto::send_event(
-            &*self.cursor_conn,
-            false,
-            self.wake_window,
-            EventMask::NO_EVENT,
-            event,
-        );
-        if sent.is_ok() {
-            let _ = self.cursor_conn.flush();
-        }
+        // which happens as the fields drop. Wake the cursor and damage
+        // threads, which are waiting for X events.
+        self.cursor_waker.wake();
+        self.damage_waker.wake();
     }
 }
 
@@ -205,16 +304,15 @@ impl ScreenSource for X11Platform {
     }
 
     fn capture(&self, rects: &[Rectangle]) -> Result<Capture> {
-        let frame = round_trip(&self.capture, "capture", CaptureRequest::Capture)?;
-        Capture::cut(&frame, rects)
+        round_trip(&self.capture, "capture", |reply| {
+            CaptureRequest::Capture(Some(rects.to_vec()), reply)
+        })
     }
 
     fn capture_all(&self) -> Result<Capture> {
-        Capture::whole(round_trip(
-            &self.capture,
-            "capture",
-            CaptureRequest::Capture,
-        )?)
+        round_trip(&self.capture, "capture", |reply| {
+            CaptureRequest::Capture(None, reply)
+        })
     }
 }
 
@@ -266,6 +364,27 @@ fn spawn(name: &str, body: impl FnOnce() + Send + 'static) -> Result<()> {
         .spawn(body)
         .with_context(|| format!("starting thread {name}"))?;
     Ok(())
+}
+
+/// Create an unmapped 1x1 input-only window on `conn`, a child of `root`,
+/// for a thread blocked on that connection's events to be woken through.
+fn create_wake_window(conn: &RustConnection, root: Window) -> Result<Window> {
+    let window = conn.generate_id()?;
+    xproto::create_window(
+        conn,
+        x11rb::COPY_FROM_PARENT as u8,
+        window,
+        root,
+        0,
+        0,
+        1,
+        1,
+        0,
+        WindowClass::INPUT_ONLY,
+        x11rb::COPY_FROM_PARENT,
+        &CreateWindowAux::new(),
+    )?;
+    Ok(window)
 }
 
 /// Open a connection to `display`, for `role`.
@@ -322,6 +441,18 @@ impl From<ReplyError> for Fault {
     }
 }
 
+impl From<ReplyOrIdError> for Fault {
+    fn from(e: ReplyOrIdError) -> Self {
+        match e {
+            ReplyOrIdError::ConnectionError(e) => e.into(),
+            ReplyOrIdError::X11Error(e) => Fault::Failed(x_error(&e)),
+            ReplyOrIdError::IdsExhausted => Fault::Failed(anyhow!(
+                "the connection to the X display has run out of ids"
+            )),
+        }
+    }
+}
+
 /// Send a request's result to whoever asked; a failed connection is
 /// answered with [`Gone`]. Returns the error if the connection has
 /// failed, after which the calling thread must stop.
@@ -369,6 +500,13 @@ fn server_facts(conn: &RustConnection, screen: &xproto::Screen) -> Result<Server
             .reply()
             .context("the XKB UseExtension handshake")?
             .supported;
+    // MIT-SHM 1.2 added ShmAttachFd.
+    let shm_fd = present(xshm::X11_EXTENSION_NAME)? && {
+        let version = xshm::query_version(conn)?
+            .reply()
+            .context("the MIT-SHM QueryVersion request")?;
+        (version.major_version, version.minor_version) >= (1, 2)
+    };
     Ok(ServerFacts {
         root_depth: screen.root_depth,
         bits_per_pixel,
@@ -377,6 +515,8 @@ fn server_facts(conn: &RustConnection, screen: &xproto::Screen) -> Result<Server
         xtest: present(xtest::X11_EXTENSION_NAME)?,
         xfixes: present(xfixes::X11_EXTENSION_NAME)?,
         xkb,
+        damage: present(xdamage::X11_EXTENSION_NAME)?,
+        shm_fd,
     })
 }
 
@@ -402,7 +542,12 @@ mod tests {
         // A thread that takes the request but dies before answering.
         let (queue, requests) = mpsc::channel::<CaptureRequest>();
         let worker = thread::spawn(move || drop(requests.recv()));
-        assert!(round_trip(&queue, "capture", CaptureRequest::Capture).is_err());
+        assert!(
+            round_trip(&queue, "capture", |reply| CaptureRequest::Capture(
+                None, reply
+            ))
+            .is_err()
+        );
         worker.join().unwrap();
     }
 

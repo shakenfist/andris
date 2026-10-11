@@ -14,8 +14,12 @@ workspace = true
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
-# For O_NONBLOCK; already in the tree through tokio.
+# For O_NONBLOCK, and memfd_create and file seals for the MIT-SHM capture
+# segment; already in the tree through tokio.
 libc = "0.2"
+# Maps the MIT-SHM capture segment, a memfd shared with the X server, so
+# andris does not hand-roll mmap and munmap.
+memmap2 = "0.9"
 # 0.8, the version shakenfist-spice-protocol uses, so that only one rand
 # is built.
 rand = "0.8"
@@ -27,7 +31,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-x11rb = { version = "0.13", features = ["xtest", "xfixes", "xkb"] }
+x11rb = { version = "0.13", features = ["damage", "shm", "xfixes", "xkb", "xtest"] }
 
 # ryll's shared crates, pinned to ryll's develop at 502199e (2026-10-11).
 # Both crates come from one ryll workspace, so they must always carry the

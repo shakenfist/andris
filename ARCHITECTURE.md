@@ -28,7 +28,7 @@ SPICE.
 | Cursor channel | `server/cursor.rs` | Sends each cursor shape the platform reports as an alpha cursor |
 | Platform traits | `platform/mod.rs`, `damage.rs` | `DisplayGeometry`, `ScreenSource`, `InputSink` and `CursorSource`, bundled as a `Platform`. They use no SPICE types, and keys cross them as Linux evdev codes. `ScreenSource` captures rectangles or the whole desktop, and hands each subscriber the damage reported since it last took some, as a region of 64x64 tiles |
 | Synthetic platform | `platform/synthetic.rs` | A deterministic test pattern that reports damage as it moves, an input sink that records events, and one cursor shape; for tests, load testing and `--platform synthetic` |
-| X11 platform | `platform/x11/` | `GetImage` capture, XTEST input, XFIXES cursor and XKB key names, each on its own connection and thread; the input queue is bounded, with room kept for releases; refuses an X server it cannot read as BGRX |
+| X11 platform | `platform/x11/` | XDamage on the root window, MIT-SHM capture through a shared memfd with `GetImage` as the fallback, XTEST input, XFIXES cursor and XKB key names, each on its own connection and thread; the MIT-SHM mapping is andris's only `unsafe` code; the input queue is bounded, with room kept for releases; refuses an X server it cannot read as BGRX |
 
 Around the code: `Makefile` and `.devcontainer/` run cargo in a
 container; `scripts/e2e.sh` drives the end-to-end test;
@@ -113,8 +113,7 @@ built.
 - **Pixels, not draw ops.** Capture is pixel reads, sent as
   `DRAW_COPY` images, with no QXL draw-op emulation. Damage says
   where to look, and comparing with what the client was last sent
-  says what to send. The X11 backend does not report damage yet, and
-  video streams are yet to come.
+  says what to send. Video streams are yet to come.
 - **Platform seams.** Capture, input injection and the cursor sit
   behind traits, with an X11 implementation and a synthetic one, so
   that a Wayland backend can be added later without restructuring.

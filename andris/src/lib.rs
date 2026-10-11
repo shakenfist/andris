@@ -7,6 +7,12 @@
 //! - [`platform`] holds the seams between the server and the desktop,
 //!   and their implementations;
 //! - [`server`] holds the SPICE server.
+//!
+//! Unsafe code is denied crate-wide. The one exception is the X11
+//! backend's MIT-SHM capture, `platform::x11::shm`, which maps memory the
+//! X server writes; it alone allows it, and justifies each block.
+
+#![deny(unsafe_code)]
 
 pub mod config;
 pub mod platform;

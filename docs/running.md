@@ -74,10 +74,18 @@ naming every problem it found, unless:
 - the root window's depth is 24 or 32, stored at 32 bits a pixel;
 - the image byte order is LSBFirst and the root visual is TrueColor
   with the usual BGRX masks (`0xff0000`, `0x00ff00`, `0x0000ff`);
-- the XTEST, XFIXES and XKEYBOARD extensions are present.
+- the XTEST, XFIXES, XKEYBOARD and DAMAGE extensions are present.
 
 Xvfb at 24 bits meets these, and the end-to-end test runs against
-it. The server's keyboard layout is read once at startup, so a layout changed
+it.
+
+Andris reads the screen with MIT-SHM when it can: it shares a memfd
+with the X server (`ShmAttachFd`, MIT-SHM 1.2), so pixels do not
+cross the X socket. It falls back to the slower `GetImage` when the
+server lacks MIT-SHM 1.2, when the display is reached over TCP, or
+when the server refuses the shared segment. Which it uses, and why,
+is logged at info at startup as `capturing the screen with MIT-SHM`
+or `capturing the screen with GetImage, because ...`. The server's keyboard layout is read once at startup, so a layout changed
 afterwards with `setxkbmap` is not noticed until andris restarts.
 
 ## The synthetic platform
@@ -192,9 +200,7 @@ smaller, and an uncompressed bitmap otherwise; a client that asks for
 no compression gets bitmaps.
 To catch a change the damage missed, andris also re-reads the whole
 desktop every four seconds, a slice at a time, and sends any tile that
-differs. The X11 backend does not report damage yet, so on an X
-display a change reaches the client through this re-read, within
-about four seconds.
+differs.
 If the desktop changes size, the display surface is recreated at the
 new size. A slow client is not flooded: while too much is
 unacknowledged, no frame starts, and changes merge until the client

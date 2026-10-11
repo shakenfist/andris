@@ -23,6 +23,12 @@ pub struct ServerFacts {
     /// Whether the XKEYBOARD extension is present and accepted the
     /// `UseExtension` handshake.
     pub xkb: bool,
+    /// Whether the DAMAGE extension is present.
+    pub damage: bool,
+    /// Whether MIT-SHM 1.2 or later is present: the version that attaches
+    /// a segment passed as a file descriptor. Optional; without it andris
+    /// captures with `GetImage`.
+    pub shm_fd: bool,
 }
 
 /// The masks that make a 32 bit pixel B, G, R, X in memory on an
@@ -31,7 +37,8 @@ pub const BGRX_MASKS: (u32, u32, u32) = (0x00ff_0000, 0x0000_ff00, 0x0000_00ff);
 
 /// Fails, naming every problem, unless `facts` describe a server whose
 /// root window `GetImage` returns as BGRX at 32 bits a pixel, and which
-/// has the extensions andris uses for input and the cursor.
+/// has the extensions andris uses for input, the cursor and damage.
+/// MIT-SHM is not required, so [`ServerFacts::shm_fd`] is not checked.
 pub fn check(display: &str, facts: &ServerFacts) -> Result<()> {
     let mut problems = Vec::new();
     if facts.root_depth != 24 && facts.root_depth != 32 {
@@ -67,6 +74,7 @@ pub fn check(display: &str, facts: &ServerFacts) -> Result<()> {
         (facts.xtest, "XTEST"),
         (facts.xfixes, "XFIXES"),
         (facts.xkb, "XKEYBOARD"),
+        (facts.damage, "DAMAGE"),
     ] {
         if !present {
             problems.push(format!("the {name} extension is missing"));
@@ -95,6 +103,8 @@ mod tests {
             xtest: true,
             xfixes: true,
             xkb: true,
+            damage: true,
+            shm_fd: true,
         }
     }
 
@@ -105,6 +115,14 @@ mod tests {
     #[test]
     fn accepts_depth_24_and_32() {
         check(":99", &xvfb()).unwrap();
+        check(
+            ":99",
+            &ServerFacts {
+                shm_fd: false,
+                ..xvfb()
+            },
+        )
+        .expect("MIT-SHM is optional");
         check(
             ":99",
             &ServerFacts {
@@ -187,6 +205,13 @@ mod tests {
                     ..xvfb()
                 },
                 "XKEYBOARD",
+            ),
+            (
+                ServerFacts {
+                    damage: false,
+                    ..xvfb()
+                },
+                "DAMAGE",
             ),
         ] {
             let message = refusal(&facts);

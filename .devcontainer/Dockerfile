@@ -1,11 +1,15 @@
 # syntax=docker/dockerfile:1
 FROM mcr.microsoft.com/devcontainers/base:debian
 
-# Only the C toolchain and pkg-config. System libraries (libxcb and the
-# like) arrive with the code that needs them, not before.
+# The C toolchain and pkg-config. System libraries (libxcb and the like)
+# arrive with the code that needs them, not before.
+# Build tools:
+#   - cmake: Build dependency for aws-lc-sys (via tokio-rustls, through
+#     shakenfist-spice-protocol)
 RUN apt-get update && apt-get install -y \
     build-essential \
     pkg-config \
+    cmake \
     && rm -rf /var/lib/apt/lists/*
 
 # Create a shared build directory that any user can use

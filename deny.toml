@@ -40,6 +40,18 @@ allow = [
     "bzip2-1.0.6",
 ]
 confidence-threshold = 0.93
+# `jpeg-encoder` (the pure-Rust JPEG encoder behind
+# shakenfist-spice-compression's `encode_spice_jpeg`) declares
+# `(MIT OR Apache-2.0) AND IJG`: the IJG term covers its DCT (and the
+# AVX2 version of it), which are ported from mozjpeg. IJG (Independent
+# JPEG Group) is the canonical libjpeg licence. It is permissive, asking
+# only for an acknowledgement, and is FSF-Free and OSI-recognised; it is
+# widely accepted for redistribution, including in Debian and Ubuntu,
+# where libjpeg-turbo ships under it. ryll's deny.toml carries the same
+# exception.
+exceptions = [
+    { allow = ["IJG"], crate = "jpeg-encoder" },
+]
 
 [bans]
 multiple-versions = "warn"

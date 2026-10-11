@@ -62,6 +62,7 @@ async fn serve(config: Config, platform: Platform) -> Result<()> {
         tls,
         ticket: config.ticket,
         frame_interval: config.frame_interval,
+        scrub_period: server::display::SCRUB_PERIOD,
         timeouts: HandshakeTimeouts::default(),
     };
     let mut handle = Server::bind(options, platform).await?.spawn()?;

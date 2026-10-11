@@ -39,17 +39,21 @@ the pre-push audit runbook.
 
 ### How a frame reaches the wire
 
-A timer in the display channel fires every `--frame-interval-ms`. It
-captures the whole desktop through the platform's `ScreenSource`, on a
-blocking thread, as BGRX. The update encoder compares it, one 64x64
-tile at a time, with its shadow of what the client was last sent, and
-copies the changed tiles into the shadow. It merges those tiles into
-at most 32 rectangles, and each becomes one `DRAW_COPY` message, drawn
-from the shadow, carrying an LZ4 image (or an uncompressed bitmap when
-LZ4 would not help or the client asked for none). The channel writes
-them as the ack window allows, and skips a tick rather than queue
-frames for a client that is behind. A capture of a new size re-creates
-the surface first.
+The display channel waits on its subscription to the platform's
+damage. When damage is pending, at least `--frame-interval-ms` has
+passed since the last frame, and the ack window has room, it takes the
+damaged region and captures its rectangles through the platform's
+`ScreenSource`, on a blocking thread, as BGRX. The update encoder
+compares them, one 64x64 tile at a time, with its shadow of what the
+client was last sent, and copies the changed tiles into the shadow. It
+merges those tiles into at most 32 rectangles, and each becomes one
+`DRAW_COPY` message, drawn from the shadow, carrying an LZ4 image (or
+an uncompressed bitmap when LZ4 would not help or the client asked for
+none), and a `MARK` ends the frame. Damage that arrives while a frame
+cannot start merges into the pending region; pixels are never queued.
+A slow scrub re-reads the desktop a slice at a time and feeds any
+difference from the shadow back in as damage. A region or capture of a
+new size re-creates the surface first.
 
 ### How a key reaches the X server
 
@@ -107,9 +111,10 @@ built.
   an ordinary client of the session user's display. It never starts
   or configures the desktop.
 - **Pixels, not draw ops.** Capture is pixel reads, sent as
-  `DRAW_COPY` images, with no QXL draw-op emulation. Changed regions
-  are found by comparing frames; damage events and video streams
-  are yet to come.
+  `DRAW_COPY` images, with no QXL draw-op emulation. Damage says
+  where to look, and comparing with what the client was last sent
+  says what to send. The X11 backend does not report damage yet, and
+  video streams are yet to come.
 - **Platform seams.** Capture, input injection and the cursor sit
   behind traits, with an X11 implementation and a synthetic one, so
   that a Wayland backend can be added later without restructuring.

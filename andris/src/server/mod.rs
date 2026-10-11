@@ -114,7 +114,11 @@ pub struct ServerOptions {
     pub listen: SocketAddr,
     pub tls: Option<TlsOptions>,
     pub ticket: Ticket,
+    /// The shortest time between the starts of two display frames.
     pub frame_interval: Duration,
+    /// How long the display channel's scrub takes to re-read the whole
+    /// desktop: [`display::SCRUB_PERIOD`], unless a test shortens it.
+    pub scrub_period: Duration,
     /// The handshake's time limits; tests shorten them.
     pub timeouts: HandshakeTimeouts,
 }
@@ -237,6 +241,7 @@ struct Shared {
     ticket: Ticket,
     platform: Platform,
     frame_interval: Duration,
+    scrub_period: Duration,
     timeouts: HandshakeTimeouts,
     registry: SessionRegistry,
     handshakes: Arc<Semaphore>,
@@ -291,6 +296,7 @@ impl Server {
                 ticket: options.ticket,
                 platform,
                 frame_interval: options.frame_interval,
+                scrub_period: options.scrub_period,
                 timeouts: options.timeouts,
                 registry: SessionRegistry::new(),
                 handshakes: Arc::new(Semaphore::new(MAX_HANDSHAKES)),
@@ -626,6 +632,7 @@ async fn serve_channel(stream: SpiceStream, linked: Linked, shared: &Shared) {
         caps: linked.caps,
         channel_id: linked.channel_id,
         frame_interval: shared.frame_interval,
+        scrub_period: shared.scrub_period,
     };
     match linked.channel {
         ServedChannel::Main => {

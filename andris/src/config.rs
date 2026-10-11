@@ -25,6 +25,9 @@ pub const RECOMMENDED_TICKET_LEN: usize = 16;
 /// The shortest frame interval `--frame-interval-ms` accepts.
 pub const MIN_FRAME_INTERVAL_MS: u64 = 20;
 
+/// `--frame-interval-ms`'s default: at most about 30 frames a second.
+pub const DEFAULT_FRAME_INTERVAL_MS: u64 = 33;
+
 /// Which display system andris exports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum PlatformKind {
@@ -76,11 +79,12 @@ pub struct Args {
     #[arg(long, value_name = "WxH", default_value = "1024x768", value_parser = parse_size)]
     pub synthetic_size: Size,
 
-    /// How often the desktop is captured, in milliseconds.
+    /// The shortest time between two frames, in milliseconds: a cap on
+    /// the frame rate. A frame is sent only when the desktop changes.
     #[arg(
         long,
         value_name = "MS",
-        default_value_t = 200,
+        default_value_t = DEFAULT_FRAME_INTERVAL_MS,
         value_parser = clap::value_parser!(u64).range(MIN_FRAME_INTERVAL_MS..),
     )]
     pub frame_interval_ms: u64,
@@ -371,7 +375,7 @@ mod tests {
                 }
             }
         );
-        assert_eq!(config.frame_interval, Duration::from_millis(200));
+        assert_eq!(config.frame_interval, Duration::from_millis(33));
     }
 
     #[test]

@@ -341,7 +341,7 @@ diff.
 | 1 | high | opus | none | Complete | The damage-aware capture seam and the synthetic platform's damage. Gated. See brief 1. |
 | 2 | high | opus | worktree | Not started | The X11 backend: XDamage, MIT-SHM through a memfd, and the `GetImage` fallback. See brief 2. |
 | 3 | high | opus | none | Complete | The update pipeline: shadow, tile comparison, merged rectangles, limits. See brief 3. |
-| 4 | high | opus | none | Not started | The display channel: damage-driven frames, rate cap, backpressure, scrub, `MARK`. See brief 4. |
+| 4 | high | opus | none | Complete | The display channel: damage-driven frames, rate cap, backpressure, scrub, `MARK`. See brief 4. |
 | 5 | high | opus | none | Not started | JPEG: the corpus, the classifier, the lossless refresh, `--jpeg-quality`. See brief 5. |
 | 6 | medium | sonnet | none | Not started | Per-session metrics. See brief 6. |
 | 7 | medium | sonnet | none | Not started | `make e2e`: idle sends nothing, a small change sends a little. See brief 7. |

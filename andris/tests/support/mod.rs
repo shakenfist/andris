@@ -18,6 +18,7 @@ use std::time::Duration;
 use andris::config::Ticket;
 use andris::platform::Size;
 use andris::platform::synthetic::SyntheticPlatform;
+use andris::server::display::SCRUB_PERIOD;
 use andris::server::{HandshakeTimeouts, Server, ServerHandle, ServerOptions, TlsOptions};
 use shakenfist_spice_protocol::link::{
     SpiceLinkMess, SpiceLinkReply, SpiceStream, default_channel_caps, perform_auth,
@@ -71,10 +72,23 @@ impl TestServer {
         Self::start_with(false, FRAME_INTERVAL, HandshakeTimeouts::default()).await
     }
 
-    /// A server with only a plain listener, capturing every
-    /// `frame_interval`.
+    /// A server with only a plain listener, starting display frames at
+    /// most every `frame_interval`.
     pub async fn start_with_frame_interval(frame_interval: Duration) -> Self {
         Self::start_with(false, frame_interval, HandshakeTimeouts::default()).await
+    }
+
+    /// A server with only a plain listener, starting display frames at
+    /// most every `frame_interval`, whose scrub re-reads the whole
+    /// desktop every `scrub_period`.
+    pub async fn start_with_intervals(frame_interval: Duration, scrub_period: Duration) -> Self {
+        Self::start_full(
+            false,
+            frame_interval,
+            scrub_period,
+            HandshakeTimeouts::default(),
+        )
+        .await
     }
 
     /// A server with only a plain listener and the handshake time limits
@@ -95,6 +109,15 @@ impl TestServer {
     }
 
     async fn start_with(tls: bool, frame_interval: Duration, timeouts: HandshakeTimeouts) -> Self {
+        Self::start_full(tls, frame_interval, SCRUB_PERIOD, timeouts).await
+    }
+
+    async fn start_full(
+        tls: bool,
+        frame_interval: Duration,
+        scrub_period: Duration,
+        timeouts: HandshakeTimeouts,
+    ) -> Self {
         init_logging();
         let platform = SyntheticPlatform::new(Size {
             width: 256,
@@ -122,6 +145,7 @@ impl TestServer {
             tls: tls_options,
             ticket: Ticket::new(TICKET).unwrap(),
             frame_interval,
+            scrub_period,
             timeouts,
         };
         let handle = Server::bind(options, platform.platform())

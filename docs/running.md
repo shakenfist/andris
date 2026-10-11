@@ -41,7 +41,7 @@ andris --ticket-file PATH [options]
 | `--tls-listen ADDR:PORT` | none | A TLS listener; needs `--tls-cert` and `--tls-key` |
 | `--tls-cert PATH` | none | The TLS certificate chain, as PEM, leaf first |
 | `--tls-key PATH` | none | The TLS private key, as PEM |
-| `--frame-interval-ms MS` | `200` | How often the desktop is captured; at least 20 |
+| `--frame-interval-ms MS` | `33` | The shortest time between two frames, a cap on the frame rate; at least 20 |
 
 `andris --help` prints the same list. Logs go to stderr at `info`
 level; set `RUST_LOG` (for example `RUST_LOG=andris=debug`) to
@@ -180,19 +180,28 @@ A connection opens four channels, and ryll opens all four:
 | inputs | Applies the client's keys and pointer events to the desktop, and reports the desktop's lock-key state |
 | cursor | The pointer's shape as it changes, as an alpha cursor |
 
-**Display.** Every `--frame-interval-ms` andris captures the whole
-desktop and compares it, in tiles of 64x64 pixels, with what it last
-sent. It sends the first frame whole, and after that only the tiles
-whose pixels changed, merged into at most 32 rectangles a frame. Each
-rectangle is an LZ4-compressed image when the client can decode LZ4
-and the result is smaller, and an uncompressed bitmap otherwise; a
-client that asks for no compression gets bitmaps.
+**Display.** Andris sends the first frame whole. After that it
+captures only the parts of the desktop the platform reports as
+damaged, compares them, in tiles of 64x64 pixels, with what it last
+sent, and sends only the tiles whose pixels changed, merged into at
+most 32 rectangles a frame and followed by a `MARK`, which ryll counts
+as a frame. A desktop that does not change sends nothing. Frames start
+at most once every `--frame-interval-ms`. Each rectangle is an
+LZ4-compressed image when the client can decode LZ4 and the result is
+smaller, and an uncompressed bitmap otherwise; a client that asks for
+no compression gets bitmaps.
+To catch a change the damage missed, andris also re-reads the whole
+desktop every four seconds, a slice at a time, and sends any tile that
+differs. The X11 backend does not report damage yet, so on an X
+display a change reaches the client through this re-read, within
+about four seconds.
 If the desktop changes size, the display surface is recreated at the
-new size. A slow client is not flooded: a capture is skipped while
-too much is unacknowledged. A capture that fails, as one can while the
-desktop is being resized, is skipped and logged as a warning; the
-display channel closes after ten failures in a row, or at once if the
-connection to the X display has gone.
+new size. A slow client is not flooded: while too much is
+unacknowledged, no frame starts, and changes merge until the client
+catches up, when one frame brings it up to date. A capture that fails,
+as one can while the desktop is being resized, is retried and logged
+as a warning; the display channel closes after ten failures in a row,
+or at once if the connection to the X display has gone.
 
 **Keys.** Keys are typed by position, not by character. The client's
 scancodes become evdev key codes, and those become whichever

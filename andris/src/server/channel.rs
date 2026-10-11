@@ -98,8 +98,11 @@ pub struct ChannelContext {
     pub caps: ClientCaps,
     /// The channel id the client linked; always 0 today.
     pub channel_id: u8,
-    /// How often the display channel captures the desktop.
+    /// The shortest time between the starts of two display frames.
     pub frame_interval: Duration,
+    /// How long the display channel's scrub takes to re-read the whole
+    /// desktop.
+    pub scrub_period: Duration,
 }
 
 impl ChannelContext {
@@ -419,6 +422,9 @@ impl<O: AckedOpcode> ChannelConn<O> {
     /// Read from the client until [`ChannelConn::may_send`] is true.
     /// Channel messages that arrive meanwhile are kept, up to
     /// [`MAX_PENDING`], for [`ChannelConn::recv`] to return in order.
+    ///
+    /// Cancel-safe: a message read is kept, with no await in between, so
+    /// a dropped call loses nothing.
     pub async fn wait_for_room(&mut self) -> Result<()> {
         while !self.may_send() {
             match self.next_event().await? {

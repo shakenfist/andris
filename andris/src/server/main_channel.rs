@@ -163,6 +163,7 @@ mod tests {
             caps: ClientCaps::default(),
             channel_id: 0,
             frame_interval: Duration::from_millis(50),
+            scrub_period: Duration::from_secs(4),
         };
         let (server_end, mut client_end) = tokio::io::duplex(64 * 1024);
         let conn = ChannelConn::<MainOpcode>::new(server_end, session);

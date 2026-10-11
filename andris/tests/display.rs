@@ -1,5 +1,6 @@
 //! The display channel: its start sequence, the draws it sends and how
-//! they decode, compression choice, the ack window, resizing and failed
+//! they decode, compression choice, damage-driven frames and their
+//! `MARK`s, the rate cap, the ack window, the scrub, resizing and failed
 //! captures, against an in-process andris on the synthetic platform.
 //!
 //! Every draw is decoded, with ryll's `DrawCopy` reader and LZ4 decoder,
@@ -12,11 +13,11 @@
 
 mod support;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use andris::platform::synthetic::{SQUARE_SIZE, SQUARE_TOP};
 use andris::platform::{DisplayGeometry, Frame, Rectangle, Region, Size};
-use andris::server::display::MAX_CAPTURE_FAILURES;
+use andris::server::display::{CAPTURE_RETRY, MAX_CAPTURE_FAILURES};
 use andris::server::updates::MAX_RECTS_PER_FRAME;
 use shakenfist_spice_compression::decompress_spice_lz4;
 use shakenfist_spice_protocol::constants::{
@@ -33,12 +34,17 @@ use shakenfist_spice_protocol::{
 
 use support::{TestClient, TestServer};
 
-/// The frame interval of every server here: short, so tests are quick.
+/// The frame interval of the servers here, unless a test says otherwise:
+/// short, so tests are quick.
 const INTERVAL: Duration = Duration::from_millis(20);
 
 /// How long to wait before concluding the server sends nothing: five
 /// frame intervals.
 const QUIET: Duration = Duration::from_millis(100);
+
+/// A short scrub period, for the tests that watch the scrub: with a
+/// 192-row desktop of three slices, a pass takes 75 ms.
+const SHORT_SCRUB: Duration = Duration::from_millis(400);
 
 /// The ack window andris asks for.
 const WINDOW: u32 = 20;
@@ -171,7 +177,11 @@ fn decode_draw(message: &ReceivedMessage) -> Draw {
 /// A server, the main channel that holds its session open, and a display
 /// channel linked with `caps`.
 async fn open_display(caps: u32) -> (TestServer, TestClient, TestClient) {
-    let server = TestServer::start_with_frame_interval(INTERVAL).await;
+    open_display_on(TestServer::start_with_frame_interval(INTERVAL).await, caps).await
+}
+
+/// [`open_display`] on `server`.
+async fn open_display_on(server: TestServer, caps: u32) -> (TestServer, TestClient, TestClient) {
     let (main, session) = server.open_main().await;
     let display = server
         .open_with_caps(session, ChannelType::Display, caps)
@@ -301,11 +311,37 @@ async fn expect_mark(client: &mut TestClient) {
 }
 
 async fn expect_quiet(client: &mut TestClient) {
-    if let Some(message) = client.recv_within(QUIET).await {
+    expect_quiet_for(client, QUIET).await;
+}
+
+async fn expect_quiet_for(client: &mut TestClient, wait: Duration) {
+    if let Some(message) = client.recv_within(wait).await {
         panic!(
             "expected nothing, but got opcode {}",
             message.header.message_type
         );
+    }
+}
+
+/// Read one frame onto `screen`: DRAW_COPYs until a `MARK`. Returns the
+/// draws' boxes.
+async fn expect_frame(client: &mut TestClient, screen: &mut Screen) -> Vec<Rect> {
+    let mut boxes = Vec::new();
+    loop {
+        let message = client.recv().await;
+        match message.header.message_type {
+            display_server::DRAW_COPY => {
+                let draw = decode_draw(&message);
+                screen.apply(&draw);
+                boxes.push(draw.bbox);
+            }
+            display_server::MARK => {
+                assert!(message.payload().is_empty());
+                assert!(!boxes.is_empty(), "a MARK with no draws before it");
+                return boxes;
+            }
+            other => panic!("expected a DRAW_COPY or MARK, got opcode {other}"),
+        }
     }
 }
 
@@ -329,9 +365,15 @@ async fn start(server: &TestServer, client: &mut TestClient, compression: u8) ->
 /// tiles the square left and entered, merged. Every one of those tiles
 /// changes, since the square moves by less than a tile.
 fn advance(server: &TestServer) -> Vec<Rectangle> {
-    let size = server.platform.desktop().unwrap().size();
     let before = server.platform.square_x().unwrap();
     server.platform.advance().unwrap();
+    square_tiles(server, before)
+}
+
+/// The rectangles a frame sends once the square has moved from `before`
+/// to where it is now: the tiles it was in and is in, merged.
+fn square_tiles(server: &TestServer, before: u32) -> Vec<Rectangle> {
+    let size = server.platform.desktop().unwrap().size();
     let after = server.platform.square_x().unwrap();
     let mut tiles = Region::empty(size);
     for x in [before, after] {
@@ -340,15 +382,17 @@ fn advance(server: &TestServer) -> Vec<Rectangle> {
     tiles.rectangles(MAX_RECTS_PER_FRAME)
 }
 
-/// Move the square, and read the draws of the tiles it crossed onto
-/// `screen`. Returns each draw's image type and id.
-async fn advance_and_expect_draws(
+/// Move the square, and read the frame of the tiles it crossed onto
+/// `screen`: their draws, then a `MARK`. Returns each draw's image type
+/// and id.
+async fn advance_and_expect_frame(
     server: &TestServer,
     client: &mut TestClient,
     screen: &mut Screen,
 ) -> Vec<(u8, u64)> {
     let expected = advance(server);
     let images = expect_draws(client, screen, &expected).await;
+    expect_mark(client).await;
     screen.assert_shows(&server.platform.desktop().unwrap());
     images
 }
@@ -403,6 +447,8 @@ async fn advance_sends_only_the_tiles_the_square_crossed() {
         let images = expect_draws(&mut client, &mut screen, &rects).await;
         assert_eq!(images, vec![(lz4, id)]);
         screen.assert_shows(&server.platform.desktop().unwrap());
+        // Exactly one MARK closes each frame.
+        expect_mark(&mut client).await;
     }
     expect_quiet(&mut client).await;
 }
@@ -412,9 +458,16 @@ async fn a_wrapping_square_sends_two_rectangles() {
     let (server, _main, mut client) = open_display(capabilities::DEFAULT_DISPLAY).await;
     let mut screen = start(&server, &mut client, image_compression::AUTO_GLZ).await;
     // The square's left edge reaches 192, the last place a 64-pixel
-    // square fits on a 256-pixel desktop, and then wraps to 0.
+    // square fits on a 256-pixel desktop, and then wraps to 0. That is
+    // 24 frames of two messages, more than twice the ack window, so the
+    // client acknowledges as it goes.
+    client
+        .send(display_client::ACK_SYNC, &body(&AckSync { generation: 1 }))
+        .await;
     while server.platform.square_x().unwrap() < 192 {
-        advance_and_expect_draws(&server, &mut client, &mut screen).await;
+        advance_and_expect_frame(&server, &mut client, &mut screen).await;
+        // More often than ryll would; the server's count stops at zero.
+        client.send(display_client::ACK, &[]).await;
     }
     let rects = advance(&server);
     assert_eq!(
@@ -425,6 +478,7 @@ async fn a_wrapping_square_sends_two_rectangles() {
         ]
     );
     expect_draws(&mut client, &mut screen, &rects).await;
+    expect_mark(&mut client).await;
     screen.assert_shows(&server.platform.desktop().unwrap());
     expect_quiet(&mut client).await;
 }
@@ -445,7 +499,7 @@ async fn bitmaps_for_a_client_without_lz4() {
     expect_monitors_config(&mut client, size).await;
     expect_mark(&mut client).await;
 
-    let images = advance_and_expect_draws(&server, &mut client, &mut screen).await;
+    let images = advance_and_expect_frame(&server, &mut client, &mut screen).await;
     assert!(images.iter().all(|&(image_type, _)| image_type == pixmap));
 }
 
@@ -470,47 +524,58 @@ async fn preferred_compression_off_is_honoured_whenever_it_arrives() {
     expect_monitors_config(&mut client, size).await;
     expect_mark(&mut client).await;
 
-    // The server reads a message within a tick; give it one before the
-    // desktop changes.
+    // The server reads a message as it arrives; give it a moment to,
+    // before the desktop changes.
     send_compression(&mut client, image_compression::AUTO_GLZ).await;
     tokio::time::sleep(INTERVAL).await;
-    let images = advance_and_expect_draws(&server, &mut client, &mut screen).await;
+    let images = advance_and_expect_frame(&server, &mut client, &mut screen).await;
     assert!(images.iter().all(|&(image_type, _)| image_type == lz4));
 
     send_compression(&mut client, image_compression::OFF).await;
     tokio::time::sleep(INTERVAL).await;
-    let images = advance_and_expect_draws(&server, &mut client, &mut screen).await;
+    let images = advance_and_expect_frame(&server, &mut client, &mut screen).await;
     assert!(images.iter().all(|&(image_type, _)| image_type == pixmap));
 }
 
 #[tokio::test]
-async fn nothing_is_sent_beyond_twice_the_ack_window_until_acks_arrive() {
+async fn while_acks_are_withheld_damage_merges_into_one_frame() {
     let (server, _main, mut client) = open_display(capabilities::DEFAULT_DISPLAY).await;
     // SET_ACK, SURFACE_CREATE, one draw, MONITORS_CONFIG and MARK.
     let mut screen = start(&server, &mut client, image_compression::AUTO_GLZ).await;
     let mut unacked = 5;
 
-    // One draw a step, or two as the square wraps, until the server has
-    // sent one more than twice the window, as many as it may. The wrap
-    // comes at 31 unacknowledged, well short of the limit.
+    // A draw and a MARK a frame, until the server has sent one more than
+    // twice the window, as many as it may. The square wraps, and sends
+    // two draws, only after 24 steps, well beyond this.
     let limit = 2 * WINDOW + 1;
     while unacked < limit {
-        let images = advance_and_expect_draws(&server, &mut client, &mut screen).await;
-        unacked += images.len() as u32;
+        let images = advance_and_expect_frame(&server, &mut client, &mut screen).await;
+        unacked += images.len() as u32 + 1;
     }
     assert_eq!(unacked, limit);
 
-    // The desktop changes, but the server holds back.
-    let rects = advance(&server);
+    // The desktop changes again and again, each change given time for a
+    // frame of its own, but the server holds back. Ten steps take the
+    // square from 144 across the wrap to 24.
+    let before = server.platform.square_x().unwrap();
+    for _ in 0..10 {
+        server.platform.advance().unwrap();
+        tokio::time::sleep(INTERVAL * 2).await;
+    }
     expect_quiet(&mut client).await;
+    let expected = square_tiles(&server, before);
+    assert_eq!(expected, vec![Rectangle::new(0, 64, 256, 128)]);
 
-    // One window acknowledged: the latest frame's draws follow, and no
-    // ticks were queued meanwhile.
+    // One window acknowledged: one frame follows, of the tiles the square
+    // was in when the window filled and the tiles it is in now, and then
+    // nothing.
     client
         .send(display_client::ACK_SYNC, &body(&AckSync { generation: 1 }))
         .await;
     client.send(display_client::ACK, &[]).await;
-    expect_draws(&mut client, &mut screen, &rects).await;
+    let boxes = expect_frame(&mut client, &mut screen).await;
+    let expected: Vec<Rect> = expected.into_iter().map(wire_rect).collect();
+    assert_eq!(boxes, expected);
     screen.assert_shows(&server.platform.desktop().unwrap());
     expect_quiet(&mut client).await;
 }
@@ -539,6 +604,10 @@ async fn a_size_change_replaces_the_surface() {
     screen.assert_shows(&server.platform.desktop().unwrap());
     expect_monitors_config(&mut client, size).await;
     expect_mark(&mut client).await;
+    expect_quiet(&mut client).await;
+
+    // Frames carry on at the new size.
+    advance_and_expect_frame(&server, &mut client, &mut screen).await;
     expect_quiet(&mut client).await;
 }
 
@@ -595,7 +664,7 @@ async fn stream_reports_codecs_and_unknown_opcodes_are_ignored() {
     client.send(60000, &[1, 2, 3]).await;
 
     // The channel still serves frames.
-    advance_and_expect_draws(&server, &mut client, &mut screen).await;
+    advance_and_expect_frame(&server, &mut client, &mut screen).await;
 }
 
 #[tokio::test]
@@ -618,7 +687,7 @@ async fn failed_captures_skip_frames_and_the_count_resets() {
             .platform
             .fail_captures(MAX_CAPTURE_FAILURES - 1)
             .unwrap();
-        advance_and_expect_draws(&server, &mut client, &mut screen).await;
+        advance_and_expect_frame(&server, &mut client, &mut screen).await;
     }
     expect_quiet(&mut client).await;
 }
@@ -628,7 +697,7 @@ async fn a_failed_first_capture_delays_the_surface() {
     let (server, _main, mut client) = open_display(capabilities::DEFAULT_DISPLAY).await;
     server.platform.fail_captures(3).unwrap();
     let mut screen = start(&server, &mut client, image_compression::AUTO_GLZ).await;
-    advance_and_expect_draws(&server, &mut client, &mut screen).await;
+    advance_and_expect_frame(&server, &mut client, &mut screen).await;
 }
 
 #[tokio::test]
@@ -636,5 +705,140 @@ async fn too_many_failed_captures_in_a_row_close_the_channel() {
     let (server, _main, mut client) = open_display(capabilities::DEFAULT_DISPLAY).await;
     start(&server, &mut client, image_compression::AUTO_GLZ).await;
     server.platform.fail_captures(MAX_CAPTURE_FAILURES).unwrap();
+    // Damage, so that the first failure comes at once, from a frame,
+    // rather than at the scrub's next tick.
+    let failing = Instant::now();
+    server.platform.advance().unwrap();
     client.expect_closed().await;
+    // Every failure after the first waits out the retry gap, however
+    // short the frame interval, whether a frame or the scrub retries.
+    let took = failing.elapsed();
+    let least = CAPTURE_RETRY * (MAX_CAPTURE_FAILURES - 1);
+    assert!(
+        took >= least,
+        "{MAX_CAPTURE_FAILURES} failures closed the channel after {took:?}, under {least:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_scrub_capture_holds_off_the_next_frame() {
+    // The scrub ticks every 25 ms, so it meets the failure before a frame
+    // does.
+    let server = TestServer::start_with_intervals(INTERVAL, SHORT_SCRUB).await;
+    let (server, _main, mut client) = open_display_on(server, capabilities::DEFAULT_DISPLAY).await;
+    let mut screen = start(&server, &mut client, image_compression::AUTO_GLZ).await;
+    server.platform.fail_captures(1).unwrap();
+    tokio::time::sleep(SHORT_SCRUB / 4).await;
+    // The failure is used up; the frame for this change still waits out
+    // the gap the scrub's failure began.
+    let changed = Instant::now();
+    let rects = advance(&server);
+    expect_draws(&mut client, &mut screen, &rects).await;
+    expect_mark(&mut client).await;
+    let took = changed.elapsed();
+    assert!(
+        took >= CAPTURE_RETRY - SHORT_SCRUB / 4 - Duration::from_millis(30),
+        "the frame came {took:?} after the change"
+    );
+    screen.assert_shows(&server.platform.desktop().unwrap());
+    expect_quiet(&mut client).await;
+}
+
+#[tokio::test]
+async fn an_idle_desktop_sends_nothing_after_the_first_frame() {
+    // A short scrub, so that it reads the whole desktop a dozen times.
+    let server = TestServer::start_with_intervals(INTERVAL, SHORT_SCRUB).await;
+    let (server, _main, mut client) = open_display_on(server, capabilities::DEFAULT_DISPLAY).await;
+    start(&server, &mut client, image_compression::AUTO_GLZ).await;
+    expect_quiet_for(&mut client, Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
+async fn damage_that_changed_nothing_sends_nothing_not_even_a_mark() {
+    let (server, _main, mut client) = open_display(capabilities::DEFAULT_DISPLAY).await;
+    let mut screen = start(&server, &mut client, image_compression::AUTO_GLZ).await;
+    let size = server.platform.desktop().unwrap().size();
+    server
+        .platform
+        .report_damage(Rectangle::new(10, 10, 100, 100))
+        .unwrap();
+    expect_quiet(&mut client).await;
+    server
+        .platform
+        .report_damage(Rectangle::full(size))
+        .unwrap();
+    expect_quiet(&mut client).await;
+
+    // A real change still arrives, and only it.
+    advance_and_expect_frame(&server, &mut client, &mut screen).await;
+    expect_quiet(&mut client).await;
+}
+
+#[tokio::test]
+async fn a_change_damage_missed_arrives_through_the_scrub() {
+    let server = TestServer::start_with_intervals(INTERVAL, SHORT_SCRUB).await;
+    let (server, _main, mut client) = open_display_on(server, capabilities::DEFAULT_DISPLAY).await;
+    let mut screen = start(&server, &mut client, image_compression::AUTO_GLZ).await;
+
+    // In the bottom right tile, which is 64 x 64, far from the square.
+    server
+        .platform
+        .paint_undamaged(Rectangle::new(200, 140, 20, 20), (1, 2, 3))
+        .unwrap();
+    let painted = Instant::now();
+    let boxes = expect_frame(&mut client, &mut screen).await;
+    let took = painted.elapsed();
+    assert!(
+        took < SHORT_SCRUB + Duration::from_millis(500),
+        "the change took {took:?} to arrive"
+    );
+    assert_eq!(boxes, vec![wire_rect(Rectangle::new(192, 128, 64, 64))]);
+    screen.assert_shows(&server.platform.desktop().unwrap());
+    expect_quiet(&mut client).await;
+}
+
+#[tokio::test]
+async fn the_rate_cap_holds_under_continuous_damage() {
+    let interval = Duration::from_millis(100);
+    let server = TestServer::start_with_frame_interval(interval).await;
+    let (server, _main, mut client) = open_display_on(server, capabilities::DEFAULT_DISPLAY).await;
+    let mut screen = start(&server, &mut client, image_compression::AUTO_GLZ).await;
+
+    // Acknowledge as ryll does, a window at a time, so that the window
+    // never limits the frame rate. Five messages have arrived.
+    client
+        .send(display_client::ACK_SYNC, &body(&AckSync { generation: 1 }))
+        .await;
+    let mut received = 5;
+
+    // The square moves every 10 ms for a second.
+    let platform = server.platform.clone();
+    let mover = tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(Duration::from_millis(10));
+        for _ in 0..100 {
+            ticks.tick().await;
+            platform.advance().unwrap();
+        }
+    });
+
+    // Read until the frames stop.
+    let mut marks = 0;
+    while let Some(message) = client.recv_within(Duration::from_millis(500)).await {
+        received += 1;
+        if received % WINDOW == 0 {
+            client.send(display_client::ACK, &[]).await;
+        }
+        match message.header.message_type {
+            display_server::DRAW_COPY => screen.apply(&decode_draw(&message)),
+            display_server::MARK => marks += 1,
+            other => panic!("expected a DRAW_COPY or MARK, got opcode {other}"),
+        }
+    }
+    mover.await.unwrap();
+
+    // A second at one frame per 100 ms is at most eleven frames, and one
+    // more for damage after the last of them.
+    assert!(marks <= 12, "{marks} frames in a second");
+    assert!(marks >= 5, "only {marks} frames in a second");
+    screen.assert_shows(&server.platform.desktop().unwrap());
 }

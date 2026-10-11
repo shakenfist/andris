@@ -445,15 +445,31 @@ impl DamageSubscription {
     /// it failed. Never blocks. Fails with [`Gone`] once the desktop has
     /// gone.
     pub fn restore(&self, region: &Region) -> Result<()> {
-        {
+        self.add(region).map(|_| ())
+    }
+
+    /// Add `region` to the pending damage, as when the consumer finds a
+    /// change the platform did not report, and wake the subscription if
+    /// that added anything. A region of another size is clipped and
+    /// rounded out, as [`Region::union`] does. Returns how many of the
+    /// tiles were not already pending. Never blocks. Fails with [`Gone`]
+    /// once the desktop has gone.
+    pub fn add(&self, region: &Region) -> Result<usize> {
+        let added = {
             let mut pending = self.shared.pending()?;
             if let Some(why) = &pending.gone {
                 return Err(anyhow::Error::new(Gone(why.clone())));
             }
+            let before = pending.region.tile_count();
             pending.region.union(region);
+            pending.region.tile_count() - before
+        };
+        // Nothing added leaves the subscription as ready, or as idle, as it
+        // was.
+        if added > 0 {
+            self.shared.wake.notify_one();
         }
-        self.shared.wake.notify_one();
-        Ok(())
+        Ok(added)
     }
 
     /// Whether damage is pending or the desktop is gone. A poisoned lock
@@ -941,6 +957,55 @@ mod tests {
             subscription.take().unwrap(),
             tiles(&["#..#", "....", "...."])
         );
+    }
+
+    #[tokio::test]
+    async fn add_counts_only_new_tiles_and_wakes_only_for_them() {
+        let hub = DamageHub::new(SIZE);
+        let subscription = hub.subscribe().unwrap();
+        subscription.take().unwrap();
+        assert_eq!(subscription.add(&Region::empty(SIZE)).unwrap(), 0);
+        assert!(!returns(&subscription).await, "nothing added, no wake");
+
+        hub.damage(&[rect(0, 0, 1, 1)]).unwrap();
+        assert_eq!(
+            subscription.add(&tiles(&["##..", "....", "...."])).unwrap(),
+            1,
+            "tile (0, 0) was already pending"
+        );
+        assert!(returns(&subscription).await);
+        assert_eq!(
+            subscription.take().unwrap(),
+            tiles(&["##..", "....", "...."])
+        );
+
+        // A waiting subscription is woken by an addition.
+        let mut waiting = Box::pin(subscription.changed());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            subscription.add(&tiles(&["....", "....", "...#"])).unwrap(),
+            1
+        );
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .unwrap();
+
+        // Another size is clipped to the desktop's.
+        let mut larger = Region::empty(Size {
+            width: 1000,
+            height: 1000,
+        });
+        larger.add(rect(900, 900, 1, 1));
+        larger.add(rect(70, 70, 1, 1));
+        assert_eq!(subscription.add(&larger).unwrap(), 1);
+
+        hub.gone("the X11 damage thread has stopped".to_string())
+            .unwrap();
+        assert!(is_gone(&subscription.add(&Region::full(SIZE)).unwrap_err()));
     }
 
     #[tokio::test]

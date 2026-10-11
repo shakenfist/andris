@@ -170,7 +170,7 @@ written with `/next-phase` as each phase comes up.
 | 1. Build and CI scaffold | PLAN-x11-desktop-phase-01-scaffold.md | Complete | andris `cf34d91` (#1) |
 | 2. Server-role wire types (ryll) | PLAN-x11-desktop-phase-02-wire-types.md | Complete | ryll `3763158` (#477); andris `a9e79cf` (#5) |
 | 3. Image encoders (ryll) | PLAN-x11-desktop-phase-03-encoders.md | Complete | ryll `cd2fe41` (#487); andris `591e062` (#6) |
-| 4. Server skeleton | Not yet written | Not started | |
+| 4. Server skeleton | PLAN-x11-desktop-phase-04-server-skeleton.md | In progress | |
 | 5. Damage and flow control | Not yet written | Not started | |
 | 6. Sharing the xrdp session | Not yet written | Not started | |
 | 7. In-process agent: resize and clipboard | Not yet written | Not started | |
@@ -289,6 +289,8 @@ which that matters.
 
 ### Phase 4: Server skeleton
 
+Detail is in
+[PLAN-x11-desktop-phase-04-server-skeleton.md](PLAN-x11-desktop-phase-04-server-skeleton.md).
 The first usable server, as one pull request built up in steps:
 
 - a TCP listener with optional rustls TLS;
@@ -298,15 +300,23 @@ The first usable server, as one pull request built up in steps:
 - a display channel with one primary surface the size of the root
   window, sending full-frame LZ4 `DRAW_COPY` updates on a timer;
 - an inputs channel that maps PC scancodes to X keycodes and
-  injects keys and pointer events through XTest;
+  injects keys and pointer events through XTest. The keycodes are
+  looked up by XKB key name from the attached server, because the
+  xrdp session `:10` uses xfree86 keycodes and Xvfb uses evdev;
 - a cursor channel driven by XFixes cursor notifications.
 
 The capture, input and display-control traits are defined here,
 with the X11 and synthetic implementations. CI runs andris against
-Xvfb and drives it with ryll's headless mode, asserting that frames
-arrive and that injected keys reach an X client. A smoke test
-confirms that kerbside's static source can front andris without an
-allowlist termination.
+Xvfb and drives it with ryll's headless mode, built at the revision
+andris pins, through ryll's control socket. It asserts that frames
+arrive and that injected keys reach an X client. Released ryll is
+too old for this. A smoke test, run by hand in this phase, confirms
+that kerbside's static source can front andris without an allowlist
+termination. A static source needs MariaDB and kerbside's API,
+daemon and proxy, so automating that check is left to phase 10.
+
+Ryll only asks for the channel list after the main channel's first
+`PING` (ryll#502), so andris pings straight after `INIT`.
 
 Andris depends on ryll's protocol and compression crates by git
 revision (see phase 3). It sends LZ4 only to a client that
@@ -389,7 +399,9 @@ kHz and honours the client's volume and mute messages.
 ### Phase 10: Packaging and dogfood soak
 
 Ship a `.deb` and the systemd user unit, and write the kerbside
-static-source configuration into `docs/`. Then the operator uses
+static-source configuration into `docs/`. Automate phase 4's
+kerbside smoke test, either here or as a "custom backend" lane in
+kerbside's own CI. Then the operator uses
 ryll → kerbside → andris as the daily connection for a week, with
 RDP as the fallback. Every regression found is filed, and either
 fixed here or recorded under Future work.

@@ -346,7 +346,7 @@ diff.
 | 6 | medium | sonnet | none | Complete | Per-session metrics. See brief 6. |
 | 7 | medium | sonnet | none | Complete | `make e2e`: idle sends nothing, a small change sends a little. See brief 7. |
 | 8 | medium | sonnet | none | Complete | Documentation. See brief 8. |
-| 9 | medium | management | none | Not started | Measurements: idle CPU and scrolling frame rate. See brief 9. |
+| 9 | medium | management | none | Complete | Measurements: idle CPU and scrolling frame rate. See brief 9. |
 | 10 | medium | management | none | Not started | Push audit, pull request, queue. See brief 10. |
 
 Step 1 is gated because the seam's shape is cheap to propose and
@@ -696,7 +696,97 @@ Constraints:
 
 ## Result
 
-Not yet started.
+**Measurements** (step 9). These used release andris and ryll headless
+at the pinned revision. CPU was sampled from `/proc/<pid>/stat` over
+the window. On Xvfb, everything ran in the devcontainer at `:10`'s
+size, 2212x1308.
+
+| Case | Andris | Other processes | Andris metrics | Target |
+|------|--------|-----------------|----------------|--------|
+| Xvfb, idle, 60 s | 0.33% of a core | Xvfb 0.08%, ryll 0.27% | first frame only; nothing after | under 2%: met |
+| Xvfb, a full-screen terminal-like window scrolling one 16-pixel line every 16 ms, 25 s | 18.6% | Xvfb 10.0%, ryll 21.4%, scroller 10.1% | 29.2–29.3 fps; capture 2.0 ms and encode 3.9–4.1 ms a frame; 58 Mbit/s; ack lag 3–5 ms | 30 fps: met, at the 33 ms cap |
+| `:10`, loopback, ryll headless sending no input, 60 s | 1.65% | Xorg 2.75%, which includes the operator's own activity | about 11 fps of small updates from this session's terminals; changed 1.3–6% of the damaged area; scrub tiles 0 | under 2%: met while not even idle |
+
+What the measurements show:
+- **Idle.** On Xvfb, andris and Xvfb together use about 0.4% of a
+  core. Phase 4 measured 1.5–1.6% at 1024x768, about 6% scaled to
+  this size.
+- **Damage over-reports, and the comparison earns its keep.** On
+  `:10`, the tiles that actually changed were 1.3–6% of what XDamage
+  reported.
+- **No missed damage on xorgxrdp.** The scrub found no tile that
+  XDamage had missed in 60 s on `:10`. It remains the backstop.
+- **Scrolling meets 30 fps without `COPY_BITS`** (decision 11). The
+  frame rate sits at the rate cap, with about 6 ms of capture and
+  encode per frame, so there is headroom. The cost is bandwidth:
+  58 Mbit/s for a full-screen scroll, fine on a LAN and heavy over a
+  WAN. The master plan's Future work entry for `COPY_BITS` scroll
+  detection stands, with this as its case.
+- **Ryll's GUI FPS was not measured.** Headless ryll reports no FPS
+  (ryll#512). Andris's frames per second is its `MARK` rate, which is
+  what ryll's GUI counts. Reading the GUI's own figure needs a ryll
+  window on the operator's desktop, so it is left to the operator.
+
+**The JPEG classifier** (step 5). The private corpus held:
+- a capture of the operator's desktop;
+- rendered terminal and document text;
+- two photographic wallpapers and two gradient wallpapers.
+
+None of it is in the repository. Ratios are bytes over raw bytes,
+summed over 64x64 tiles. "JPEG share" is for 64x64 tiles / 256x256 /
+512x512 / the whole image.
+
+| Image | JPEG share | LZ4 | JPEG q85 | Saving | LZ4 MB/s | JPEG MB/s |
+|-------|-----------|-----|----------|--------|----------|-----------|
+| desktop 2212x1308 | 0 / 0 / 0 / 0 | 0.072 | 0.078 | 1.0x | 2895 | 624 |
+| terminal 1600x1000 | 0 / 0 / 0 / 0 | 0.039 | 0.094 | 1.0x | 4263 | 578 |
+| document 1600x1000 | 0 / 0 / 0 / 0 | 0.051 | 0.114 | 1.0x | 3724 | 550 |
+| photo 1, 1280x800 | 91% / 100 / 100 / 100 | 0.693 | 0.061 | 7.6x to 34.9x | 549 | 638 |
+| photo 2, 1280x800 | 92% / 100 / 100 / 100 | 0.678 | 0.060 | 8.0x to 35.3x | 543 | 643 |
+| gradient 1 | 0 | 0.186 | 0.055 | 1.0x | 1556 | 642 |
+| gradient 2 | 0 | 0.221 | 0.062 | 1.0x | 1425 | 629 |
+
+The chosen rule: JPEG only for rectangles that meet all of these:
+- at least one 64x64 tile in area, and at least 16 pixels on each
+  side;
+- LZ4 over half the raw size;
+- JPEG at most half of what lossless would send.
+
+The reasons:
+- **The LZ4 gate separates the content types.** Every text tile came
+  under 0.3, and photographic tiles came between 0.4 and 1.0.
+- **The JPEG size test alone would be unsafe.** It would have made
+  43% of the real desktop's tiles lossy.
+- **Gradients stay lossless.** They overlap text on LZ4 ratio, and LZ4
+  already compresses them well.
+- **Encoding a full-screen photographic frame is slow.** At 2212x1308
+  it would cost about 21 ms of LZ4 plus 17 ms of JPEG on one core,
+  over the 33 ms frame budget. That case is phase 8's (streams), not
+  this one's.
+
+**The e2e job** takes about 8.6 s warm, up from 6.4 s. Nearly all of
+the difference is the 2 s idle window. The small-change check sees one
+`surface_drawn` event every time.
+
+**Departures from the plan:**
+- **Step 4 added `CAPTURE_RETRY` (200 ms) on review.** At a 33 ms frame
+  interval, `MAX_CAPTURE_FAILURES` would otherwise give up after about
+  330 ms rather than the roughly 2 s an RDP resize needs.
+- **Step 5 tracks lossy areas per tile,** each with its own due time,
+  rather than with one timer. Changing content in one place would
+  otherwise postpone the refresh everywhere.
+- **Step 5 also made large rectangles split on tile rows,** so that
+  every draw covers whole tiles.
+- **Step 2 sealed the memfd** against shrinking and growing. It also
+  detects a TCP display from the socket itself, because x11rb falls
+  back to TCP quietly.
+- **Step 2 was built in a separate worktree** of its own, then
+  cherry-picked, rather than through the Agent tool's worktree
+  isolation. That would have made a worktree of the session's own
+  repository, not andris.
+
+The push audit (step 10), the pull request and its merge commit are
+recorded below once known.
 
 ## Appendix: the damage spike
 

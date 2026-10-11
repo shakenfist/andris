@@ -1,24 +1,24 @@
-/// The banner printed by the binary: its name and version.
-fn banner() -> String {
-    format!("andris {}", env!("CARGO_PKG_VERSION"))
-}
+//! The andris binary: parse the command line, set up logging, and hand
+//! over to the library.
 
-fn main() {
-    println!("{}", banner());
-}
+use anyhow::Result;
+use clap::Parser;
+use tracing::info;
+use tracing_subscriber::EnvFilter;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+use andris::config::Args;
 
-    #[test]
-    fn banner_has_name_and_version() {
-        let banner = banner();
-        let version = banner.strip_prefix("andris ").unwrap();
-        assert!(!version.is_empty(), "no version in banner: {banner:?}");
-        assert!(
-            !version.chars().any(char::is_whitespace),
-            "version contains whitespace: {version:?}"
-        );
-    }
+fn main() -> Result<()> {
+    let args = Args::parse();
+
+    // RUST_LOG picks what is logged, and info is the default. Logs go to
+    // stderr.
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
+
+    info!("{}", andris::banner());
+    andris::run(args.validate()?)
 }

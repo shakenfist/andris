@@ -1,11 +1,32 @@
 # syntax=docker/dockerfile:1
 FROM mcr.microsoft.com/devcontainers/base:debian
 
-# Only the C toolchain and pkg-config. System libraries (libxcb and the
-# like) arrive with the code that needs them, not before.
+# The C toolchain and pkg-config. System libraries (libxcb and the like)
+# arrive with the code that needs them, not before.
+# Build tools:
+#   - cmake: Build dependency for aws-lc-sys (via tokio-rustls, through
+#     shakenfist-spice-protocol)
 RUN apt-get update && apt-get install -y \
     build-essential \
     pkg-config \
+    cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+# A headless X server, to test the X11 backend against, and the X
+# clients the end-to-end test (`make e2e`) runs on it:
+#   - xvfb: the virtual framebuffer X server
+#   - xauth: X authorisation cookies, for Xvfb -auth and xvfb-run
+#   - x11-utils: xdpyinfo, which scripts/e2e.sh polls until Xvfb answers
+#   - python3-xlib: scripts/e2e-keylogger.py's window (pulls in python3,
+#     which scripts/e2e-drive.py also runs on)
+# Ryll's slim headless build (`make ryll-headless`) needs nothing beyond
+# the build tools above: cmake already serves aws-lc-sys, and its opus
+# and openh264 crates build from bundled source.
+RUN apt-get update && apt-get install -y \
+    xvfb \
+    xauth \
+    x11-utils \
+    python3-xlib \
     && rm -rf /var/lib/apt/lists/*
 
 # Create a shared build directory that any user can use

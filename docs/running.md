@@ -41,7 +41,7 @@ andris --ticket-file PATH [options]
 | `--tls-listen ADDR:PORT` | none | A TLS listener; needs `--tls-cert` and `--tls-key` |
 | `--tls-cert PATH` | none | The TLS certificate chain, as PEM, leaf first |
 | `--tls-key PATH` | none | The TLS private key, as PEM |
-| `--frame-interval-ms MS` | `33` | The shortest time between two frames, a cap on the frame rate; at least 20 |
+| `--frame-interval-ms MS` | `33` | The shortest time between two frames, a cap on the frame rate (33 is about 30 frames a second); at least 20. It is a cap, not a timer: see [What a client gets](#what-a-client-gets) |
 | `--jpeg-quality QUALITY` | `85` | The JPEG quality, 1 to 100, for areas that look photographic; `0` never sends JPEG (see [What a client gets](#what-a-client-gets)) |
 
 `andris --help` prints the same list. Logs go to stderr at `info`
@@ -80,14 +80,21 @@ naming every problem it found, unless:
 Xvfb at 24 bits meets these, and the end-to-end test runs against
 it.
 
-Andris reads the screen with MIT-SHM when it can: it shares a memfd
-with the X server (`ShmAttachFd`, MIT-SHM 1.2), so pixels do not
-cross the X socket. It falls back to the slower `GetImage` when the
-server lacks MIT-SHM 1.2, when the display is reached over TCP, or
-when the server refuses the shared segment. Which it uses, and why,
-is logged at info at startup as `capturing the screen with MIT-SHM`
-or `capturing the screen with GetImage, because ...`. The server's keyboard layout is read once at startup, so a layout changed
-afterwards with `setxkbmap` is not noticed until andris restarts.
+The DAMAGE extension is how andris learns which parts of the desktop
+changed, so an X server without it is refused. MIT-SHM is optional.
+Andris reads the screen with it when it can: it shares a memfd with
+the X server (`ShmAttachFd`, MIT-SHM 1.2), so pixels do not cross the
+X socket. It falls back to the slower `GetImage` when the server lacks
+MIT-SHM 1.2, when the display is reached over TCP (a file descriptor
+cannot cross it), or when the server refuses the shared segment. Which
+it uses, and why, is logged at info at startup, as
+`capturing the screen with MIT-SHM, through a shared memfd` or
+`capturing the screen with GetImage, because ...` followed by the
+reason. Use a local display (`:10`, not `host:10`) to get MIT-SHM.
+
+The server's keyboard layout is read once at startup, so a layout
+changed afterwards with `setxkbmap` is not noticed until andris
+restarts.
 
 ## The synthetic platform
 
@@ -194,15 +201,15 @@ captures only the parts of the desktop the platform reports as
 damaged, compares them, in tiles of 64x64 pixels, with what it last
 sent, and sends only the tiles whose pixels changed, merged into at
 most 32 rectangles a frame and followed by a `MARK`, which ryll counts
-as a frame. A desktop that does not change sends nothing. Frames start
-at most once every `--frame-interval-ms`. Each rectangle is a JPEG
+as a frame. A desktop that does not change captures and sends no
+frames. Frames start at most once every `--frame-interval-ms`, and
+only when there is damage to send, so the option bounds the frame rate
+and the work a busy desktop costs; it does nothing for a still one.
+Each rectangle is a JPEG
 when it looks photographic and JPEG is allowed (below), an
 LZ4-compressed image when the client can decode LZ4 and the result is
 smaller, and an uncompressed bitmap otherwise; a client that asks for
 no compression gets bitmaps.
-To catch a change the damage missed, andris also re-reads the whole
-desktop every four seconds, a slice at a time, and sends any tile that
-differs.
 If the desktop changes size, the display surface is recreated at the
 new size. A slow client is not flooded: while too much is
 unacknowledged, no frame starts, and changes merge until the client
@@ -210,6 +217,15 @@ catches up, when one frame brings it up to date. A capture that fails,
 as one can while the desktop is being resized, is retried and logged
 as a warning; the display channel closes after ten failures in a row,
 or at once if the connection to the X display has gone.
+
+**The scrub.** The X server does not report every change, so andris
+also re-reads the whole desktop every four seconds, in 16 slices of
+whole tile rows, 250 ms apart. It compares each slice with what it last
+sent, and any tile that differs is sent in the next frame as if it had
+been reported. A change damage missed therefore reaches the client
+within about four seconds. The scrub runs even on a still desktop,
+where it sends nothing but still costs a slice's capture and
+comparison each tick (see [High CPU use](#high-cpu-use)).
 
 **JPEG.** Andris sends JPEG, at `--jpeg-quality`,
 only when the client leaves the choice of compression to the server:
@@ -300,6 +316,34 @@ metrics: 12.4 fps (1 refreshes), draws lz4=118 bitmap=0 jpeg=6, display 842 kbit
   real changes.
 
 A `-` means there was nothing to average in the interval.
+
+### High CPU use
+
+On a still desktop andris should use very little: no frames are
+captured, and the only work is the scrub's. If it uses more, or a busy
+desktop uses more than you expect, look at the [metrics](#metrics)
+line and the startup log:
+
+- The startup log says how the screen is captured. `GetImage` means
+  every pixel crosses the X socket, which costs far more than MIT-SHM;
+  the reason it gives (no MIT-SHM 1.2, a TCP display, a refused
+  segment) is the thing to fix. A local display is the usual cure.
+- `capture` is the time to read the pixels and `encode` the time to
+  compare and compress them. A `capture` of many milliseconds with
+  `GetImage` is the socket; with MIT-SHM it is the X server being
+  slow, such as under software rendering. A large `encode` means a lot
+  of pixels are changing, or a lot are being sent as JPEG.
+- A high `fps` that sits at the cap (about 30 at the default) is a
+  desktop that never stops changing, such as a video. Raising
+  `--frame-interval-ms` lowers the frame rate, and so the CPU use, at
+  the price of smoothness; `--jpeg-quality 0` removes JPEG's encode
+  cost.
+- A steadily nonzero `scrub tiles` means the X server is missing
+  damage, so the scrub is doing real work; a `changed` figure that is
+  low means damage reports are coarse and most of each capture is
+  unchanged.
+- No metrics line at all means no frame was sent in the interval, so
+  any CPU use is the scrub's.
 
 ## Connecting with ryll
 

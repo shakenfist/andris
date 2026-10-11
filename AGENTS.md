@@ -94,6 +94,10 @@ locally:
   scancodes or X keycodes.
 - **`platform/` carries no SPICE or ryll types.** Mapping to and from
   SPICE happens in `server/`.
+- **No `unsafe` outside `platform/x11/shm.rs`.** The crate has
+  `#![deny(unsafe_code)]`; that module alone opts out, for the
+  MIT-SHM mapping, and every `unsafe` block there carries a `SAFETY:`
+  comment.
 - **No `unwrap()` in production code.** `clippy::unwrap_used` is on
   for the workspace; tests may unwrap.
 - **Commits go through `pre-commit run --all-files`.** Run it, and

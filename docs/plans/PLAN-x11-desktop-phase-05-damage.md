@@ -345,7 +345,7 @@ diff.
 | 5 | high | opus | none | Complete | JPEG: the corpus, the classifier, the lossless refresh, `--jpeg-quality`. See brief 5. |
 | 6 | medium | sonnet | none | Complete | Per-session metrics. See brief 6. |
 | 7 | medium | sonnet | none | Complete | `make e2e`: idle sends nothing, a small change sends a little. See brief 7. |
-| 8 | medium | sonnet | none | Not started | Documentation. See brief 8. |
+| 8 | medium | sonnet | none | Complete | Documentation. See brief 8. |
 | 9 | medium | management | none | Not started | Measurements: idle CPU and scrolling frame rate. See brief 9. |
 | 10 | medium | management | none | Not started | Push audit, pull request, queue. See brief 10. |
 

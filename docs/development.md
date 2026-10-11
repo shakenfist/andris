@@ -52,9 +52,18 @@ and `GetImage`. That test reads the display from
 unset, as under `make test`. The script then starts a full-screen
 window that logs the keys it receives, starts the debug andris against
 that display, and connects ryll's headless client through a `.vv`
-file. Last, it asserts, over ryll's control socket, that a frame of
-the window arrived and that two keys reached it; checks ryll's log for all four channels; and stops ryll
-and andris with SIGINT, which must exit 0. It fails if andris logs an
+file. Last, it asserts, over ryll's control socket:
+
+- **frames**: a frame of the window arrived;
+- **keys**: two keys reached the window;
+- **idle silence**: with nothing changing, no draw arrives for several
+  seconds, since andris sends frames only on damage;
+- **a small change**: a key makes the window repaint a 64x64 square,
+  which must reach the client in fewer draws than there are 64-row
+  bands in the screen.
+
+It also checks ryll's log for all four channels, and stops ryll and
+andris with SIGINT, which must exit 0. It fails if andris logs an
 `ERROR`, and prints every log on failure.
 
 It needs nothing on the host beyond Docker: Xvfb and Python are in
@@ -65,6 +74,28 @@ capture) at the revision `Cargo.lock` pins for
 into `ryll/<revision>/` under the cargo cache, and is skipped when the
 binary for that revision is already there. Moving the ryll pin builds
 ryll afresh.
+
+### The JPEG corpus measurement
+
+`andris/tests/jpeg_corpus.rs` is an ignored test that measures real
+screen content, to justify the constants of the JPEG classifier in
+`server/updates.rs`. It asserts nothing about andris's behaviour; it
+prints, per image and rectangle size, the LZ4 and JPEG sizes and encode
+rates, and the share of rectangles and of area the classifier would
+send as JPEG.
+
+It reads every file in `target/corpus` (or the directory in
+`$ANDRIS_JPEG_CORPUS`): raw packed 32-bit B, G, R, X pixels, named
+`<name>_<W>x<H>.bgrx`. Put the files there, then run it in release,
+inside the devcontainer, so the timings mean something:
+
+```bash
+cargo test --release --frozen --test jpeg_corpus -- --ignored --nocapture
+```
+
+`make test` skips it. A capture of a real desktop must never be
+committed: it holds whatever was on the screen. `target/` is
+untracked, and the test prints numbers, never pixels.
 
 ### Why compiling targets are offline
 

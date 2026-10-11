@@ -22,13 +22,13 @@ SPICE.
 | Session registry | `server/session.rs` | Holds the one session served at a time. A main-channel link that authenticates begins a session and cancels the previous one; secondary channels must name the session's id. The session carries the mouse mode and a cancel signal every channel task races against, and holds one channel of each type: a new link of a type replaces the old channel |
 | Channel framing | `server/channel.rs`, `opcodes.rs` | Mini-header message framing, the messages every channel shares, and the ack window. Each channel sends only variants of its own opcode enum |
 | Main channel | `server/main_channel.rs` | `INIT`, the channel list, mouse mode and pings |
-| Display channel | `server/display.rs` | The primary surface and the frame timer |
-| Updates | `server/updates.rs` | Keeps a shadow of what the client was last sent, compares each capture with it in 64x64 tiles, merges the changed tiles into at most 32 rectangles, splits any over 4 MiB, and encodes each from the shadow as LZ4 or an uncompressed bitmap |
+| Display channel | `server/display.rs`, `stats.rs` | The primary surface; the loop that turns damage into frames under the frame-rate cap and the ack window; the scrub; the lossless refresh of JPEG areas; the client's compression preference; and the per-session metrics |
+| Updates | `server/updates.rs` | Keeps a shadow of what the client was last sent, compares each capture with it in 64x64 tiles, merges the changed tiles into at most 32 rectangles, splits any over 4 MiB, and encodes each from the shadow as JPEG (photographic areas, when the client leaves the choice to the server), LZ4 or an uncompressed bitmap |
 | Inputs channel | `server/inputs.rs`, `keymap.rs` | Decodes set-1 scancodes to evdev codes, tracks lock keys, applies pointer events according to the mouse mode |
 | Cursor channel | `server/cursor.rs` | Sends each cursor shape the platform reports as an alpha cursor |
 | Platform traits | `platform/mod.rs`, `damage.rs` | `DisplayGeometry`, `ScreenSource`, `InputSink` and `CursorSource`, bundled as a `Platform`. They use no SPICE types, and keys cross them as Linux evdev codes. `ScreenSource` captures rectangles or the whole desktop, and hands each subscriber the damage reported since it last took some, as a region of 64x64 tiles |
 | Synthetic platform | `platform/synthetic.rs` | A deterministic test pattern that reports damage as it moves, an input sink that records events, and one cursor shape; for tests, load testing and `--platform synthetic` |
-| X11 platform | `platform/x11/` | XDamage on the root window, MIT-SHM capture through a shared memfd with `GetImage` as the fallback, XTEST input, XFIXES cursor and XKB key names, each on its own connection and thread; the MIT-SHM mapping is andris's only `unsafe` code; the input queue is bounded, with room kept for releases; refuses an X server it cannot read as BGRX |
+| X11 platform | `platform/x11/` | XDamage on the root window, MIT-SHM capture through a shared memfd with `GetImage` as the fallback, XTEST input, XFIXES cursor and XKB key names, each on its own connection and thread; the MIT-SHM mapping is andris's only `unsafe` code (`platform/x11/shm.rs`; the rest of the crate denies it), because mapping memory the X server writes into cannot be expressed in safe Rust, and is kept sound by reading it only between replies; the input queue is bounded, with room kept for releases; refuses an X server it cannot read as BGRX |
 
 Around the code: `Makefile` and `.devcontainer/` run cargo in a
 container; `scripts/e2e.sh` drives the end-to-end test;
@@ -39,21 +39,39 @@ the pre-push audit runbook.
 
 ### How a frame reaches the wire
 
-The display channel waits on its subscription to the platform's
-damage. When damage is pending, at least `--frame-interval-ms` has
-passed since the last frame, and the ack window has room, it takes the
-damaged region and captures its rectangles through the platform's
-`ScreenSource`, on a blocking thread, as BGRX. The update encoder
-compares them, one 64x64 tile at a time, with its shadow of what the
-client was last sent, and copies the changed tiles into the shadow. It
-merges those tiles into at most 32 rectangles, and each becomes one
-`DRAW_COPY` message, drawn from the shadow, carrying an LZ4 image (or
-an uncompressed bitmap when LZ4 would not help or the client asked for
-none), and a `MARK` ends the frame. Damage that arrives while a frame
-cannot start merges into the pending region; pixels are never queued.
-A slow scrub re-reads the desktop a slice at a time and feeds any
-difference from the shadow back in as damage. A region or capture of a
-new size re-creates the surface first.
+1. **Damage.** The X11 platform subscribes to XDamage on the root
+   window. Each subscriber (the display channel is one) is handed the
+   damage reported since it last took some, as a region of 64x64
+   tiles. Damage that arrives while a frame cannot start merges into
+   the pending region; pixels are never queued.
+2. **When to capture.** The display channel starts a frame only when
+   damage is pending, at least `--frame-interval-ms` has passed since
+   the last frame, and the ack window has room. A still desktop
+   captures no frames.
+3. **Capture.** It captures the region's rectangles through
+   `ScreenSource`, on a blocking thread, as BGRX: with `ShmGetImage`
+   into a shared memfd when MIT-SHM 1.2 is available, otherwise with
+   `GetImage`.
+4. **Shadow comparison.** The update encoder compares the capture,
+   one tile at a time, with its shadow of what the client was last
+   sent, and copies the changed tiles into the shadow.
+5. **Rectangles and encoding.** It merges the changed tiles into at
+   most 32 rectangles. Each becomes one `DRAW_COPY` drawn from the
+   shadow, as JPEG when it looks photographic and the client leaves
+   compression to the server, otherwise as LZ4, or as an uncompressed
+   bitmap when LZ4 would not help or the client asked for none.
+6. **Frame end.** A `MARK` ends the frame. The ack window counts
+   messages and holds back the next frame while the client is too far
+   behind; changes merge meanwhile, and one frame then catches it up.
+
+Two background jobs feed the same loop. The scrub re-reads the desktop
+a slice at a time, compares it with the shadow, and adds any
+difference to the pending damage, catching changes the X server did
+not report. The lossless refresh resends, as a frame of its own, tiles
+that went out as JPEG once they have been still for a while, so a still
+screen ends up exact. A capture of a new size re-creates the surface
+first. [`docs/running.md`](docs/running.md) describes what an operator
+sees of all this.
 
 ### How a key reaches the X server
 

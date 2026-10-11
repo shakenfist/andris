@@ -47,9 +47,12 @@ Inside the devcontainer, with no network and a read-only checkout,
 starts Xvfb and runs the X11 backend's integration test,
 `andris/tests/x11.rs`, against its bare root window: it draws a
 rectangle, waits for the damage, and captures it through both MIT-SHM
-and `GetImage`. That test reads the display from
-`ANDRIS_TEST_DISPLAY`, and passes without doing anything when it is
-unset, as under `make test`. The script then starts a full-screen
+and `GetImage`. It then detaches andris's shared segment from a second
+connection, finding it through X-Resource 1.2 as another client
+could, and checks that capture recovers: first with a fresh segment,
+then, after a second detach, through `GetImage`. That test reads the
+display from `ANDRIS_TEST_DISPLAY`. When the variable is unset, as
+under `make test`, it prints that it is skipping and passes. The script then starts a full-screen
 window that logs the keys it receives, starts the debug andris against
 that display, and connects ryll's headless client through a `.vv`
 file. Last, it asserts, over ryll's control socket:

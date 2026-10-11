@@ -91,6 +91,9 @@ it uses, and why, is logged at info at startup, as
 `capturing the screen with MIT-SHM, through a shared memfd` or
 `capturing the screen with GetImage, because ...` followed by the
 reason. Use a local display (`:10`, not `host:10`) to get MIT-SHM.
+If captures through the shared segment keep failing, as they do if
+another client detaches it, andris attaches a fresh one once and then
+switches to `GetImage` for good, logging a warning each time.
 
 The server's keyboard layout is read once at startup, so a layout
 changed afterwards with `setxkbmap` is not noticed until andris

@@ -12,21 +12,21 @@ pub mod config;
 pub mod platform;
 pub mod server;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use tracing::info;
 
 use config::{Config, PlatformConfig};
+use platform::Platform;
 use platform::synthetic::SyntheticPlatform;
+use server::{Server, ServerOptions, TlsOptions};
 
 /// Andris's name and version, as `--version` prints them.
 pub fn banner() -> String {
     format!("andris {}", env!("CARGO_PKG_VERSION"))
 }
 
-/// Run andris with a validated configuration.
-///
-/// This builds the platform the configuration names. There is no SPICE
-/// server yet, so it then returns.
+/// Run andris with a validated configuration: build the platform the
+/// configuration names, start the listeners, and serve until Ctrl-C.
 pub fn run(config: Config) -> Result<()> {
     let platform = match &config.platform {
         PlatformConfig::Synthetic { size } => {
@@ -40,8 +40,36 @@ pub fn run(config: Config) -> Result<()> {
             )
         }
     };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("starting the async runtime")?;
+    runtime.block_on(serve(config, platform))
+}
+
+/// Serve `platform` as `config` says, until Ctrl-C.
+async fn serve(config: Config, platform: Platform) -> Result<()> {
     let size = platform.geometry.size()?;
-    info!("the desktop is {size}; andris has no SPICE server yet, so it exits");
+    info!("the desktop is {size}");
+    let tls = match &config.tls {
+        Some(tls) => Some(TlsOptions {
+            listen: tls.listen,
+            config: server::tls::load_server_config(&tls.cert, &tls.key)?,
+        }),
+        None => None,
+    };
+    let options = ServerOptions {
+        listen: config.listen,
+        tls,
+        ticket: config.ticket,
+        frame_interval: config.frame_interval,
+    };
+    let handle = Server::bind(options, platform).await?.spawn()?;
+    tokio::signal::ctrl_c()
+        .await
+        .context("waiting for Ctrl-C")?;
+    info!("Ctrl-C: shutting down");
+    handle.shutdown();
     Ok(())
 }
 

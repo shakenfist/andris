@@ -99,6 +99,20 @@ pub enum PlatformConfig {
 pub struct Ticket(Vec<u8>);
 
 impl Ticket {
+    /// A ticket of `bytes`, which must be 1 to [`MAX_TICKET_LEN`] bytes
+    /// long. `--ticket-file` is read with [`read_ticket_file`]; this is
+    /// for embedding andris, and for tests.
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Result<Self> {
+        let bytes = bytes.into();
+        if bytes.is_empty() || bytes.len() > MAX_TICKET_LEN {
+            bail!(
+                "a ticket must be 1 to {MAX_TICKET_LEN} bytes long, not {}",
+                bytes.len()
+            );
+        }
+        Ok(Self(bytes))
+    }
+
     /// The ticket's bytes, as a client must present them.
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
@@ -470,6 +484,14 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(message.contains("--frame-interval-ms"), "{message}");
+    }
+
+    #[test]
+    fn ticket_new_checks_length() {
+        assert_eq!(Ticket::new("secret").unwrap().as_bytes(), b"secret");
+        assert!(Ticket::new("").is_err());
+        assert!(Ticket::new(vec![b'x'; MAX_TICKET_LEN]).is_ok());
+        assert!(Ticket::new(vec![b'x'; MAX_TICKET_LEN + 1]).is_err());
     }
 
     #[test]

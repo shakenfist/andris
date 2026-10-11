@@ -13,8 +13,15 @@
 //! sequence (`E1 1D 45` to press, `E1 9D C5` to release); decoding it
 //! as plain bytes would press Ctrl and toggle Num Lock instead.
 //!
-//! A code with no mapping is dropped, with a warning logged once per code
-//! for each decoder.
+//! Keyboards wrap some extended keys, such as Print Screen and the
+//! navigation keys, in "fake shifts": `E0 2A` or `E0 36` before the key
+//! and `E0 AA` or `E0 B6` after it, depending on the Shift and Num Lock
+//! state. Clients that pass hardware scancodes through, such as
+//! spice-gtk, can send them. They are dropped without a warning, since
+//! the shift keys themselves arrive unprefixed.
+//!
+//! Any other code with no mapping is dropped, with a warning logged once
+//! per code for each decoder.
 
 use std::collections::HashSet;
 
@@ -28,6 +35,8 @@ const PREFIX_E0: u8 = 0xE0;
 const PREFIX_E1: u8 = 0xE1;
 /// The break (release) bit.
 const BREAK: u8 = 0x80;
+/// The fake left and right shifts, which follow `0xE0`.
+const FAKE_SHIFTS: [u8; 2] = [0x2A, 0x36];
 
 /// `KEY_PAUSE`.
 const KEY_PAUSE: EvdevCode = EvdevCode(119);
@@ -156,6 +165,9 @@ impl KeyDecoder {
             Prefix::E0 => {
                 self.prefix = Prefix::None;
                 let code = byte & !BREAK;
+                if FAKE_SHIFTS.contains(&code) {
+                    return None;
+                }
                 match extended_to_evdev(code) {
                     Some(evdev) => Some(KeyStroke {
                         code: evdev,
@@ -330,9 +342,24 @@ mod tests {
         assert_eq!(decoder.logged.len(), 1);
         // An extended code with no mapping, then a mapped one: only the
         // unmapped one is dropped, and the prefix does not linger.
-        assert_eq!(decoder.bytes(&[0xE0, 0x2A, 0x1E]), vec![press(30)]);
+        assert_eq!(decoder.bytes(&[0xE0, 0x10, 0x1E]), vec![press(30)]);
         assert_eq!(decoder.logged.len(), 2);
-        assert!(decoder.logged.contains(&0xE02A));
+        assert!(decoder.logged.contains(&0xE010));
+    }
+
+    #[test]
+    fn fake_shifts_are_dropped_silently() {
+        let mut decoder = KeyDecoder::new();
+        // Print Screen as a keyboard sends it, wrapped in a fake left shift.
+        assert_eq!(decoder.bytes(&[0xE0, 0x2A, 0xE0, 0x37]), vec![press(99)]);
+        assert_eq!(decoder.bytes(&[0xE0, 0xB7, 0xE0, 0xAA]), vec![release(99)]);
+        // Home with Num Lock on and right shift held: a fake right shift
+        // release before it and press after, around the real right shift.
+        assert_eq!(
+            decoder.bytes(&[0x36, 0xE0, 0xB6, 0xE0, 0x47, 0xE0, 0xC7, 0xE0, 0x36, 0xB6]),
+            vec![press(54), press(102), release(102), release(54)]
+        );
+        assert!(decoder.logged.is_empty(), "logged {:?}", decoder.logged);
     }
 
     #[test]

@@ -1382,6 +1382,32 @@ in andris:
   each shape change.
 - **The keymap** is read once at startup, so a later `setxkbmap` is not
   seen.
+- **Server mouse mode** gets no pointer position, because andris sends
+  no `CURSOR_MOVE`. docs/running.md says so, and the master plan's
+  Future work carries the fix.
+
+**CI and review on andris#7.**
+
+- `cargo deny` and `cargo audit` both failed on the new dependencies.
+  The fixes:
+  - PEM is now parsed with rustls-pki-types;
+  - the ryll git dependencies carry a version;
+  - the `rsa` and `rustls-pemfile` advisories are ignored with a
+    rationale, in `deny.toml` and in `.cargo/audit.toml`, which
+    mirrors it.
+- The automated review gave one document item and five consider items.
+  - **Taken, as defects in this phase's code:**
+    - On Ctrl-C, `ServerHandle::stop` waits up to five seconds for
+      every connection task to end and for the input sink to apply
+      the releases.
+    - A failed size read no longer closes the inputs channel.
+    - E0 fake shifts are dropped without a warning.
+    - Private files are opened with `O_NONBLOCK`, which replaces the
+      check-then-open pre-check.
+    - The server mouse mode limit is documented.
+  - **Declined:** e2e coverage of the X11 pointer and lock paths, now
+    in the master plan's Future work.
+  - Mutation checks confirm the new tests fail without each fix.
 
 The pull request and its merge commit are recorded below once known.
 

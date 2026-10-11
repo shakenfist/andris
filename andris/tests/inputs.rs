@@ -327,6 +327,36 @@ async fn positions_are_clamped_to_the_desktop() {
 }
 
 #[tokio::test]
+async fn a_failed_size_read_keeps_the_last_size() {
+    let server = TestServer::start().await;
+    let (_main, mut inputs, _) = open_inputs(&server).await;
+
+    // Due for a read, which fails: the clamp keeps the size it had.
+    server.platform.fail_size_reads(1).unwrap();
+    tokio::time::sleep(GEOMETRY_MAX_AGE + Duration::from_millis(50)).await;
+    send_position(&mut inputs, 1000, 1000, 0).await;
+    assert_eq!(
+        settle(&server, &mut inputs).await,
+        vec![InputEvent::PointerAbsolute { x: 255, y: 191 }]
+    );
+
+    // The next read works, and finds the new size.
+    server
+        .platform
+        .set_size(Size {
+            width: 320,
+            height: 200,
+        })
+        .unwrap();
+    tokio::time::sleep(GEOMETRY_MAX_AGE + Duration::from_millis(50)).await;
+    send_position(&mut inputs, 1000, 1000, 0).await;
+    assert_eq!(
+        settle(&server, &mut inputs).await,
+        vec![InputEvent::PointerAbsolute { x: 319, y: 199 }]
+    );
+}
+
+#[tokio::test]
 async fn a_position_on_another_display_is_ignored() {
     let server = TestServer::start().await;
     let (_main, mut inputs, _) = open_inputs(&server).await;
@@ -450,6 +480,36 @@ async fn closing_the_channel_releases_held_keys_and_buttons() {
         vec![key(30, false), button(Button::Left, false)],
         "only what was still held is released"
     );
+}
+
+#[tokio::test]
+async fn stopping_the_server_waits_for_held_input_to_be_released() {
+    let mut server = TestServer::start().await;
+    let (_main, mut inputs, _) = open_inputs(&server).await;
+
+    send_key(&mut inputs, inputs_client::KEY_DOWN, 0x1E).await;
+    send_button(
+        &mut inputs,
+        inputs_client::MOUSE_PRESS,
+        mouse_button_id::MIDDLE,
+    )
+    .await;
+    settle(&server, &mut inputs).await;
+
+    // As on Ctrl-C: the client is still connected, and the process exits
+    // as soon as stop returns, so the releases must be in by then.
+    assert!(server.handle.stop(WAIT).await, "stop did not finish");
+    assert_eq!(
+        server.platform.take_input_events().unwrap(),
+        vec![key(30, false), button(Button::Middle, false)]
+    );
+    inputs.expect_closed().await;
+}
+
+#[tokio::test]
+async fn stopping_an_idle_server_returns_at_once() {
+    let mut server = TestServer::start().await;
+    assert!(server.handle.stop(Duration::from_secs(1)).await);
 }
 
 #[tokio::test]

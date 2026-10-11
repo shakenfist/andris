@@ -13,13 +13,13 @@ pub mod platform;
 pub mod server;
 
 use anyhow::{Context, Result};
-use tracing::info;
+use tracing::{info, warn};
 
 use config::{Config, PlatformConfig};
 use platform::Platform;
 use platform::synthetic::SyntheticPlatform;
 use platform::x11::X11Platform;
-use server::{HandshakeTimeouts, Server, ServerOptions, TlsOptions};
+use server::{HandshakeTimeouts, STOP_GRACE, Server, ServerOptions, TlsOptions};
 
 /// Andris's name and version, as `--version` prints them.
 pub fn banner() -> String {
@@ -64,12 +64,18 @@ async fn serve(config: Config, platform: Platform) -> Result<()> {
         frame_interval: config.frame_interval,
         timeouts: HandshakeTimeouts::default(),
     };
-    let handle = Server::bind(options, platform).await?.spawn()?;
+    let mut handle = Server::bind(options, platform).await?.spawn()?;
     tokio::signal::ctrl_c()
         .await
         .context("waiting for Ctrl-C")?;
     info!("Ctrl-C: shutting down");
-    handle.shutdown();
+    if !handle.stop(STOP_GRACE).await {
+        warn!(
+            "connections were still closing after {}s; keys or buttons held on the desktop \
+             may not have been released",
+            STOP_GRACE.as_secs()
+        );
+    }
     Ok(())
 }
 

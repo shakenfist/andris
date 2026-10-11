@@ -17,7 +17,9 @@
 //!
 //! Each listener runs one accept task. Each accepted connection gets one
 //! task, which links and authenticates it and then serves the channel,
-//! owning its socket throughout.
+//! owning its socket throughout. Every one of these tasks holds a clone of
+//! one [`mpsc::Sender`], so [`ServerHandle::stop`] knows they have all
+//! ended when its receiver closes.
 //!
 //! # Limits on unauthenticated peers
 //!
@@ -52,7 +54,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use shakenfist_spice_protocol::link::{SpiceStream, read_link_mess, send_need_secured};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
 use tracing::{debug, info, warn};
@@ -89,6 +91,14 @@ pub const MAX_KEY_GENERATIONS: usize = 2;
 /// How long to pause after a failed accept, so that running out of file
 /// descriptors does not become a busy loop.
 const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(100);
+
+/// How long `andris` waits, on Ctrl-C, for [`ServerHandle::stop`]: for
+/// connections to close and the input they release to reach the desktop.
+pub const STOP_GRACE: Duration = Duration::from_secs(5);
+
+/// Held by every accept and connection task; see the module's Tasks
+/// section. Nothing is ever sent on it.
+type TaskMarker = mpsc::Sender<()>;
 
 /// The TLS listener.
 #[derive(Clone)]
@@ -297,6 +307,7 @@ impl Server {
 
     /// Start accepting connections.
     pub fn spawn(self) -> Result<ServerHandle> {
+        let (marker, tasks) = mpsc::channel(1);
         let plain_addr = self
             .plain
             .local_addr()
@@ -311,6 +322,7 @@ impl Server {
                     listener,
                     ListenerKind::Tls(acceptor),
                     self.shared.clone(),
+                    marker.clone(),
                 ));
                 (ListenerKind::Redirect, Some(addr))
             }
@@ -321,11 +333,17 @@ impl Server {
         } else {
             info!(addr = %plain_addr, "plain listener ready");
         }
-        tokio::spawn(accept_loop(self.plain, plain_kind, self.shared.clone()));
+        tokio::spawn(accept_loop(
+            self.plain,
+            plain_kind,
+            self.shared.clone(),
+            marker,
+        ));
         Ok(ServerHandle {
             plain_addr,
             tls_addr,
             shared: self.shared,
+            tasks,
         })
     }
 }
@@ -335,6 +353,8 @@ pub struct ServerHandle {
     plain_addr: SocketAddr,
     tls_addr: Option<SocketAddr>,
     shared: Arc<Shared>,
+    /// Closes once every accept and connection task has ended.
+    tasks: mpsc::Receiver<()>,
 }
 
 impl ServerHandle {
@@ -375,6 +395,35 @@ impl ServerHandle {
     pub fn shutdown(&self) {
         self.shared.shutdown.cancel();
         self.shared.registry.close();
+    }
+
+    /// Shut down, then wait at most `grace` for every connection to
+    /// close and for the input their channels released to reach the
+    /// desktop. Returns whether that finished in time.
+    ///
+    /// A process that exits straight after [`ServerHandle::shutdown`]
+    /// can lose those releases, which are only queued, and XTEST does
+    /// not release what a departing client holds: a key held at Ctrl-C
+    /// would stay held on the desktop.
+    pub async fn stop(&mut self, grace: Duration) -> bool {
+        self.shutdown();
+        let input = self.shared.platform.input.clone();
+        let tasks = &mut self.tasks;
+        let stopped = async move {
+            // Nothing is sent, so this returns once every sender is gone.
+            let _ = tasks.recv().await;
+            // The lock state is read after every event already queued has
+            // been applied, so reading it waits for the releases.
+            match tokio::task::spawn_blocking(move || input.lock_state()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => debug!(
+                    error = format!("{e:#}"),
+                    "could not confirm the desktop took the released input"
+                ),
+                Err(e) => debug!(error = %e, "waiting for released input failed"),
+            }
+        };
+        tokio::time::timeout(grace, stopped).await.is_ok()
     }
 }
 
@@ -422,7 +471,12 @@ fn admit(shared: &Shared, kind: &ListenerKind, peer: SocketAddr) -> Option<Hands
 }
 
 /// Accept connections until shutdown, each in its own task.
-async fn accept_loop(listener: TcpListener, kind: ListenerKind, shared: Arc<Shared>) {
+async fn accept_loop(
+    listener: TcpListener,
+    kind: ListenerKind,
+    shared: Arc<Shared>,
+    marker: TaskMarker,
+) {
     loop {
         let accepted = tokio::select! {
             biased;
@@ -447,19 +501,21 @@ async fn accept_loop(listener: TcpListener, kind: ListenerKind, shared: Arc<Shar
             kind.clone(),
             shared.clone(),
             slot,
+            marker.clone(),
         ));
     }
     debug!("listener closed");
 }
 
 /// Serve one accepted connection. `slot` is released when the handshake
-/// ends, whatever its result.
+/// ends, whatever its result; `_marker` when the connection ends.
 async fn handle_connection(
     mut tcp: TcpStream,
     peer: SocketAddr,
     kind: ListenerKind,
     shared: Arc<Shared>,
     slot: HandshakeSlot,
+    _marker: TaskMarker,
 ) {
     if let Err(e) = tcp.set_nodelay(true) {
         debug!(%peer, error = %e, "setting TCP_NODELAY failed");

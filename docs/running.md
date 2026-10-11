@@ -45,7 +45,10 @@ andris --ticket-file PATH [options]
 
 `andris --help` prints the same list. Logs go to stderr at `info`
 level; set `RUST_LOG` (for example `RUST_LOG=andris=debug`) to
-change that. Ctrl-C (SIGINT) shuts andris down.
+change that. Ctrl-C (SIGINT) shuts andris down. It closes the client's
+connections, releases any key or mouse button the client still held,
+and waits up to five seconds for the desktop to take those releases
+before it exits, so nothing is left held down on the desktop.
 
 Options are checked together before anything starts, and each error
 names the option at fault and how to fix it. The three TLS options go
@@ -200,6 +203,12 @@ sends absolute positions and draws the pointer itself. A client may
 ask for server mode, in which it sends relative motion. Andris applies
 absolute positions only in client mode and relative motion only in
 server mode.
+
+Server mode moves the desktop's pointer, but andris does not yet tell
+the client where that pointer is: it sends no `CURSOR_MOVE`, and every
+cursor shape carries position (0, 0). A client in server mode that
+draws the pointer from the server's reports, as spice-gtk does, draws
+it in the wrong place. Use client mode, which ryll uses.
 
 ### Not supported
 

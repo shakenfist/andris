@@ -3,7 +3,7 @@
 use std::fs::File;
 use std::io::Read;
 use std::net::SocketAddr;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -202,14 +202,14 @@ impl Args {
 /// are made on the open file, so the file read is the file checked.
 pub fn open_private_file(path: &Path, option: &str) -> Result<File> {
     let shown = path.display().to_string();
-    // Refuse a FIFO or device before opening it, since opening one can
-    // block. This check is only that: the one that counts is below.
-    let named =
-        std::fs::metadata(path).with_context(|| format!("{option} {shown} cannot be read"))?;
-    if !named.is_file() {
-        bail!("{option} {shown} is not a regular file");
-    }
-    let file = File::open(path).with_context(|| format!("{option} {shown} cannot be read"))?;
+    // O_NONBLOCK, so that opening a FIFO with no writer cannot block
+    // startup; the type check below then refuses it. Reads of a regular
+    // file ignore the flag.
+    let file = File::options()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("{option} {shown} cannot be read"))?;
     let metadata = file
         .metadata()
         .with_context(|| format!("{option} {shown} cannot be read"))?;
@@ -520,6 +520,27 @@ mod tests {
         // A directory is not a regular file.
         let dir = tempfile::tempdir().unwrap();
         let message = format!("{:#}", read_ticket_file(dir.path()).unwrap_err());
+        assert!(message.contains("not a regular file"), "{message}");
+    }
+
+    #[test]
+    fn a_fifo_is_refused_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("ticket");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        // In a thread, so that a blocking open fails the test rather
+        // than hanging it.
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(format!("{:#}", read_ticket_file(&fifo).unwrap_err()));
+        });
+        let message = result
+            .recv_timeout(Duration::from_secs(5))
+            .expect("opening the FIFO blocked");
         assert!(message.contains("not a regular file"), "{message}");
     }
 

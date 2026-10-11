@@ -69,6 +69,8 @@ struct State {
     locks: LockState,
     /// How many of the next captures fail.
     failing_captures: u32,
+    /// How many of the next size reads fail.
+    failing_size_reads: u32,
 }
 
 /// The synthetic platform. Create it with [`SyntheticPlatform::new`] and
@@ -93,6 +95,7 @@ impl SyntheticPlatform {
                 square_x: 0,
                 locks: LockState::default(),
                 failing_captures: 0,
+                failing_size_reads: 0,
             }),
             events: Mutex::new(VecDeque::new()),
             cursor: watch::Sender::new(Some(Arc::new(default_cursor()))),
@@ -161,6 +164,15 @@ impl SyntheticPlatform {
         Ok(())
     }
 
+    /// Make the next `count` size reads fail, as a read of a desktop
+    /// being resized can. The failures are not [`Gone`].
+    ///
+    /// [`Gone`]: super::Gone
+    pub fn fail_size_reads(&self, count: u32) -> Result<()> {
+        self.state()?.failing_size_reads = count;
+        Ok(())
+    }
+
     /// Set the lock state directly, as if changed from outside andris.
     pub fn force_lock_state(&self, locks: LockState) -> Result<()> {
         self.state()?.locks = locks;
@@ -187,7 +199,12 @@ impl SyntheticPlatform {
 
 impl DisplayGeometry for SyntheticPlatform {
     fn size(&self) -> Result<Size> {
-        Ok(self.state()?.size)
+        let mut state = self.state()?;
+        if state.failing_size_reads > 0 {
+            state.failing_size_reads -= 1;
+            bail!("a synthetic size read failure");
+        }
+        Ok(state.size)
     }
 }
 
@@ -436,6 +453,17 @@ mod tests {
             assert!(!crate::platform::is_gone(&error));
         }
         assert_eq!(platform.capture().unwrap().size(), SIZE);
+    }
+
+    #[test]
+    fn fail_size_reads_fails_that_many() {
+        let platform = SyntheticPlatform::new(SIZE).unwrap();
+        platform.fail_size_reads(2).unwrap();
+        for _ in 0..2 {
+            let error = platform.size().unwrap_err();
+            assert!(!crate::platform::is_gone(&error));
+        }
+        assert_eq!(platform.size().unwrap(), SIZE);
     }
 
     #[test]

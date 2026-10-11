@@ -486,6 +486,15 @@ file) and keep its status in step with the Execution table.
   beside the encoder's tables, so that encode and decode can be tested
   against each other.
 - A side-by-side comparison against Xspice as a baseline.
+- Pointer position for server mouse mode: send `CURSOR_MOVE`, and the
+  real position in `CURSOR_INIT` and `CURSOR_SET`, so that a client in
+  server mode draws the pointer where the desktop has it. Phase 4
+  advertises server mode and applies relative motion, but reports no
+  position.
+- End-to-end coverage of the X11 pointer and lock-state paths (XTEST
+  motion and buttons, XKB indicators) against Xvfb. Phase 4's `make
+  e2e` drives only frames and keys, because ryll's control socket has
+  no mouse verbs; a test could drive `X11Platform` directly.
 
 ### Bugs fixed during this work
 

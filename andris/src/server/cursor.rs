@@ -16,7 +16,9 @@
 //! `CURSOR_INIT` and `CURSOR_SET` also carry a position and visibility.
 //! The position is always (0, 0), spice-server's default, because in
 //! client mouse mode the client draws the pointer where its own mouse is,
-//! and andris sends no `CURSOR_MOVE`. A message with a shape says the
+//! and andris sends no `CURSOR_MOVE`. So a client in server mouse mode,
+//! which relies on the server for the pointer's position, is not told it;
+//! docs/running.md says so. A message with a shape says the
 //! cursor is visible. One that the platform says has no shape says it is
 //! not, because a client keeps the shape it had when the cursor it is
 //! sent has none.

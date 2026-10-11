@@ -58,13 +58,13 @@ use shakenfist_spice_protocol::messages::{
     InputsInit, KeyEvent, KeyModifiers, KeyScancode, MouseButton, MouseMotion, MousePosition,
     ReceivedMessage, WireType,
 };
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::channel::{ChannelConn, ChannelContext};
 use super::keymap::{KeyDecoder, KeyStroke};
 use super::opcodes::InputsOpcode;
 use super::session::MouseMode;
-use crate::platform::{Button, EvdevCode, InputEvent, InputSink, LockState, Size};
+use crate::platform::{self, Button, EvdevCode, InputEvent, InputSink, LockState, Size};
 
 /// How many motion and position messages each `MOUSE_MOTION_ACK`
 /// answers, as spice-server and ryll agree.
@@ -93,6 +93,7 @@ pub async fn run(ctx: ChannelContext, mut conn: ChannelConn<InputsOpcode>) -> Re
         keys: KeyDecoder::new(),
         size,
         size_read: Instant::now(),
+        size_failing: false,
         motions: 0,
         logged: HashSet::new(),
         ctx,
@@ -269,9 +270,11 @@ struct Inputs {
     ctx: ChannelContext,
     held: HeldInput,
     keys: KeyDecoder,
-    /// The desktop's size as last read, and when.
+    /// The desktop's size as last read, and when it was last read or
+    /// tried; and whether the last read failed.
     size: Size,
     size_read: Instant,
+    size_failing: bool,
     /// Motion and position messages since the last `MOUSE_MOTION_ACK`.
     motions: u32,
     logged: HashSet<Once>,
@@ -370,13 +373,44 @@ impl Inputs {
             return Ok(());
         }
         if self.size_read.elapsed() >= GEOMETRY_MAX_AGE {
-            self.size = read_size(&self.ctx).await?;
-            self.size_read = Instant::now();
+            self.refresh_size().await?;
         }
         // Size::check holds both sides to at least 1.
         let x = position.x.min(self.size.width.saturating_sub(1));
         let y = position.y.min(self.size.height.saturating_sub(1));
         self.held.pointer(InputEvent::PointerAbsolute { x, y })
+    }
+
+    /// Read the desktop's size again. A failed read, as during a
+    /// resize, keeps the size last read, as the display channel skips a
+    /// failed capture; only a desktop that has gone closes the channel.
+    async fn refresh_size(&mut self) -> Result<()> {
+        self.size_read = Instant::now();
+        match read_size(&self.ctx).await {
+            Ok(size) => {
+                if self.size_failing {
+                    self.size_failing = false;
+                    info!(
+                        session = self.ctx.session.id(),
+                        "reading the desktop's size works again"
+                    );
+                }
+                self.size = size;
+            }
+            Err(e) if platform::is_gone(&e) => return Err(e),
+            Err(e) => {
+                if !self.size_failing {
+                    self.size_failing = true;
+                    warn!(
+                        session = self.ctx.session.id(),
+                        error = format!("{e:#}"),
+                        "reading the desktop's size failed; pointer positions are clamped to \
+                         the size last read until it works"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     fn motion(&mut self, motion: MouseMotion) -> Result<()> {

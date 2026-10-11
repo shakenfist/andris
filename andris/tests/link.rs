@@ -255,6 +255,23 @@ async fn still_serves(server: &TestServer) {
 }
 
 #[tokio::test]
+async fn stop_waits_for_a_connection_still_in_its_handshake() {
+    let mut server = TestServer::start().await;
+
+    // A connection that sends nothing stays in its handshake until the
+    // first-stage time limit, seconds away; stop must wait for it.
+    let _silent = TcpStream::connect(server.addr()).await.unwrap();
+    wait_until("the handshake has started", || {
+        server.handle.handshakes_available() == MAX_HANDSHAKES - 1
+    })
+    .await;
+    assert!(
+        !server.handle.stop(Duration::from_millis(200)).await,
+        "stop returned while a connection was still open"
+    );
+}
+
+#[tokio::test]
 async fn ninth_concurrent_handshake_is_refused() {
     let server = TestServer::start().await;
 

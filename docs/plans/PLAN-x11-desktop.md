@@ -298,7 +298,8 @@ The first usable server, as one pull request built up in steps:
   sets listed under Situation;
 - the main channel (`INIT`, channel list, mouse mode);
 - a display channel with one primary surface the size of the root
-  window, sending full-frame LZ4 `DRAW_COPY` updates on a timer;
+  window, sending LZ4 `DRAW_COPY` updates on a timer, in bands, only
+  for the bands that changed;
 - an inputs channel that maps PC scancodes to X keycodes and
   injects keys and pointer events through XTest. The keycodes are
   looked up by XKB key name from the attached server, because the
@@ -481,6 +482,9 @@ file) and keep its status in step with the Execution table.
 - VA-API H.264 encode; multi-monitor; the record channel
   (microphone); usbredir and webdav; several simultaneous viewers.
 - Kerbside L2 inspection reusing the phase 2 wire types.
+- Move andris's set-1 scancode decoder into ryll's protocol crate,
+  beside the encoder's tables, so that encode and decode can be tested
+  against each other.
 - A side-by-side comparison against Xspice as a baseline.
 
 ### Bugs fixed during this work

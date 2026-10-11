@@ -620,17 +620,17 @@ diff.
 
 | Step | Effort | Model | Isolation | Status | Brief for sub-agent |
 |------|--------|-------|-----------|--------|---------------------|
-| 0 | low | management | none | Not started | Commit the close-out and this plan; remove the phase 3 worktree. See brief 0. |
-| 1 | high | opus | none | Not started | Dependencies, devcontainer, `deny.toml`, the lib/bin split, the CLI and ticket file, the platform traits and the synthetic platform. Gated. See brief 1. |
-| 2 | high | opus | none | Not started | Listeners, TLS, link and auth, sessions, channel framing, opcode enums, acks; the in-process test client. Gated. See brief 2. |
-| 3 | medium | sonnet | none | Not started | The main channel. See brief 3. |
-| 4 | high | opus | none | Not started | The display channel and band encoding. See brief 4. |
-| 5 | high | opus | none | Not started | The inputs and cursor channels. See brief 5. |
-| 6 | high | opus | none | Not started | The X11 backend. See brief 6. |
-| 7 | high | opus | none | Not started | `make e2e` against Xvfb and ryll headless, and its CI job. See brief 7. |
-| 8 | medium | sonnet | none | Not started | Documentation. See brief 8. |
-| 9 | medium | management | none | Not started | The kerbside smoke test. See brief 9. |
-| 10 | medium | management | none | Not started | Push audit, pull request, queue. See brief 10. |
+| 0 | low | management | none | Complete | Commit the close-out and this plan; remove the phase 3 worktree. See brief 0. |
+| 1 | high | opus | none | Complete | Dependencies, devcontainer, `deny.toml`, the lib/bin split, the CLI and ticket file, the platform traits and the synthetic platform. Gated. See brief 1. |
+| 2 | high | opus | none | Complete | Listeners, TLS, link and auth, sessions, channel framing, opcode enums, acks; the in-process test client. Gated. See brief 2. |
+| 3 | medium | sonnet | none | Complete | The main channel. See brief 3. |
+| 4 | high | opus | none | Complete | The display channel and band encoding. See brief 4. |
+| 5 | high | opus | none | Complete | The inputs and cursor channels. See brief 5. |
+| 6 | high | opus | none | Complete | The X11 backend. See brief 6. |
+| 7 | high | opus | none | Complete | `make e2e` against Xvfb and ryll headless, and its CI job. See brief 7. |
+| 8 | medium | sonnet | none | Complete | Documentation. See brief 8. |
+| 9 | medium | management | none | Complete | The kerbside smoke test. See brief 9. |
+| 10 | medium | management | none | In progress | Push audit, pull request, queue. See brief 10. |
 
 Steps 1 and 2 are gated (see the back brief) because their shape is
 cheap to propose and expensive to change once four channels sit on
@@ -1201,6 +1201,55 @@ Commit subject: `Document running andris.`
 5. Record the merge commit in the Result section. Phase 5's planning
    commit fills in the master plan's `Merged` cell.
 
+## Departures from the briefs
+
+Each was reviewed when its step was committed, and each commit
+message says why.
+
+- **Step 1.** `platform/` carries no ryll types: the design note's
+  `Frame::rows() -> Bgrx` was dropped at review, and `server/frames.rs`
+  builds the `Bgrx`. Only the compression crate's size limits are
+  imported, as plain constants.
+- **Step 2.**
+  - At most eight handshakes run at once, so an unauthenticated flood
+    cannot spend unbounded CPU on key generation. This was added at
+    design review.
+  - A main link's session begins after the ticket checks out but before
+    `Ok` is sent, so a client that hears `Ok` always finds its session.
+- **Step 4.**
+  - The surface's size comes from the captured frame, not a separate
+    geometry read, which closes a resize race.
+  - Every display message waits for ack-window room, not only bands.
+  - A compression preference that arrives after `INIT` applies from the
+    next frame.
+- **Step 5.**
+  - Pointer messages apply only in their own mouse mode, as spice-server
+    does: positions in client mode, motion in server mode. Brief 5 had
+    asked for positions to be honoured in server mode as well; that was
+    changed to follow spice-server.
+  - Pause (`E1 1D 45`) is decoded.
+  - A lock key the client holds is left alone by `KEY_MODIFIERS`.
+  - "No cursor" is sent as hidden, because ryll keeps the previous image
+    otherwise.
+- **Step 6.**
+  - A startup check of the visual's colour masks was added.
+  - The cursor thread is woken on shutdown with a `ClientMessage` rather
+    than left blocked.
+  - XKB key names above keycode 255 are skipped, since X cannot carry
+    them.
+- **Step 7.**
+  - The end-to-end test found that ryll never opens a channel listed
+    after inputs (ryll#509), so andris lists inputs last (`f4e5098`).
+  - The devcontainer has `x11-utils`, not `x11-xserver-utils`.
+  - `make ryll-headless` builds in its own isolated container rather
+    than under `DOCKER_RUN`, because it compiles with the network up.
+- **Step 9.** This used kerbside's demo compose stack, with andris in
+  QEMU's place in the kerbside container's network namespace, rather
+  than the direct-qemu scripts, which need a host MariaDB. Kerbside and
+  kerbside-proxy 0.6.0 came from PyPI, because a worktree's `.git` file
+  cannot be read inside the image build that installs from the
+  checkout.
+
 ## Risks and mitigations
 
 | Risk | Mitigation |
@@ -1246,7 +1295,95 @@ Commit subject: `Document running andris.`
 
 ## Result
 
-Not yet run.
+Andris pins ryll at `502199e`.
+
+**The kerbside smoke test** (step 9) ran on 2026-10-11:
+
+- **Stack.** Kerbside's demo stack (MariaDB, kerbside 0.6.0 and
+  kerbside-proxy 0.6.0 from PyPI) was set up with a static console.
+  Andris ran on Xvfb in the kerbside container's network namespace, on
+  127.0.0.1:5910.
+- **Client.** Ryll headless (the pinned build) used a `.vv` from
+  `get-console.sh`. Its results:
+  - It connected main, display, cursor and inputs through the proxy.
+  - Its control socket showed a 1024x768 surface.
+  - A PNG screenshot came back.
+  - `send_key` was accepted.
+- **Kerbside's side.**
+  - It logged "hypervisor connection successful" for every channel of
+    each of three sessions, with no capability warning.
+  - The firewall was in `enforce` mode, and no verdict counter or
+    termination was recorded.
+  - Every relay ended only when ryll exited. Kerbside logged a missing
+    TLS `close_notify` from ryll's side, which is ryll's behaviour, not
+    andris's.
+
+**Measurements:**
+
+- **Idle CPU.** With one client connected and an idle 1024x768 Xvfb,
+  andris and Xvfb together used 1.5-1.6% of one core, at the default
+  200 ms interval. Scaled to `:10`'s 2212x1308, that is about 6%. That
+  is above the master plan's 2% target for a static screen, which is
+  phase 5's XDamage and MIT-SHM work.
+- **The e2e test.** `make ryll-headless` takes about 1.5 minutes cold.
+  `make e2e` takes about 5 seconds warm.
+
+**The push audit** (step 10):
+
+- **Wave 1** passed.
+- **Style** passed.
+- **Wave 2** found nothing blocking. These were fixed:
+  - **Security (`5aa2109`):**
+    - handshake slots per address and a 3-second first stage;
+    - a delay after a wrong ticket, with the peer logged;
+    - a cap on concurrent key generation;
+    - a bounded X11 input queue with a reserve for releases;
+    - one channel of each type per session;
+    - ticket and TLS key files checked through one open handle and
+      owned by andris's user;
+    - a safer ticket recipe;
+    - a narrower ryll build mount.
+  - **Tests (`5aa2109`):** adversarial link tests, oversized messages on
+    every channel, and CLI refusals through the binary.
+  - **Code quality:** a failed capture skips a tick instead of ending
+    the display channel; the ticket comparison; duplicated helpers; a
+    narrowing cast; and the X11 module was split.
+  - **Documentation:** this section, the step statuses and three small
+    corrections.
+
+**Declined in the audit:**
+
+- **Peak memory of a complete frame.** All bands are encoded before
+  any is sent, about 33 MB for a 4K desktop. Phase 5 replaces
+  whole-frame capture with damage, which changes this anyway.
+- **Moving the scancode decoder into ryll's protocol crate**, so that
+  encode and decode can be tested together. Recorded under the master
+  plan's Future work.
+- **The quadratic receive-buffer drain.** It is ryll's `take_message`,
+  filed as ryll#510.
+- **Shortening the display and cursor module docs.** They explain
+  behaviour that the code cannot show, and `docs/running.md` has the
+  operator's view.
+
+**Ryll issues this phase filed or relies on.** Each is worked around
+in andris:
+
+- ryll#499: openh264 is unconditional;
+- ryll#502: ATTACH_CHANNELS waits for a ping;
+- ryll#503: inputs and cursor caps and the surface PRIMARY flag are
+  unnamed;
+- ryll#509: channels after inputs are never opened;
+- ryll#510: `take_message` is quadratic.
+
+**Left for later phases:**
+
+- **The `CURSOR_SET` position** is always (0, 0). XFixes reports the
+  pointer's position too. Ryll's web frontend may jump the pointer on
+  each shape change.
+- **The keymap** is read once at startup, so a later `setxkbmap` is not
+  seen.
+
+The pull request and its merge commit are recorded below once known.
 
 ## Back brief
 

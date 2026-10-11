@@ -54,3 +54,7 @@ shakenfist-spice-compression = { version = "0.1.7", git = "https://github.com/sh
     "lz4",
 ] }
 tempfile = "3"
+# X-Resource, so the X11 test can find andris's MIT-SHM segment as another
+# client of the display would, and detach it. Cargo unifies these features
+# with the ones above in test builds.
+x11rb = { version = "0.13", features = ["res"] }

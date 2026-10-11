@@ -12,7 +12,7 @@ use x11rb::protocol::xfixes;
 use x11rb::protocol::xproto::Window;
 use x11rb::rust_connection::RustConnection;
 
-use super::{Fault, create_wake_window, log_lost, x_error};
+use super::{Fault, create_wake_window, is_wake, log_lost, x_error};
 use crate::platform::CursorShape;
 
 /// Set up the cursor connection: make the XFixes handshake, create the
@@ -57,8 +57,9 @@ fn read_cursor(conn: &RustConnection) -> Result<CursorShape, Fault> {
     .map_err(|e| Fault::Failed(e.context("the X server's cursor image is not usable")))
 }
 
-/// Follow cursor changes until woken to stop or the connection fails.
-/// The thread owns the only sender, so its receivers see it stop.
+/// Follow cursor changes until the platform's drop wakes it to stop, or
+/// the connection fails. The thread owns the only sender, so its
+/// receivers see it stop.
 pub(super) fn serve_cursor(
     conn: Arc<RustConnection>,
     wake_window: Window,
@@ -86,8 +87,12 @@ pub(super) fn serve_cursor(
                 Err(Fault::Failed(e)) => Some(e),
             },
             Event::ClientMessage(message) if message.window == wake_window => {
-                debug!("the X11 cursor thread is stopping");
-                return;
+                if is_wake(&message) {
+                    debug!("the X11 cursor thread is stopping");
+                    return;
+                }
+                debug!("ignored a ClientMessage to the cursor thread's wake window");
+                None
             }
             Event::Error(e) => Some(x_error(&e)),
             _ => None,

@@ -4,9 +4,15 @@
 //! Each rectangle is read with MIT-SHM's `ShmGetImage` where that works
 //! (see [`super::shm`]), and with `GetImage` otherwise. Which is used is
 //! decided once, when the thread's [`Capturer`] is built, and logged at
-//! info. Should the segment later need to grow and the server refuse the
-//! larger one, the thread falls back to `GetImage` for good, with a
-//! warning.
+//! info. MIT-SHM can later give way to `GetImage`, for good and with a
+//! warning, in two ways: the segment needs to grow and the server refuses
+//! the larger one, or MIT-SHM captures keep failing. Another client can
+//! `ShmDetach` andris's segment, say, after which every `ShmGetImage`
+//! fails with `BadShmSeg`. After [`SHM_FAILURE_LIMIT`] failed MIT-SHM
+//! captures in a row the thread attaches a fresh segment, once; if that
+//! fails, or the limit is reached again, it switches to `GetImage`. Either
+//! way the capture that reached the limit is retried at once by the new
+//! means, so a dead segment costs a few failed captures, not the display.
 //!
 //! The checks at startup ensured a `ZPixmap` image of the root window is
 //! 32 bits a pixel, LSBFirst, with red, green and blue masks that put the
@@ -37,6 +43,55 @@ pub(super) enum CaptureRequest {
     Capture(Option<Vec<Rectangle>>, SyncSender<Result<Capture>>),
 }
 
+/// How many MIT-SHM captures in a row may fail before the capture thread
+/// gives up on its segment: it attaches a fresh one the first time, and
+/// switches to `GetImage` the second. Well below the display channel's
+/// `MAX_CAPTURE_FAILURES`, so the channel survives both.
+const SHM_FAILURE_LIMIT: u32 = 3;
+
+/// What to do about the MIT-SHM segment after a failed capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShmVerdict {
+    /// Keep the segment; the failure may be one-off.
+    Keep,
+    /// Attach a fresh segment in its place, and retry.
+    Reattach,
+    /// Stop using MIT-SHM, and retry with `GetImage`.
+    GiveUp,
+}
+
+/// Failed MIT-SHM captures, counted to decide when the segment is dead.
+#[derive(Debug, Default)]
+struct ShmFailures {
+    /// Failed captures since the last success or fresh segment.
+    in_a_row: u32,
+    /// Whether a fresh segment has already been attached once.
+    reattached: bool,
+}
+
+impl ShmFailures {
+    /// An MIT-SHM capture worked.
+    fn succeeded(&mut self) {
+        self.in_a_row = 0;
+    }
+
+    /// An MIT-SHM capture failed: what to do now. A fresh segment is
+    /// tried only once in the thread's life, so a segment that keeps
+    /// being taken away ends in `GetImage` rather than a cycle.
+    fn failed(&mut self) -> ShmVerdict {
+        self.in_a_row += 1;
+        if self.in_a_row < SHM_FAILURE_LIMIT {
+            ShmVerdict::Keep
+        } else if self.reattached {
+            ShmVerdict::GiveUp
+        } else {
+            self.reattached = true;
+            self.in_a_row = 0;
+            ShmVerdict::Reattach
+        }
+    }
+}
+
 /// The capture connection, and the MIT-SHM segment attached on it if
 /// MIT-SHM is in use. Dropping it detaches the segment.
 pub(super) struct Capturer {
@@ -45,6 +100,12 @@ pub(super) struct Capturer {
     shm: Option<Segment>,
     /// Whether `shm` is in use, shared with [`super::X11Platform`].
     using_shm: Arc<AtomicBool>,
+    /// Failed MIT-SHM captures, while `shm` is in use.
+    shm_failures: ShmFailures,
+    /// Whether a capture has found the connection gone. Nothing may
+    /// capture after that: [`Segment::capture`] can return `Gone` with
+    /// `ShmGetImage` requests still in flight.
+    gone: bool,
 }
 
 impl Capturer {
@@ -90,12 +151,30 @@ impl Capturer {
             root,
             shm,
             using_shm,
+            shm_failures: ShmFailures::default(),
+            gone: false,
         })
     }
 
     /// Capture `rects`, each clipped to the desktop's size now, or the
-    /// whole desktop for `None`.
+    /// whole desktop for `None`. Must not be called again once it has
+    /// failed with [`Fault::Gone`]; [`serve_capture`] stops instead.
     fn capture(&mut self, rects: Option<&[Rectangle]>) -> Result<Capture, Fault> {
+        debug_assert!(
+            !self.gone,
+            "a capture after the connection has gone could read a segment the server is still \
+             writing"
+        );
+        let captured = self.capture_now(rects);
+        if let Err(Fault::Gone(_)) = captured {
+            self.gone = true;
+        }
+        captured
+    }
+
+    /// [`Capturer::capture`], without the check that the connection has
+    /// not gone.
+    fn capture_now(&mut self, rects: Option<&[Rectangle]>) -> Result<Capture, Fault> {
         let size = root_size(&self.conn, self.root)?;
         let rects: Vec<Rectangle> = match rects {
             None => vec![Rectangle::full(size)],
@@ -105,10 +184,7 @@ impl Capturer {
             Vec::new()
         } else {
             self.fit(size)?;
-            match &self.shm {
-                Some(segment) => segment.capture(&self.conn, self.root, &rects)?,
-                None => get_images(&self.conn, self.root, &rects)?,
-            }
+            self.read(size, &rects)?
         };
         let patches = rects
             .into_iter()
@@ -117,6 +193,76 @@ impl Capturer {
             .collect::<Result<_>>()
             .map_err(Fault::Failed)?;
         Capture::new(size, patches).map_err(Fault::Failed)
+    }
+
+    /// Capture each of `rects`, which lie within a desktop of `size`: with
+    /// MIT-SHM while it is in use, counting its failures, and with
+    /// `GetImage` otherwise. A failure that reaches [`SHM_FAILURE_LIMIT`]
+    /// replaces the segment or gives MIT-SHM up, and the capture is tried
+    /// again by the new means. That happens at most twice, since a fresh
+    /// segment is attached only once and giving up is for good.
+    fn read(&mut self, size: Size, rects: &[Rectangle]) -> Result<Vec<Frame>, Fault> {
+        loop {
+            let Some(segment) = &self.shm else {
+                return get_images(&self.conn, self.root, rects);
+            };
+            let failure = match segment.capture(&self.conn, self.root, rects) {
+                Ok(frames) => {
+                    self.shm_failures.succeeded();
+                    return Ok(frames);
+                }
+                Err(Fault::Gone(e)) => return Err(Fault::Gone(e)),
+                Err(Fault::Failed(e)) => e,
+            };
+            match self.shm_failures.failed() {
+                ShmVerdict::Keep => return Err(Fault::Failed(failure)),
+                ShmVerdict::Reattach => self.reattach(size, &failure)?,
+                ShmVerdict::GiveUp => self.give_up_shm(&failure),
+            }
+        }
+    }
+
+    /// Replace the MIT-SHM segment, after `failure` and those before it,
+    /// with a fresh one for a desktop of `size`. If that cannot be
+    /// attached, give MIT-SHM up.
+    fn reattach(&mut self, size: Size, failure: &anyhow::Error) -> Result<(), Fault> {
+        // Detach the old segment first, so that the two are never
+        // attached at once. If another client detached it already, the
+        // server refuses this, unchecked and harmlessly.
+        if let Some(old) = self.shm.take() {
+            old.detach(&self.conn);
+        }
+        match attach(&self.conn, size) {
+            Ok(segment) => {
+                warn!(
+                    error = format!("{failure:#}"),
+                    "{SHM_FAILURE_LIMIT} MIT-SHM captures in a row failed; attached a fresh \
+                     segment"
+                );
+                self.shm = Some(segment);
+                Ok(())
+            }
+            Err(Fault::Gone(e)) => Err(Fault::Gone(e)),
+            Err(Fault::Failed(e)) => {
+                self.give_up_shm(&e.context(format!(
+                    "attaching a fresh segment, after {SHM_FAILURE_LIMIT} failed MIT-SHM \
+                     captures in a row"
+                )));
+                Ok(())
+            }
+        }
+    }
+
+    /// Stop using MIT-SHM for good, because of `why`.
+    fn give_up_shm(&mut self, why: &anyhow::Error) {
+        if let Some(old) = self.shm.take() {
+            old.detach(&self.conn);
+        }
+        self.using_shm.store(false, Ordering::Relaxed);
+        warn!(
+            error = format!("{why:#}"),
+            "MIT-SHM capture keeps failing; capturing with GetImage from now on"
+        );
     }
 
     /// Make the MIT-SHM segment, if one is in use, large enough for a
@@ -191,6 +337,10 @@ pub(super) fn serve_capture(mut capturer: Capturer, requests: Receiver<CaptureRe
             }
         };
         if let Some(e) = gone {
+            // Stopping here is what makes Segment::capture's early return
+            // on Gone sound: it may leave ShmGetImage requests in flight,
+            // and this drops the Capturer, and so the segment, without
+            // reading it again. Capturer::capture asserts as much.
             log_lost("capture", "capture has stopped", &e);
             return;
         }
@@ -264,6 +414,53 @@ mod tests {
         );
         assert!(x_rect(&Rectangle::new(32768, 0, 1, 1)).is_err());
         assert!(x_rect(&Rectangle::new(0, 0, 65536, 1)).is_err());
+    }
+
+    #[test]
+    fn repeated_shm_failures_reattach_once_then_give_up() {
+        let mut failures = ShmFailures::default();
+        for _ in 1..SHM_FAILURE_LIMIT {
+            assert_eq!(failures.failed(), ShmVerdict::Keep);
+        }
+        assert_eq!(failures.failed(), ShmVerdict::Reattach);
+        // The fresh segment starts a new count.
+        for _ in 1..SHM_FAILURE_LIMIT {
+            assert_eq!(failures.failed(), ShmVerdict::Keep);
+        }
+        assert_eq!(failures.failed(), ShmVerdict::GiveUp);
+    }
+
+    #[test]
+    fn a_success_resets_the_count_but_not_the_reattach() {
+        let mut failures = ShmFailures::default();
+        for _ in 0..10 {
+            for _ in 1..SHM_FAILURE_LIMIT {
+                assert_eq!(failures.failed(), ShmVerdict::Keep);
+            }
+            failures.succeeded();
+        }
+        for _ in 1..SHM_FAILURE_LIMIT {
+            failures.failed();
+        }
+        assert_eq!(failures.failed(), ShmVerdict::Reattach);
+        failures.succeeded();
+        for _ in 1..SHM_FAILURE_LIMIT {
+            assert_eq!(failures.failed(), ShmVerdict::Keep);
+        }
+        assert_eq!(
+            failures.failed(),
+            ShmVerdict::GiveUp,
+            "a segment is replaced only once"
+        );
+    }
+
+    #[test]
+    fn shm_gives_up_well_before_the_display_does() {
+        // Two rounds of failures, the second ending in a retry with
+        // GetImage, must not close the display channel on the way.
+        const {
+            assert!(2 * (SHM_FAILURE_LIMIT - 1) < crate::server::display::MAX_CAPTURE_FAILURES);
+        }
     }
 
     #[test]

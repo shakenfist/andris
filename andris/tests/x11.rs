@@ -1,25 +1,32 @@
-//! The X11 backend against a real X server: damage from a drawing, and
-//! the drawing captured through MIT-SHM and through `GetImage`.
+//! The X11 backend against a real X server: damage from a drawing, the
+//! drawing captured through MIT-SHM and through `GetImage`, and capture
+//! carrying on after another client detaches andris's MIT-SHM segment.
 //!
 //! The X server is named by `ANDRIS_TEST_DISPLAY`. `make e2e` sets it to
 //! its Xvfb, before any window is mapped; with it unset, as under
-//! `make test`, the test passes without doing anything. The display must
-//! be one nothing else draws on while the test runs, and the test leaves
-//! a filled rectangle on its root window.
+//! `make test`, the test says on stderr that it is skipping, and passes
+//! without doing anything. The display must be one nothing else draws on
+//! or attaches MIT-SHM segments to while the test runs, and needs the
+//! X-Resource extension, 1.2 or later. The test leaves a filled rectangle
+//! on its root window.
 
 // Test helpers, where a failed unwrap is a failed test. clippy's
 // allow-unwrap-in-tests covers only #[test] functions themselves.
 #![allow(clippy::unwrap_used)]
 
+use std::io::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 
 use andris::platform::x11::{CaptureMethod, X11Options, X11Platform};
 use andris::platform::{
     Capture, DamageSubscription, DisplayGeometry, Frame, Rectangle, Region, ScreenSource, TILE,
+    is_gone,
 };
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{self, ConnectionExt as _, CreateGCAux, SubwindowMode};
+use x11rb::protocol::{res, shm as xshm};
+use x11rb::rust_connection::RustConnection;
 
 /// Where the test draws. It straddles a tile corner, at (128, 64), so
 /// its damage spans four tiles.
@@ -144,10 +151,87 @@ fn captures(platform: &Arc<X11Platform>, rects: &[Rectangle]) -> (Capture, Captu
     )
 }
 
+/// Every resource on the display, as its XID and its type's name, found
+/// as any other client of the display could: with X-Resource 1.2's
+/// `QueryResourceBytes`, for any resource of any client.
+fn resources(conn: &RustConnection) -> Vec<(u32, String)> {
+    let version = res::query_version(conn, 1, 2).unwrap().reply().unwrap();
+    assert!(
+        (version.server_major, version.server_minor) >= (1, 2),
+        "QueryResourceBytes needs X-Resource 1.2"
+    );
+    let any = res::ResourceIdSpec {
+        resource: 0,
+        type_: 0,
+    };
+    res::query_resource_bytes(conn, 0, &[any])
+        .unwrap()
+        .reply()
+        .unwrap()
+        .sizes
+        .iter()
+        .map(|value| {
+            let spec = value.size.spec;
+            let name = conn
+                .get_atom_name(spec.type_)
+                .unwrap()
+                .reply()
+                .unwrap()
+                .name;
+            (spec.resource, String::from_utf8_lossy(&name).into_owned())
+        })
+        .collect()
+}
+
+/// The XIDs of every MIT-SHM segment attached on the display.
+fn shm_segments(conn: &RustConnection) -> Vec<u32> {
+    resources(conn)
+        .into_iter()
+        .filter(|(_, kind)| kind == "ShmSeg")
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// Detach, from `conn`, the one MIT-SHM segment attached on the display,
+/// which is andris's.
+fn detach_the_segment(conn: &RustConnection) {
+    let [segment] = shm_segments(conn)[..] else {
+        let mut kinds: Vec<String> = resources(conn).into_iter().map(|(_, kind)| kind).collect();
+        kinds.sort();
+        kinds.dedup();
+        panic!(
+            "expected one MIT-SHM segment, andris's, among resources of types {kinds:?}: {:?}",
+            shm_segments(conn)
+        );
+    };
+    xshm::detach(conn, segment).unwrap().check().unwrap();
+}
+
+/// Capture `FILL_AREA` through `platform` until a capture works, checking
+/// that it matches `expected`. Returns how many failed first; panics if
+/// any failure is the desktop going, or if capture never recovers.
+fn failures_before_recovery(platform: &Arc<X11Platform>, expected: &Capture) -> usize {
+    for failed in 0..10 {
+        match platform.capture(&[FILL_AREA]) {
+            Ok(capture) => {
+                assert_eq!(summary(&capture), summary(expected));
+                return failed;
+            }
+            Err(e) => assert!(!is_gone(&e), "a dead segment is not a dead display: {e:#}"),
+        }
+    }
+    panic!("capture did not recover from a detached MIT-SHM segment");
+}
+
 #[tokio::test]
 async fn damage_and_both_capture_paths_see_a_drawing() {
     let Some(display) = display() else {
-        eprintln!("ANDRIS_TEST_DISPLAY is unset; skipping the X11 test");
+        // Straight to stderr: libtest captures eprintln!, which would
+        // hide that this passed without testing anything.
+        let _ = writeln!(
+            std::io::stderr(),
+            "ANDRIS_TEST_DISPLAY is unset; SKIPPING the X11 backend test, which `make e2e` runs"
+        );
         return;
     };
     let shm = X11Platform::connect(&display).unwrap();
@@ -220,5 +304,30 @@ async fn damage_and_both_capture_paths_see_a_drawing() {
     assert_eq!(summary(&shm_all), summary(&get_image_all));
     let fallback = get_image.capture(&[FILL_AREA]).unwrap();
     assert_eq!(summary(&fallback), summary(&capture));
-    eprintln!("damage, MIT-SHM and GetImage agree on X display {display}");
+    drop(get_image);
+
+    // Another client detaches andris's segment. MIT-SHM captures then
+    // fail until andris attaches a fresh segment, and carry on with it.
+    let (other, _) = x11rb::connect(Some(display.as_str())).unwrap();
+    detach_the_segment(&other);
+    assert!(failures_before_recovery(&shm, &capture) > 0);
+    assert_eq!(
+        shm.capture_method(),
+        CaptureMethod::Shm,
+        "a fresh segment replaced the detached one"
+    );
+    assert_eq!(shm_segments(&other).len(), 1);
+
+    // Detached again, andris gives MIT-SHM up for GetImage.
+    detach_the_segment(&other);
+    assert!(failures_before_recovery(&shm, &capture) > 0);
+    assert_eq!(shm.capture_method(), CaptureMethod::GetImage);
+    assert!(shm_segments(&other).is_empty());
+    let (after_rects, after_all) = captures(&shm, &rects);
+    assert_eq!(summary(&after_rects), summary(&shm_rects));
+    assert_eq!(summary(&after_all), summary(&shm_all));
+    eprintln!(
+        "damage, MIT-SHM and GetImage agree on X display {display}, and capture survives a \
+         detached segment"
+    );
 }

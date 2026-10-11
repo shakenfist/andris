@@ -4,14 +4,24 @@
 //! The segment is a memfd, passed to the server with `ShmAttachFd`
 //! (MIT-SHM 1.2), so SysV IPC namespaces do not matter. It is sealed
 //! against shrinking and growing, and mapped read-only on andris's side
-//! with `memmap2`.
+//! with `memmap2`'s raw mapping, which hands out a pointer rather than a
+//! slice.
 //!
 //! This is andris's only `unsafe` code; the crate denies it everywhere
-//! else. The mapping is sound because of one rule, which
-//! [`Segment::capture`] keeps: the X server writes the segment only
-//! while serving a `ShmGetImage`, and andris reads it only once the
-//! reply to every `ShmGetImage` it has sent has arrived, copying the
-//! pixels out at once. No borrow of the mapping outlives that copy.
+//! else. Its trust boundary is this: andris is not the segment's only
+//! user. The X server writes it to serve andris's `ShmGetImage`, but any
+//! client of the display can name the segment's XID and write it too
+//! (draw into a `ShmCreatePixmap`, or `ShmGetImage` into it), and any
+//! process able to open the memfd (through `/proc/<pid>/fd`, say) can
+//! write it at any time. So andris treats the segment's bytes as
+//! untrusted pixels, and never relies on their stability. It never makes
+//! a Rust reference into the mapping: [`Mapping::copy`] copies bytes out
+//! through raw pointers into memory andris owns, and only that copy is
+//! ever read. [`Segment::capture`] copies once the reply to every
+//! `ShmGetImage` it sent has arrived, so in the normal case the pixels
+//! are complete; a concurrent writer can only tear them, never make the
+//! copy unsound. The seals keep the mapping backed, so reading it cannot
+//! fault.
 
 use std::fs::File;
 use std::io;
@@ -19,7 +29,7 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
 use anyhow::{Context, Result, anyhow, ensure};
-use memmap2::Mmap;
+use memmap2::{MmapOptions, MmapRaw};
 use x11rb::connection::Connection;
 use x11rb::protocol::shm;
 use x11rb::protocol::xproto::{ImageFormat, Window};
@@ -105,24 +115,36 @@ pub(super) fn refusal(allowed: bool, shm_fd: bool, unix: bool) -> Option<&'stati
     }
 }
 
-/// A memfd of `len` bytes, sealed so that it can no longer shrink or
-/// grow.
-fn memfd(len: usize) -> Result<File> {
+/// `memfd_create` with `flags`, returning the new descriptor.
+fn memfd_create(flags: libc::c_uint) -> io::Result<OwnedFd> {
     // SAFETY: memfd_create reads only `name`, a NUL-terminated string
     // that lives for the whole call, and returns a new descriptor that
     // nothing else refers to, or -1.
-    let fd = unsafe {
-        libc::memfd_create(
-            c"andris-capture".as_ptr(),
-            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
-        )
-    };
+    let fd = unsafe { libc::memfd_create(c"andris-capture".as_ptr(), flags) };
     if fd < 0 {
-        return Err(io::Error::last_os_error()).context("creating a memfd");
+        return Err(io::Error::last_os_error());
     }
     // SAFETY: `fd` was just returned by memfd_create, so it is open and
-    // owned by nothing else; the File takes sole ownership and closes it.
-    let file = File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    // owned by nothing else; the OwnedFd takes sole ownership and closes
+    // it.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// A memfd of `len` bytes, sealed so that it can no longer shrink or
+/// grow, and, where the kernel can, so that it can never be made
+/// executable.
+fn memfd(len: usize) -> Result<File> {
+    // MFD_NOEXEC_SEAL (Linux 6.3) creates the memfd without execute
+    // permission and seals it so, which also keeps it working under
+    // `vm.memfd_noexec = 2`. Older kernels refuse the unknown flag with
+    // EINVAL; their memfds are then made without it.
+    let base = libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING;
+    let fd = match memfd_create(base | libc::MFD_NOEXEC_SEAL) {
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => memfd_create(base),
+        created => created,
+    }
+    .context("creating a memfd")?;
+    let file = File::from(fd);
     file.set_len(len as u64)
         .with_context(|| format!("sizing a memfd to {len} bytes"))?;
     // SAFETY: F_ADD_SEALS takes an int argument and touches no memory of
@@ -140,13 +162,68 @@ fn memfd(len: usize) -> Result<File> {
     Ok(file)
 }
 
+/// Andris's read-only view of a sealed memfd. It never hands out a
+/// reference into the memory, which others may write at any time; bytes
+/// leave it only as an owned copy. See the module's documentation.
+struct Mapping {
+    map: MmapRaw,
+}
+
+impl Mapping {
+    /// Map all of `file`, which [`memfd`] made: it must be sealed against
+    /// shrinking, or reading the mapping could fault.
+    fn new(file: &File) -> Result<Self> {
+        let map = MmapOptions::new()
+            .map_raw_read_only(file)
+            .context("mapping a memfd")?;
+        Ok(Self { map })
+    }
+
+    /// The mapping's size in bytes.
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// A copy of the `len` bytes at `offset`, or `None` if they do not
+    /// all lie within the mapping. Another writer may change them during
+    /// the copy, which can tear the copy but not make it unsound.
+    fn copy(&self, offset: usize, len: usize) -> Option<Vec<u8>> {
+        let end = offset.checked_add(len)?;
+        if end > self.len() {
+            return None;
+        }
+        let mut copy = Vec::with_capacity(len);
+        // SAFETY:
+        // - Source: `offset..end` lies within the mapping, checked above,
+        //   and the mapping lives as long as `self`, so the source is
+        //   valid for `len` bytes of reads. The memfd is sealed against
+        //   shrinking, so every page stays backed and reading it cannot
+        //   raise SIGBUS.
+        // - Destination: `copy` was just allocated with room for `len`
+        //   bytes, and nothing else can see it, so the two do not
+        //   overlap. The copy initialises all `len` bytes, so `set_len`
+        //   exposes no uninitialised memory.
+        // - Other writers: any client of the display, and any process
+        //   able to open the memfd, may write these bytes at any time,
+        //   even during the copy. No Rust reference ever claims they are
+        //   immutable: they are read only through the raw source pointer,
+        //   and any byte is a valid u8, so a concurrent write can only
+        //   make the copy a mix of old and new pixels.
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.map.as_ptr().add(offset), copy.as_mut_ptr(), len);
+            copy.set_len(len);
+        }
+        Some(copy)
+    }
+}
+
 /// A segment attached to the X server on one connection. It does not
 /// own the connection, so the owner detaches it with [`Segment::detach`]
 /// before dropping it; dropping it unmaps andris's side and closes the
 /// memfd.
 pub(super) struct Segment {
     id: shm::Seg,
-    map: Mmap,
+    map: Mapping,
 }
 
 impl Segment {
@@ -157,17 +234,7 @@ impl Segment {
         let file = memfd(len)
             .context("creating the MIT-SHM segment")
             .map_err(Fault::Failed)?;
-        // SAFETY: memmap2 requires that nothing truncate the file, or
-        // write it while Rust holds a reference into the mapping.
-        // - The memfd has no name in any filesystem, and is sealed
-        //   against shrinking, so the mapping stays backed for its whole
-        //   life.
-        // - Its only other holder is the X server, which writes it only
-        //   while serving a ShmGetImage that andris sent on `conn`.
-        //   Segment::capture borrows the mapping only once the reply to
-        //   every ShmGetImage it sent has arrived, and copies out before
-        //   the borrow ends; no other code reaches `map`.
-        let map = unsafe { Mmap::map(&file) }
+        let map = Mapping::new(&file)
             .context("mapping the MIT-SHM segment")
             .map_err(Fault::Failed)?;
         let id = conn.generate_id()?;
@@ -247,6 +314,13 @@ impl Segment {
                         )));
                     }
                     Err(e) => match Fault::from(e) {
+                        // Later requests of this batch may still be in
+                        // flight, and the server may yet write their
+                        // slots. That is harmless only because a Gone
+                        // connection is never used again: serve_capture
+                        // stops on it, dropping the Capturer and with it
+                        // this segment. Retrying after Gone would need to
+                        // drain or discard this segment first.
                         gone @ Fault::Gone(_) => return Err(gone),
                         failed => {
                             failure.get_or_insert(failed);
@@ -266,20 +340,14 @@ impl Segment {
 
     /// Copy `slot`'s image of `rect` out of the mapping. Called only once
     /// the reply to the request that wrote it, and to every other request
-    /// sent, has arrived; see the SAFETY comment in [`Segment::attach`].
+    /// sent, has arrived, so that the image is complete unless another
+    /// writer interferes; see the module's documentation.
     fn copy_out(&self, rect: &Rectangle, slot: &Slot) -> Result<Frame, Fault> {
-        let bytes = slot
-            .offset
-            .checked_add(slot.len)
-            .and_then(|end| self.map.get(slot.offset..end))
+        let bytes = self
+            .map
+            .copy(slot.offset, slot.len)
             .ok_or_else(|| Fault::Failed(anyhow!("{rect}'s image lies outside the segment")))?;
-        Frame::new(
-            rect.width,
-            rect.height,
-            rect.width as usize * 4,
-            bytes.to_vec(),
-        )
-        .map_err(Fault::Failed)
+        Frame::new(rect.width, rect.height, rect.width as usize * 4, bytes).map_err(Fault::Failed)
     }
 }
 
@@ -395,5 +463,24 @@ mod tests {
         assert_eq!(file.metadata().unwrap().len(), 4096);
         assert!(file.set_len(1024).is_err(), "sealed against shrinking");
         assert!(file.set_len(8192).is_err(), "sealed against growing");
+    }
+
+    #[test]
+    fn a_mapping_copies_out_what_lies_within_it() {
+        use std::io::Write;
+
+        let mut file = memfd(16).unwrap();
+        file.write_all(&(0..16).collect::<Vec<u8>>()).unwrap();
+        let map = Mapping::new(&file).unwrap();
+        assert_eq!(map.len(), 16);
+        assert_eq!(map.copy(4, 3), Some(vec![4, 5, 6]));
+        assert_eq!(map.copy(0, 16), Some((0..16).collect::<Vec<u8>>()));
+        assert_eq!(map.copy(16, 0), Some(Vec::new()));
+        // A later write is seen by a later copy: the mapping is shared.
+        std::os::unix::fs::FileExt::write_all_at(&file, &[0xaa], 5).unwrap();
+        assert_eq!(map.copy(4, 3), Some(vec![4, 0xaa, 6]));
+        assert_eq!(map.copy(15, 2), None, "runs past the end");
+        assert_eq!(map.copy(17, 0), None, "starts past the end");
+        assert_eq!(map.copy(usize::MAX, 2), None, "overflows");
     }
 }

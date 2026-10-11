@@ -18,7 +18,7 @@ use x11rb::protocol::damage::{self as xdamage, ReportLevel};
 use x11rb::protocol::xproto::{self, ChangeWindowAttributesAux, EventMask, Window};
 use x11rb::rust_connection::RustConnection;
 
-use super::{create_wake_window, log_lost, x_error};
+use super::{create_wake_window, is_wake, log_lost, x_error};
 use crate::platform::{DamageHub, Rectangle, Size};
 
 /// The DAMAGE version andris asks for. Andris uses only what 1.0 has:
@@ -92,7 +92,7 @@ struct Batch {
     damaged: Vec<Rectangle>,
     /// The root window's new size, if it changed.
     resized: Option<Size>,
-    /// Whether the thread was woken to stop.
+    /// Whether the platform's drop woke the thread to stop.
     stop: bool,
 }
 
@@ -141,7 +141,11 @@ impl DamageThread {
                 }
             }
             Event::ClientMessage(message) if message.window == self.wake_window => {
-                batch.stop = true;
+                if is_wake(&message) {
+                    batch.stop = true;
+                } else {
+                    debug!("ignored a ClientMessage to the damage thread's wake window");
+                }
             }
             Event::Error(e) => return Some(x_error(&e)),
             _ => {}
@@ -150,12 +154,28 @@ impl DamageThread {
     }
 }
 
-/// Follow damage and resizes until woken to stop or the connection
-/// fails. A failed connection makes the hub [`gone`], so every
-/// subscription learns the desktop has gone.
+/// Follow damage and resizes until woken to stop or something fails.
+/// Unless it was woken, the hub is made [`gone`] as the thread stops, so
+/// every subscription learns the desktop has gone rather than waiting for
+/// damage that will never come.
 ///
 /// [`gone`]: DamageHub::gone
 pub(super) fn serve_damage(mut thread: DamageThread) {
+    let Some(why) = follow(&mut thread) else {
+        debug!("the X11 damage thread is stopping");
+        return;
+    };
+    if let Err(e) = thread.hub.gone(why) {
+        error!(
+            error = format!("{e:#}"),
+            "the X11 damage thread cannot report that the X display has gone"
+        );
+    }
+}
+
+/// Follow damage and resizes. Returns `None` once woken to stop, and
+/// otherwise why the thread cannot go on, having logged it.
+fn follow(thread: &mut DamageThread) -> Option<String> {
     let mut warned = false;
     loop {
         let mut batch = Batch::default();
@@ -189,22 +209,16 @@ pub(super) fn serve_damage(mut thread: DamageThread) {
                 error = format!("{e:#}"),
                 "the X11 damage thread cannot report damage, and is stopping"
             );
-            return;
+            return Some(format!("the X11 damage thread cannot report damage: {e:#}"));
         }
         if let Some(e) = failure {
             log_lost("damage", "damage is no longer followed", &e);
-            let why = format!("the X11 damage thread lost its connection to the X display: {e}");
-            if let Err(e) = thread.hub.gone(why) {
-                error!(
-                    error = format!("{e:#}"),
-                    "the X11 damage thread cannot report that the X display has gone"
-                );
-            }
-            return;
+            return Some(format!(
+                "the X11 damage thread lost its connection to the X display: {e}"
+            ));
         }
         if batch.stop {
-            debug!("the X11 damage thread is stopping");
-            return;
+            return None;
         }
     }
 }

@@ -38,16 +38,19 @@
 //! [`InputQueue`]: input::InputQueue
 //!
 //! A thread whose connection fails logs that once and exits; every later
-//! call to it returns an error. When the damage thread's fails, the hub
-//! is told the desktop has [`Gone`], so every [`DamageSubscription`]
-//! learns of it. An error the X server returns for one request fails that
-//! request only.
+//! call to it returns an error. When the damage thread stops for any
+//! reason but the platform's drop, the hub is told the desktop has
+//! [`Gone`], so every [`DamageSubscription`] learns of it. An error the X
+//! server returns for one request fails that request only.
 //!
 //! Dropping the platform closes the capture and input queues, and those
 //! threads exit; the capture thread detaches its MIT-SHM segment as it
 //! goes. The cursor and damage threads are blocked waiting for X events,
 //! so the drop also sends each a `ClientMessage` to an unmapped window
-//! only that thread knows, which wakes it to exit.
+//! of its own, which wakes it to exit. Any client of the display can find
+//! those windows with `QueryTree` and send them a `ClientMessage` too, so
+//! the drop's carries a random cookie, chosen once per process, and a
+//! thread stops only for a message that carries it (see [`is_wake`]).
 //!
 //! # Keys
 //!
@@ -68,9 +71,9 @@ mod keymap;
 mod shm;
 
 use std::os::fd::AsFd;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender, SyncSender};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 
 use anyhow::{Context, Result, anyhow};
@@ -127,8 +130,24 @@ pub enum CaptureMethod {
     GetImage,
 }
 
+/// The cookie a wake message carries: random, and the same for every
+/// waker in this process. Other clients of the display never see it,
+/// because a `SendEvent` with an empty event mask goes only to the
+/// client that created the window.
+fn wake_cookie() -> [u32; 5] {
+    static COOKIE: OnceLock<[u32; 5]> = OnceLock::new();
+    *COOKIE.get_or_init(rand::random)
+}
+
+/// Whether `message`, sent to a thread's wake window, is the platform's
+/// drop waking that thread to stop, rather than another client's.
+fn is_wake(message: &ClientMessageEvent) -> bool {
+    message.format == 32 && message.data.as_data32() == wake_cookie()
+}
+
 /// A thread blocked on X events, and how to wake it: a `ClientMessage`
-/// to a window only it knows, sent on its own connection.
+/// carrying [`wake_cookie`] to a window of its own, sent on its own
+/// connection.
 struct Waker {
     conn: Arc<RustConnection>,
     window: Window,
@@ -138,7 +157,7 @@ impl Waker {
     /// Wake the thread. If its connection has gone the thread has already
     /// stopped, so a failure does not matter.
     fn wake(&self) {
-        let event = ClientMessageEvent::new(32, self.window, AtomEnum::NONE, [0u32; 5]);
+        let event = ClientMessageEvent::new(32, self.window, AtomEnum::NONE, wake_cookie());
         let sent = xproto::send_event(&*self.conn, false, self.window, EventMask::NO_EVENT, event);
         if sent.is_ok() {
             let _ = self.conn.flush();
@@ -262,7 +281,7 @@ impl X11Platform {
 
     /// How the screen is being read. MIT-SHM can give way to `GetImage`
     /// after startup, if the desktop grows and the server refuses a
-    /// larger segment.
+    /// larger segment, or if MIT-SHM captures keep failing.
     pub fn capture_method(&self) -> CaptureMethod {
         if self.using_shm.load(Ordering::Relaxed) {
             CaptureMethod::Shm
@@ -549,6 +568,43 @@ mod tests {
             .is_err()
         );
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn only_the_cookie_wakes_a_thread() {
+        let window = 0x0040_0001;
+        assert!(is_wake(&ClientMessageEvent::new(
+            32,
+            window,
+            AtomEnum::NONE,
+            wake_cookie()
+        )));
+        assert_eq!(wake_cookie(), wake_cookie(), "one cookie per process");
+        assert!(!is_wake(&ClientMessageEvent::new(
+            32,
+            window,
+            AtomEnum::NONE,
+            [0u32; 5]
+        )));
+        let mut near = wake_cookie();
+        near[4] ^= 1;
+        assert!(!is_wake(&ClientMessageEvent::new(
+            32,
+            window,
+            AtomEnum::NONE,
+            near
+        )));
+        // The same bytes, sent as another format.
+        let mut bytes = [0u8; 20];
+        for (chunk, word) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(wake_cookie()) {
+            chunk.copy_from_slice(&word.to_ne_bytes());
+        }
+        assert!(!is_wake(&ClientMessageEvent::new(
+            8,
+            window,
+            AtomEnum::NONE,
+            bytes
+        )));
     }
 
     #[test]

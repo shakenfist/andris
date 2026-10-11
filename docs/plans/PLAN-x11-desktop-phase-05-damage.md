@@ -785,8 +785,69 @@ the difference is the 2 s idle window. The small-change check sees one
   isolation. That would have made a worktree of the session's own
   repository, not andris.
 
-The push audit (step 10), the pull request and its merge commit are
-recorded below once known.
+**The push audit** (step 10) audited the range `origin/develop...HEAD`.
+
+- **Wave 1 passed:** pre-commit, `make lint`, `make test` and `make
+  e2e`.
+- **Wave 2 found nothing blocking.**
+  - **Style:** passed.
+  - **Security:** no critical, high or medium findings. There were
+    three low findings and seven informational ones.
+  - **Code quality, tests and documentation:** advisory items only.
+
+The findings were fixed in the last five commits.
+
+- **Security:**
+  - **L1:** the MIT-SHM segment is read through raw pointers into
+    owned memory. The SAFETY comments now say that any display client,
+    or any process able to open the memfd, may write it.
+  - **L2:** wake-ups carry a random cookie. A damage thread that stops
+    for any other reason ends the desktop rather than leaving
+    scrub-only updates.
+  - **L3:** the next lossy tile's due time is cached.
+  - **Informational items:**
+    - the soundness of returning early on `Gone` is commented;
+    - the memfd asks for `MFD_NOEXEC_SEAL`;
+    - repeated MIT-SHM failures re-attach once, then fall back to
+      `GetImage`;
+    - implausible ping round trips are discarded;
+    - dead damage subscriptions are pruned.
+- **Code quality:**
+  - `updates.rs` is split into `server/updates/`;
+  - `Region` and `Rectangle` gained tile iteration;
+  - one encoder helper replaces three copies;
+  - `DisplayOptions` groups the display options;
+  - the stats use fixed, exhaustive slots;
+  - a duplicate counter is gone;
+  - `display.rs`'s module doc is trimmed to invariants;
+  - the synthetic platform takes its locks consistently.
+- **Tests:**
+  - malformed compression and codec preferences have tests;
+  - the rate-cap test's lower bound is widened;
+  - the X11 test skips visibly, and now detaches andris's segment to
+    test recovery;
+  - e2e checks the session-end metrics line.
+- **Documentation:** seven wordings that disagreed with the code were
+  corrected.
+
+After the fixes, 313 tests pass. `make e2e` and `cargo deny` pass.
+
+**Declined, with reasons:**
+- **Security informational 6, memory per session.** At the 64-megapixel
+  desktop limit a session can hold about 1 GiB transiently: shadow,
+  capture, segment and one update's draws. That is bounded: one
+  session at a time, `MAX_PENDING` messages, and an ack window that
+  every send waits on.
+- **Security informational 7, uncancellable blocking work.** A
+  replaced display channel's `spawn_blocking` capture or encode runs
+  to completion. Captures are serialised through the one capture
+  thread, and the handshake limits bound how fast an authenticated
+  client can relink.
+- **Test review A1, part.** The X11 test cannot run under `make test`,
+  which has no X server. It runs under `make e2e`, and now says when
+  it skips.
+
+The pull request and its merge commit are recorded below once known.
 
 ## Appendix: the damage spike
 

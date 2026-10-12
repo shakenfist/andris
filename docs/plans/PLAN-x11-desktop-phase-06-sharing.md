@@ -255,8 +255,8 @@ diff.
 | 1 | high | opus | none | Complete | The containerised xrdp test bed, with a smoke run. Gated. See brief 1. |
 | 2 | high | opus | none | Complete | Interleaving checks as `make e2e-xrdp`, with their results recorded. Gates step 4. See brief 2. |
 | 3 | high | opus | none | Complete | Process lifetime: SIGTERM, and exiting when the desktop goes. See brief 3. |
-| 4 | high | opus | none | Not started | Fixes that step 2 calls for, if any. Gated. See brief 4. |
-| 5 | medium | sonnet | none | Not started | The systemd user unit and the documentation. See brief 5. |
+| 4 | high | opus | none | Skipped | Fixes that step 2 calls for, if any. Gated. See brief 4. |
+| 5 | medium | sonnet | none | Complete | The systemd user unit and the documentation. See brief 5. |
 | 6 | medium | management | none | Not started | Operator acceptance on `:10`, by hand. See brief 6. |
 | 7 | medium | management | none | Not started | Push audit, pull request, queue. See brief 7. |
 
@@ -633,6 +633,23 @@ choice of fix is the management session's:
 
 Either way, `docs/xrdp.md` should say how locks and held modifiers
 behave.
+
+**Step 4 is skipped.** No gating check failed. For the keepalive
+finding, the operator chose the ryll fix over a workaround in andris:
+andris keeps applying every `KEY_MODIFIERS`, as spice-server does, and
+the gap is shakenfist/ryll#517. Ignoring repeats in andris would also
+ignore a client that resynchronises on focus with an unchanged value, as
+spice-gtk does. Until ryll#517 is fixed, `docs/xrdp.md` documents that a
+connected ryll puts the locks back to Num Lock on and Caps Lock off
+after 10 s idle.
+
+**Step 5: the live unit check moved to step 6.** The throwaway
+`andris@98` instance on an Xvfb was not run in step 5: the host has no
+Xvfb, and installing one needs sudo. `systemd-analyze --user verify` on
+the unit reports only that `andris` is not executable, which is
+expected while it is not installed. The live check (start, kill the
+display, backoff and recovery, clean stop) is part of the operator
+attended step 6.
 
 **Other test-side findings.** FreeRDP 3 overwrites the password in its
 own `argv`, so the checks restart it with the command `run.sh` passes

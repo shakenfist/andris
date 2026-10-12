@@ -1,0 +1,26 @@
+# A systemd user unit that shares one X display over SPICE. The instance
+# name is the display number: andris@10.service exports :10.
+# See https://github.com/shakenfist/andris/blob/develop/docs/xrdp.md
+
+[Unit]
+Description=Andris SPICE server for X display :%i
+Documentation=https://github.com/shakenfist/andris/blob/develop/docs/xrdp.md
+# Never give up restarting: the X server may not exist yet, or may be
+# between sessions.
+StartLimitIntervalSec=0
+
+[Service]
+# Optional. Sets ANDRIS_ARGS (listen address, TLS options) and, if the
+# session's cookie is not in ~/.Xauthority, XAUTHORITY.
+EnvironmentFile=-%h/.config/andris/andris.env
+# A bare name is looked up in systemd's standard binary search path, so
+# this works for /usr/local/bin/andris and /usr/bin/andris alike.
+ExecStart=andris --display :%i --ticket-file %h/.config/andris/ticket $ANDRIS_ARGS
+# Andris exits 1 when the desktop goes away, and 0 when stopped.
+Restart=on-failure
+RestartSec=2s
+RestartSteps=5
+RestartMaxDelaySec=60s
+
+[Install]
+WantedBy=default.target

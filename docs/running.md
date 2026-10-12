@@ -78,6 +78,8 @@ xrdp session is the session's user. The display comes from
 to start. Authorisation uses the usual X mechanisms, so set
 `XAUTHORITY` if the session's cookie is not in `~/.Xauthority`.
 
+To run andris as a service beside xrdp, see [xrdp.md](xrdp.md).
+
 Before it listens, andris checks the X server and refuses to start,
 naming every problem it found, unless:
 

@@ -19,6 +19,8 @@ what it is meant to become.
 
 - [Running andris](running.md) - Building, options, the ticket file,
   TLS, connecting with ryll and fronting andris with kerbside
+- [Running andris alongside xrdp](xrdp.md) - The systemd user unit, what
+  happens when the session ends, and how RDP and SPICE input interleave
 - [Development](development.md) - Building, testing, pre-commit, CI
   and the merge queue
 - [Plans index](plans/index.md) - Every planning document, with its

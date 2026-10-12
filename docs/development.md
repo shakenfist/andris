@@ -29,6 +29,7 @@ make test       # cargo test across the workspace
 make lint       # cargo fmt --check, then clippy with -D warnings
 make ryll-headless  # build ryll's headless client at the pinned revision
 make e2e        # run andris against Xvfb, driven by ryll
+make e2e-xrdp   # run andris against a real xrdp session, in a container
 make lint-fix   # rustfmt and clippy --fix
 make fetch      # pre-download crates into the cargo cache
 make lock       # refresh Cargo.lock after editing a Cargo.toml
@@ -80,6 +81,39 @@ capture) at the revision `Cargo.lock` pins for
 into `ryll/<revision>/` under the cargo cache, and is skipped when the
 binary for that revision is already there. Moving the ryll pin builds
 ryll afresh.
+
+### The xrdp test bed
+
+`make e2e-xrdp` runs andris against a real xrdp session. It builds
+a Docker image (`andris-xrdp-testbed`, on top of `andris-dev`) with
+xrdp, xorgxrdp and a FreeRDP client, and in a throwaway container,
+[`scripts/xrdp-testbed/run.sh`](https://github.com/shakenfist/andris/blob/develop/scripts/xrdp-testbed/run.sh)
+starts xrdp and connects FreeRDP, so that xrdp starts a real Xorg
+session, on display `:50`. Andris and ryll's headless client then
+share that session with the RDP client, and
+[`scripts/e2e-xrdp-drive.py`](https://github.com/shakenfist/andris/blob/develop/scripts/e2e-xrdp-drive.py)
+checks, after a smoke test, that:
+
+- keys typed alternately over RDP and SPICE arrive once each, in order;
+- modifiers held over one protocol apply to keys from the other;
+- lock keys set over RDP and by ryll behave as
+  [xrdp.md](xrdp.md#rdp-and-spice-together) says;
+- an RDP resize reaches ryll as a new surface;
+- an RDP disconnect and reconnect leave andris and ryll connected;
+- an RDP reconnect with another layout changes what SPICE keys type;
+- ending the session makes andris exit with status 1.
+
+The container has no network, and its own `/tmp`, so no X server or
+xrdp session on the host can be reached from it. Never aim a test that
+resizes, logs out or types into a session at a real one: the test bed
+exists so that nobody has to.
+
+It needs Docker, plus the network the first time, to build the image
+and install its packages; the image is rebuilt only when its inputs
+change. It is not part of CI: what it guards is xrdp's behaviour, and
+a remote-desktop client driven through `xdotool` on a shared runner is
+the sort of check that flakes. A warm run, with the image and binaries
+current, takes about 27 seconds.
 
 ### The JPEG corpus measurement
 

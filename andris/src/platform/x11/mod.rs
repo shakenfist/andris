@@ -37,11 +37,13 @@
 //!
 //! [`InputQueue`]: input::InputQueue
 //!
-//! A thread whose connection fails logs that once and exits; every later
-//! call to it returns an error. When the damage thread stops for any
+//! A thread whose connection fails logs that once, sets the platform's
+//! [`GoneSignal`] with the reason, and exits; every later call to it
+//! returns an error. The first thread to find the connection dead gives
+//! the reason the signal keeps. When the damage thread stops for any
 //! reason but the platform's drop, the hub is told the desktop has
-//! [`Gone`], so every [`DamageSubscription`] learns of it. An error the X
-//! server returns for one request fails that request only.
+//! [`Gone`] too, so every [`DamageSubscription`] learns of it. An error
+//! the X server returns for one request fails that request only.
 //!
 //! Dropping the platform closes the capture and input queues, and those
 //! threads exit; the capture thread detaches its MIT-SHM segment as it
@@ -91,7 +93,8 @@ use x11rb::x11_utils::X11Error;
 
 use super::{
     Capture, CursorReceiver, CursorSource, DamageHub, DamageSubscription, DisplayGeometry, Gone,
-    InputEvent, InputSink, LockState, Platform, Rectangle, ScreenSource, Size,
+    GoneSender, GoneSignal, InputEvent, InputSink, LockState, Platform, Rectangle, ScreenSource,
+    Size,
 };
 use capture::{CaptureRequest, Capturer, serve_capture};
 use checks::ServerFacts;
@@ -180,6 +183,9 @@ pub struct X11Platform {
     damage: Arc<DamageHub>,
     /// Whether the capture thread is using MIT-SHM.
     using_shm: Arc<AtomicBool>,
+    /// Set by whichever backend thread first finds its connection dead;
+    /// each holds a sender.
+    gone: GoneSignal,
 }
 
 impl X11Platform {
@@ -239,18 +245,22 @@ impl X11Platform {
         let (cursor_window, first_shape) = start_cursor(&cursor_conn, root)
             .with_context(|| format!("following the cursor on X display {name}"))?;
         let (shapes, cursor) = watch::channel(first_shape.map(Arc::new));
+        let (gone_sender, gone) = GoneSignal::new();
 
         let (capture, capture_queue) = mpsc::channel();
+        let thread_gone = gone_sender.clone();
         spawn("andris-x11-capture", move || {
-            serve_capture(capturer, capture_queue)
+            serve_capture(capturer, capture_queue, thread_gone)
         })?;
         let (input, input_queue) = InputQueue::new();
+        let thread_gone = gone_sender.clone();
         spawn("andris-x11-input", move || {
-            serve_input(injector, input_queue)
+            serve_input(injector, input_queue, thread_gone)
         })?;
         let thread_conn = cursor_conn.clone();
+        let thread_gone = gone_sender.clone();
         spawn("andris-x11-cursor", move || {
-            serve_cursor(thread_conn, cursor_window, shapes)
+            serve_cursor(thread_conn, cursor_window, shapes, thread_gone)
         })?;
         let thread = DamageThread {
             conn: damage_conn.clone(),
@@ -259,6 +269,7 @@ impl X11Platform {
             damage: damage_object,
             size,
             hub: damage.clone(),
+            gone: gone_sender,
         };
         spawn("andris-x11-damage", move || serve_damage(thread))?;
 
@@ -276,6 +287,7 @@ impl X11Platform {
             },
             damage,
             using_shm,
+            gone,
         }))
     }
 
@@ -290,13 +302,14 @@ impl X11Platform {
         }
     }
 
-    /// This platform as all four seams.
+    /// This platform as all four seams, and its gone signal.
     pub fn platform(self: &Arc<Self>) -> Platform {
         Platform {
             geometry: self.clone(),
             screen: self.clone(),
             input: self.clone(),
             cursor: self.clone(),
+            gone: self.gone.clone(),
         }
     }
 }
@@ -413,12 +426,16 @@ fn open(display: &str, role: &str) -> Result<(RustConnection, usize)> {
 }
 
 /// Log that backend thread `thread` lost its connection to the X display
-/// and is stopping, and what stops with it.
-fn log_lost(thread: &str, consequence: &str, e: &dyn std::fmt::Display) {
+/// and is stopping, and what stops with it; then set `gone`, unless
+/// another thread already has. Returns the reason given.
+fn lost(gone: &GoneSender, thread: &str, consequence: &str, e: &dyn std::fmt::Display) -> String {
     error!(
         error = format!("{e:#}"),
         "the X11 {thread} thread lost its connection; {consequence}"
     );
+    let why = format!("the X11 {thread} thread lost its connection to the X display: {e:#}");
+    gone.set(why.clone());
+    why
 }
 
 /// The error for a connection to the X display that has failed.

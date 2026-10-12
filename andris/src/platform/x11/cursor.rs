@@ -12,8 +12,8 @@ use x11rb::protocol::xfixes;
 use x11rb::protocol::xproto::Window;
 use x11rb::rust_connection::RustConnection;
 
-use super::{Fault, create_wake_window, is_wake, log_lost, x_error};
-use crate::platform::CursorShape;
+use super::{Fault, create_wake_window, is_wake, lost, x_error};
+use crate::platform::{CursorShape, GoneSender};
 
 /// Set up the cursor connection: make the XFixes handshake, create the
 /// window the drop wakes the thread through, ask for cursor changes, and
@@ -58,19 +58,20 @@ fn read_cursor(conn: &RustConnection) -> Result<CursorShape, Fault> {
 }
 
 /// Follow cursor changes until the platform's drop wakes it to stop, or
-/// the connection fails. The thread owns the only sender, so its
-/// receivers see it stop.
+/// the connection fails, which sets `gone`. The thread owns the only
+/// sender of shapes, so its receivers see it stop.
 pub(super) fn serve_cursor(
     conn: Arc<RustConnection>,
     wake_window: Window,
     shapes: watch::Sender<Option<Arc<CursorShape>>>,
+    gone: GoneSender,
 ) {
     let mut warned = false;
     loop {
         let event = match conn.wait_for_event() {
             Ok(event) => event,
             Err(e) => {
-                log_lost("cursor", "cursor changes have stopped", &e);
+                lost(&gone, "cursor", "cursor changes have stopped", &e);
                 return;
             }
         };
@@ -81,7 +82,7 @@ pub(super) fn serve_cursor(
                     None
                 }
                 Err(Fault::Gone(e)) => {
-                    log_lost("cursor", "cursor changes have stopped", &e);
+                    lost(&gone, "cursor", "cursor changes have stopped", &e);
                     return;
                 }
                 Err(Fault::Failed(e)) => Some(e),

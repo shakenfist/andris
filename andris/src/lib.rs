@@ -18,14 +18,24 @@ pub mod config;
 pub mod platform;
 pub mod server;
 
-use anyhow::{Context, Result};
-use tracing::{info, warn};
+use std::time::Duration;
+
+use anyhow::{Context, Result, bail};
+use tokio::signal::unix::{Signal, SignalKind, signal};
+use tracing::{error, info, warn};
 
 use config::{Config, PlatformConfig};
-use platform::Platform;
 use platform::synthetic::SyntheticPlatform;
 use platform::x11::X11Platform;
-use server::{DisplayOptions, HandshakeTimeouts, STOP_GRACE, Server, ServerOptions, TlsOptions};
+use platform::{GoneSignal, Platform};
+use server::{
+    DisplayOptions, HandshakeTimeouts, STOP_GRACE, Server, ServerHandle, ServerOptions, TlsOptions,
+};
+
+/// How long andris waits for connections to close once the desktop has
+/// gone. There is no desktop left to take released keys, so this only
+/// lets each client see its connection close.
+pub const GONE_GRACE: Duration = Duration::from_secs(1);
 
 /// Andris's name and version, as `--version` prints them.
 pub fn banner() -> String {
@@ -33,7 +43,9 @@ pub fn banner() -> String {
 }
 
 /// Run andris with a validated configuration: build the platform the
-/// configuration names, start the listeners, and serve until Ctrl-C.
+/// configuration names, start the listeners, and serve until SIGINT or
+/// SIGTERM, or until the desktop goes. Fails, naming why, if the desktop
+/// went.
 pub fn run(config: Config) -> Result<()> {
     let platform = match &config.platform {
         PlatformConfig::Synthetic { size } => {
@@ -52,7 +64,7 @@ pub fn run(config: Config) -> Result<()> {
     runtime.block_on(serve(config, platform))
 }
 
-/// Serve `platform` as `config` says, until Ctrl-C.
+/// Serve `platform` as `config` says, as [`run`] describes.
 async fn serve(config: Config, platform: Platform) -> Result<()> {
     let size = platform.geometry.size()?;
     info!("the desktop is {size}");
@@ -74,19 +86,79 @@ async fn serve(config: Config, platform: Platform) -> Result<()> {
         },
         timeouts: HandshakeTimeouts::default(),
     };
-    let mut handle = Server::bind(options, platform).await?.spawn()?;
-    tokio::signal::ctrl_c()
-        .await
-        .context("waiting for Ctrl-C")?;
-    info!("Ctrl-C: shutting down");
-    if !handle.stop(STOP_GRACE).await {
+    let gone = platform.gone.clone();
+    // Listen before the listeners are ready, so that a signal sent once
+    // andris has said it is listening is never met by the default action,
+    // which would end the process without releasing held input.
+    let signals = Signals::listen()?;
+    let handle = Server::bind(options, platform).await?.spawn()?;
+    serve_until(handle, signals.next(), gone).await
+}
+
+/// SIGINT and SIGTERM, each listened for from [`Signals::listen`] on.
+struct Signals {
+    interrupt: Signal,
+    terminate: Signal,
+}
+
+impl Signals {
+    fn listen() -> Result<Self> {
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt()).context("listening for SIGINT")?,
+            terminate: signal(SignalKind::terminate()).context("listening for SIGTERM")?,
+        })
+    }
+
+    /// Wait for either signal, and name the one that came.
+    async fn next(mut self) -> &'static str {
+        tokio::select! {
+            _ = self.interrupt.recv() => "SIGINT",
+            _ = self.terminate.recv() => "SIGTERM",
+        }
+    }
+}
+
+/// Run until `signal` returns or `gone` is set, then stop `handle`.
+///
+/// When `signal` returns, with the name of the signal that came, this logs
+/// that and stops the server, waiting up to [`STOP_GRACE`] for the input
+/// that connected clients held to be released, and returns `Ok`.
+///
+/// When the desktop goes, it logs why and stops the server, waiting only
+/// [`GONE_GRACE`]: nothing held can be released into a desktop that has
+/// gone, but each client still sees its connection close. It then fails,
+/// naming why, so that the process exits with an error.
+///
+/// `andris` passes the signals it listens for as `signal`. Tests pass a
+/// future of their own, so that no real signal is sent inside the test
+/// process.
+pub async fn serve_until(
+    mut handle: ServerHandle,
+    signal: impl Future<Output = &'static str>,
+    mut gone: GoneSignal,
+) -> Result<()> {
+    let why = tokio::select! {
+        name = signal => {
+            info!("{name}: shutting down");
+            if !handle.stop(STOP_GRACE).await {
+                warn!(
+                    "connections were still closing after {}s; keys or buttons held on the \
+                     desktop may not have been released",
+                    STOP_GRACE.as_secs()
+                );
+            }
+            return Ok(());
+        }
+        why = gone.wait() => why,
+    };
+    error!("the desktop has gone, so andris is stopping: {why}");
+    if !handle.stop(GONE_GRACE).await {
         warn!(
-            "connections were still closing after {}s; keys or buttons held on the desktop \
-             may not have been released",
-            STOP_GRACE.as_secs()
+            "connections were still closing after {}s; stopping anyway",
+            GONE_GRACE.as_secs()
         );
     }
-    Ok(())
+    bail!("the desktop has gone: {why}")
 }
 
 #[cfg(test)]

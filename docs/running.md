@@ -46,10 +46,19 @@ andris --ticket-file PATH [options]
 
 `andris --help` prints the same list. Logs go to stderr at `info`
 level; set `RUST_LOG` (for example `RUST_LOG=andris=debug`) to
-change that. Ctrl-C (SIGINT) shuts andris down. It closes the client's
+change that. SIGINT (Ctrl-C) and SIGTERM (what systemd and `kill`
+send) each shut andris down cleanly. It closes the client's
 connections, releases any key or mouse button the client still held,
 and waits up to five seconds for the desktop to take those releases
-before it exits, so nothing is left held down on the desktop.
+before it exits with status 0, so nothing is left held down on the
+desktop.
+
+Andris attaches to a desktop; it does not own one. If the X server it
+exports goes away (the session logs out, or the server exits or is
+killed), andris logs an error saying why, closes the client's
+connections within a second, and exits with status 1. There is no
+desktop left to release held keys into. It does not wait for a new X
+server; whatever started andris must start it again once there is one.
 
 Options are checked together before anything starts, and each error
 names the option at fault and how to fix it. The three TLS options go

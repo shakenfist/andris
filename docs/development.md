@@ -65,9 +65,12 @@ file. Last, it asserts, over ryll's control socket:
   which must reach the client in fewer draws than there are 64-row
   bands in the screen.
 
-It also checks ryll's log for all four channels, and stops ryll and
-andris with SIGINT, which must exit 0. It fails if andris logs an
-`ERROR`, and prints every log on failure.
+It also checks ryll's log for all four channels, and stops ryll with
+SIGINT and andris with SIGTERM; both must exit 0. Last, it starts a
+second andris against the same display and kills Xvfb under it: that
+andris must exit 1 within ten seconds, logging that the desktop has
+gone and why. It fails if the first andris logs an `ERROR`, and prints
+every log on failure.
 
 It needs nothing on the host beyond Docker: Xvfb and Python are in
 the devcontainer image, and `make ryll-headless`, which `make e2e`

@@ -94,8 +94,9 @@ pub const MAX_KEY_GENERATIONS: usize = 2;
 /// descriptors does not become a busy loop.
 const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(100);
 
-/// How long `andris` waits, on Ctrl-C, for [`ServerHandle::stop`]: for
-/// connections to close and the input they release to reach the desktop.
+/// How long `andris` waits, on SIGINT or SIGTERM, for
+/// [`ServerHandle::stop`]: for connections to close and the input they
+/// release to reach the desktop.
 pub const STOP_GRACE: Duration = Duration::from_secs(5);
 
 /// Held by every accept and connection task; see the module's Tasks

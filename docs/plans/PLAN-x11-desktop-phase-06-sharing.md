@@ -251,10 +251,10 @@ diff.
 
 | Step | Effort | Model | Isolation | Status | Brief for sub-agent |
 |------|--------|-------|-----------|--------|---------------------|
-| 0 | low | management | none | Not started | Commit the phase 5 close-out and this plan. See brief 0. |
+| 0 | low | management | none | Complete | Commit the phase 5 close-out and this plan. See brief 0. |
 | 1 | high | opus | none | Not started | The containerised xrdp test bed, with a smoke run. Gated. See brief 1. |
 | 2 | high | opus | none | Not started | Interleaving checks as `make e2e-xrdp`, with their results recorded. Gates step 4. See brief 2. |
-| 3 | high | opus | none | Not started | Process lifetime: SIGTERM, and exiting when the desktop goes. See brief 3. |
+| 3 | high | opus | none | Complete | Process lifetime: SIGTERM, and exiting when the desktop goes. See brief 3. |
 | 4 | high | opus | none | Not started | Fixes that step 2 calls for, if any. Gated. See brief 4. |
 | 5 | medium | sonnet | none | Not started | The systemd user unit and the documentation. See brief 5. |
 | 6 | medium | management | none | Not started | Operator acceptance on `:10`, by hand. See brief 6. |

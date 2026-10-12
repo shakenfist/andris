@@ -32,8 +32,8 @@ use x11rb::protocol::xproto::{self, ImageFormat, Window};
 use x11rb::rust_connection::RustConnection;
 
 use super::shm::{Segment, image_bytes};
-use super::{Fault, answer, log_lost};
-use crate::platform::{Capture, Frame, Patch, Rectangle, Size};
+use super::{Fault, answer, lost};
+use crate::platform::{Capture, Frame, GoneSender, Patch, Rectangle, Size};
 
 /// A request to the capture thread, with where to send its answer.
 pub(super) enum CaptureRequest {
@@ -327,21 +327,26 @@ fn screen_bytes(size: Size) -> Result<usize> {
         .ok_or_else(|| anyhow!("an image of a {size} desktop is too large to address"))
 }
 
-/// Serve capture requests until the queue closes or the connection fails.
-pub(super) fn serve_capture(mut capturer: Capturer, requests: Receiver<CaptureRequest>) {
+/// Serve capture requests until the queue closes or the connection fails,
+/// setting `gone` if it fails.
+pub(super) fn serve_capture(
+    mut capturer: Capturer,
+    requests: Receiver<CaptureRequest>,
+    gone: GoneSender,
+) {
     while let Ok(request) = requests.recv() {
-        let gone = match request {
+        let failed = match request {
             CaptureRequest::Size(reply) => answer(reply, root_size(&capturer.conn, capturer.root)),
             CaptureRequest::Capture(rects, reply) => {
                 answer(reply, capturer.capture(rects.as_deref()))
             }
         };
-        if let Some(e) = gone {
+        if let Some(e) = failed {
             // Stopping here is what makes Segment::capture's early return
             // on Gone sound: it may leave ShmGetImage requests in flight,
             // and this drops the Capturer, and so the segment, without
             // reading it again. Capturer::capture asserts as much.
-            log_lost("capture", "capture has stopped", &e);
+            lost(&gone, "capture", "capture has stopped", &e);
             return;
         }
     }

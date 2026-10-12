@@ -9,7 +9,9 @@
 //!   the lock-key state;
 //! - [`CursorSource`] yields the cursor shape as it changes.
 //!
-//! [`Platform`] bundles one implementation of each. [`synthetic`] is a
+//! [`Platform`] bundles one implementation of each, with a [`GoneSignal`]
+//! that is set, with the reason, once the desktop has gone for good: when
+//! the connection to the X display fails, say. [`synthetic`] is a
 //! deterministic implementation for tests and load testing, and [`x11`]
 //! exports an X display.
 //!
@@ -444,6 +446,60 @@ pub fn is_gone(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<Gone>())
 }
 
+/// Sets a [`GoneSignal`]: says the desktop has gone for good, and why.
+/// Clones set the same signal.
+#[derive(Debug, Clone)]
+pub struct GoneSender(Arc<watch::Sender<Option<String>>>);
+
+impl GoneSender {
+    /// Say the desktop has gone, because of `why`. Only the first reason
+    /// given is kept; returns whether this was it. Never blocks.
+    pub fn set(&self, why: String) -> bool {
+        self.0.send_if_modified(|gone| {
+            if gone.is_some() {
+                return false;
+            }
+            *gone = Some(why);
+            true
+        })
+    }
+}
+
+/// Learns that the desktop has gone for good: the connection to it has
+/// failed, so nothing andris serves can work again. It is set once, with
+/// the first reason a [`GoneSender`] gave, and stays set.
+#[derive(Debug, Clone)]
+pub struct GoneSignal(watch::Receiver<Option<String>>);
+
+impl GoneSignal {
+    /// A signal not yet set, and its sender.
+    pub fn new() -> (GoneSender, GoneSignal) {
+        let (sender, receiver) = watch::channel(None);
+        (GoneSender(Arc::new(sender)), GoneSignal(receiver))
+    }
+
+    /// Why the desktop has gone, or `None` while it has not.
+    pub fn why(&self) -> Option<String> {
+        self.0.borrow().clone()
+    }
+
+    /// Wait until the desktop has gone, and return why. Returns at once
+    /// if it already has. Never returns if every sender is dropped
+    /// without setting it, since then nothing can say the desktop went.
+    pub async fn wait(&mut self) -> String {
+        // Bound first, so that the borrow wait_for returns is not held
+        // across the await below.
+        let why = match self.0.wait_for(Option::is_some).await {
+            Ok(why) => why.clone(),
+            Err(_) => None,
+        };
+        match why {
+            Some(why) => why,
+            None => std::future::pending().await,
+        }
+    }
+}
+
 /// Reports the size of the desktop.
 pub trait DisplayGeometry: Send + Sync {
     /// The desktop's current size. May block.
@@ -545,13 +601,16 @@ pub trait CursorSource: Send + Sync {
     fn subscribe(&self) -> CursorReceiver;
 }
 
-/// One implementation of each seam, shared by the server's tasks.
+/// One implementation of each seam, shared by the server's tasks, and the
+/// signal that the desktop behind them has gone.
 #[derive(Clone)]
 pub struct Platform {
     pub geometry: Arc<dyn DisplayGeometry>,
     pub screen: Arc<dyn ScreenSource>,
     pub input: Arc<dyn InputSink>,
     pub cursor: Arc<dyn CursorSource>,
+    /// Set once the desktop has gone for good; `andris` exits when it is.
+    pub gone: GoneSignal,
 }
 
 #[cfg(test)]
@@ -566,6 +625,36 @@ mod tests {
         assert!(format!("{gone:#}").contains("capture thread has stopped"));
         let passing = anyhow::anyhow!("BadMatch").context("capturing the desktop");
         assert!(!is_gone(&passing));
+    }
+
+    /// Whether `signal` returns within a moment.
+    async fn returns_soon(signal: &GoneSignal) -> bool {
+        let mut probe = signal.clone();
+        tokio::time::timeout(std::time::Duration::from_millis(50), probe.wait())
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn the_gone_signal_keeps_the_first_reason() {
+        let (sender, mut signal) = GoneSignal::new();
+        assert_eq!(signal.why(), None);
+        assert!(!returns_soon(&signal).await, "an unset signal waits");
+
+        let mut waiter = signal.clone();
+        let woken = tokio::spawn(async move { waiter.wait().await });
+        assert!(sender.clone().set("first".to_string()));
+        assert!(!sender.set("second".to_string()));
+        assert_eq!(woken.await.unwrap(), "first");
+        assert_eq!(signal.wait().await, "first", "a set signal returns at once");
+        assert_eq!(signal.why().as_deref(), Some("first"));
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_gone_signal_never_returns() {
+        let (sender, signal) = GoneSignal::new();
+        drop(sender);
+        assert!(!returns_soon(&signal).await);
     }
 
     #[test]

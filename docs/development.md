@@ -44,12 +44,29 @@ depend on it.
 `make e2e` runs andris against a real X server and a real client.
 Inside the devcontainer, with no network and a read-only checkout,
 [`scripts/e2e.sh`](https://github.com/shakenfist/andris/blob/develop/scripts/e2e.sh)
-starts Xvfb and a full-screen window that logs the keys it receives,
-starts the debug andris against that display, and connects ryll's
-headless client through a `.vv` file. It then asserts, over ryll's
-control socket, that a frame of the window arrived and that two keys
-reached it; checks ryll's log for all four channels; and stops ryll
-and andris with SIGINT, which must exit 0. It fails if andris logs an
+starts Xvfb and runs the X11 backend's integration test,
+`andris/tests/x11.rs`, against its bare root window: it draws a
+rectangle, waits for the damage, and captures it through both MIT-SHM
+and `GetImage`. It then detaches andris's shared segment from a second
+connection, finding it through X-Resource 1.2 as another client
+could, and checks that capture recovers: first with a fresh segment,
+then, after a second detach, through `GetImage`. That test reads the
+display from `ANDRIS_TEST_DISPLAY`. When the variable is unset, as
+under `make test`, it prints that it is skipping and passes. The script then starts a full-screen
+window that logs the keys it receives, starts the debug andris against
+that display, and connects ryll's headless client through a `.vv`
+file. Last, it asserts, over ryll's control socket:
+
+- **frames**: a frame of the window arrived;
+- **keys**: two keys reached the window;
+- **idle silence**: with nothing changing, once the desktop has settled (the
+  driver waits for quiet first), no draw arrives for two seconds, since andris sends frames only on damage;
+- **a small change**: a key makes the window repaint a 64x64 square,
+  which must reach the client in fewer draws than there are 64-row
+  bands in the screen.
+
+It also checks ryll's log for all four channels, and stops ryll and
+andris with SIGINT, which must exit 0. It fails if andris logs an
 `ERROR`, and prints every log on failure.
 
 It needs nothing on the host beyond Docker: Xvfb and Python are in
@@ -60,6 +77,28 @@ capture) at the revision `Cargo.lock` pins for
 into `ryll/<revision>/` under the cargo cache, and is skipped when the
 binary for that revision is already there. Moving the ryll pin builds
 ryll afresh.
+
+### The JPEG corpus measurement
+
+`andris/tests/jpeg_corpus.rs` is an ignored test that measures real
+screen content, to justify the constants of the JPEG classifier in
+`server/updates/encode.rs`. It asserts nothing about andris's behaviour; it
+prints, per image and rectangle size, the LZ4 and JPEG sizes and encode
+rates, and the share of rectangles and of area the classifier would
+send as JPEG.
+
+It reads every file in `target/corpus` (or the directory in
+`$ANDRIS_JPEG_CORPUS`): raw packed 32-bit B, G, R, X pixels, named
+`<name>_<W>x<H>.bgrx`. Put the files there, then run it in release,
+inside the devcontainer, so the timings mean something:
+
+```bash
+cargo test --release --frozen --test jpeg_corpus -- --ignored --nocapture
+```
+
+`make test` skips it. A capture of a real desktop must never be
+committed: it holds whatever was on the screen. `target/` is
+untracked, and the test prints numbers, never pixels.
 
 ### Why compiling targets are offline
 

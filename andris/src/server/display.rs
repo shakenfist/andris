@@ -1,51 +1,69 @@
 //! The display channel.
 //!
-//! # The start sequence
-//!
-//! As spice-server's display channel does, andris sends `SET_ACK` (window
-//! [`ACK_WINDOW`]) and then waits for the client's `INIT`. Andris keeps no
-//! pixmap cache and no GLZ dictionary, so `INIT` is only validated. Then
-//! it sends:
-//!
-//! 1. `SURFACE_CREATE` for the primary surface, 32-bit XRGB, at the
-//!    desktop's size;
-//! 2. a complete frame, as one `DRAW_COPY` per band (see [`frames`]);
-//! 3. `MONITORS_CONFIG` with one head, if the client has that capability;
-//! 4. `MARK`.
-//!
-//! `INVAL_ALL_PALETTES` is not sent: andris sends no palettes.
+//! What it sends and when, as a user sees it, is described in
+//! [`docs/running.md`][running], under "What a client gets". This says
+//! what the code relies on.
 //!
 //! # Frames
 //!
-//! Every `frame_interval` andris captures the desktop and sends the bands
-//! that changed. A tick is skipped, not queued, while more than twice the
-//! ack window is unacknowledged, and every message waits for room in the
-//! window before it is sent. If the capture is a different size from the
-//! surface, the surface is destroyed and the start sequence re-run from
-//! `SURFACE_CREATE` at the new size.
+//! After `SET_ACK` ([`ACK_WINDOW`]) and the client's `INIT`, damage drives
+//! everything. The channel subscribes to damage before `INIT`, and a new
+//! subscription starts with the whole desktop pending, which the first
+//! frame takes. A frame starts only when damage is pending, at least
+//! `frame_interval` has passed since the last one started (a cap on the
+//! rate, not a polling period), and the ack window has room. Damage that
+//! arrives meanwhile merges in the subscription; pixels are never queued,
+//! so a frame always captures them fresh. A frame whose damage changed
+//! nothing sends nothing, not even `MARK`.
 //!
-//! The size is the capture's own, not a separate geometry query, so the
-//! surface is always created at the size of the frame about to be drawn
-//! on it, even when the desktop resizes between the two.
+//! A frame for damage of another size than the surface, or whose capture
+//! is of another size, captures the whole desktop and re-runs the start
+//! sequence ([`Display::start_surface`]) at the capture's own size, so the
+//! surface is always the size of the frame drawn on it.
+//!
+//! # Cancel-safety
+//!
+//! The main loop's `select!` drops every branch it does not take, so each
+//! must lose nothing when dropped: [`ChannelConn::recv`] and
+//! [`ChannelConn::wait_for_room`] keep what they read,
+//! [`DamageSubscription::changed`] loses nothing, the sleeps are made
+//! afresh each time round, and an interval's `tick()` is cancel-safe.
+//! Frames, refreshes and the scrub run in branch bodies, after the
+//! `select!` has chosen, so nothing drops them part way but the end of
+//! the channel.
+//!
+//! # The shadow
+//!
+//! The [`UpdateEncoder`]'s shadow holds the true pixels of everything the
+//! client was sent, even where it was sent lossily. So any part of the
+//! surface can be sent again without capturing it, and the scrub can
+//! compare a capture with what the client should show. A new surface
+//! starts with a new shadow and no lossy tiles.
 //!
 //! # Failed captures
 //!
-//! A failed capture skips the tick rather than closing the channel: a
-//! desktop resized while it is being captured (as RDP resizes an xrdp
-//! session) fails one capture, and the next succeeds. The first failure
-//! is logged as a warning and the recovery as information. The channel
-//! closes once [`MAX_CAPTURE_FAILURES`] captures in a row have failed,
-//! or at once if the platform says the desktop is gone for good.
+//! A failed capture skips its frame and puts the damage it took back.
+//! After any failed capture, a frame's or the scrub's, nothing is captured
+//! for the longer of `frame_interval` and [`CAPTURE_RETRY`]. The gap makes
+//! the failures a channel tolerates, [`MAX_CAPTURE_FAILURES`] in a row,
+//! span a fixed time rather than a number of frame intervals, long enough
+//! to ride out an RDP resize of an xrdp session. The channel closes on the
+//! last of them, or at once if the platform says the desktop is gone.
 //!
-//! # What the client sends
+//! # Lossy tiles and the refresh
 //!
-//! `PREFERRED_COMPRESSION` is honoured whenever it arrives: `OFF` means
-//! uncompressed bitmaps, and anything else means LZ4 when the client can
-//! decode it. `PREFERRED_VIDEO_CODEC_TYPE` and `STREAM_REPORT` are parsed
-//! and ignored, since andris sends no streams. A malformed message closes
-//! the channel; an unknown one is ignored.
+//! Every draw sent is recorded in [`LossyTiles`]: a lossy one makes the
+//! tiles it touches due for a refresh `lossless_delay` later, and a
+//! lossless one makes the tiles it covers exact. Damage a frame takes
+//! postpones the lossy tiles it touches. A refresh sends the tiles that
+//! are due losslessly from the shadow, as a frame of its own that waits
+//! for the rate cap and the ack window, behind any pending damage; it
+//! then marks them exact. So a still screen always ends up exact.
 //!
-//! [`frames`]: super::frames
+//! [running]: https://github.com/shakenfist/andris/blob/develop/docs/running.md
+//! [`LossyTiles`]: super::updates::LossyTiles
+
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use shakenfist_spice_protocol::constants::{image_compression, surface_fmt};
@@ -58,9 +76,10 @@ use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
 use super::channel::{ACK_WINDOW, ChannelConn, ChannelContext};
-use super::frames::{FrameEncoder, SURFACE_ID};
 use super::opcodes::DisplayOpcode;
-use crate::platform::{self, Frame, Size};
+use super::updates::{Draw, EncodeOptions, JpegQuality, LossyTiles, SURFACE_ID, UpdateEncoder};
+use crate::config::DEFAULT_FRAME_INTERVAL_MS;
+use crate::platform::{self, Capture, DamageSubscription, Rectangle, Region, Size, TILE};
 
 /// `SPICE_SURFACE_FLAGS_PRIMARY` (spice-protocol enums.h), which ryll's
 /// protocol crate does not name: the surface is the display itself.
@@ -69,17 +88,90 @@ pub const SURFACE_FLAGS_PRIMARY: u32 = 1 << 0;
 /// How many captures in a row may fail before the channel gives up.
 pub const MAX_CAPTURE_FAILURES: u32 = 10;
 
+/// The shortest wait after a failed capture before the next, unless
+/// `frame_interval` is longer. With [`MAX_CAPTURE_FAILURES`], it lets a
+/// channel ride out about two seconds of failures, as an RDP resize of an
+/// xrdp session can cause.
+pub const CAPTURE_RETRY: Duration = Duration::from_millis(200);
+
+/// The most rectangles a frame captures its damage as. More than a frame
+/// sends ([`MAX_RECTS_PER_FRAME`]), since a capture of a few more, smaller
+/// rectangles reads less of the desktop than one of fewer, larger ones.
+///
+/// [`MAX_RECTS_PER_FRAME`]: super::updates::MAX_RECTS_PER_FRAME
+pub const MAX_CAPTURE_RECTS: usize = 64;
+
+/// How long the scrub takes to re-read the whole desktop, unless the
+/// server's options say otherwise.
+pub const SCRUB_PERIOD: Duration = Duration::from_secs(4);
+
+/// How many ticks the scrub spreads one pass over the desktop across.
+pub const SCRUB_SLICES: u32 = 16;
+
+/// How long an area sent as JPEG must go without damage before it is
+/// sent again losslessly, unless the server's options say otherwise.
+pub const LOSSLESS_DELAY: Duration = Duration::from_millis(500);
+
+/// How a display channel paces its frames, its scrub and its lossless
+/// refreshes, and whether it may send JPEG. The server hands every
+/// display channel the same options. [`DisplayOptions::default`] gives
+/// what andris runs with when the command line does not say otherwise;
+/// tests shorten the times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayOptions {
+    /// The shortest time between the starts of two frames: a cap on the
+    /// frame rate, not a polling period.
+    pub frame_interval: Duration,
+    /// How long the scrub takes to re-read the whole desktop.
+    pub scrub_period: Duration,
+    /// How long an area sent as JPEG must stay still before it is sent
+    /// again losslessly.
+    pub lossless_delay: Duration,
+    /// The quality to send JPEG at, or `None` if JPEG must not be sent
+    /// (`--jpeg-quality 0`).
+    pub jpeg_quality: Option<JpegQuality>,
+}
+
+impl Default for DisplayOptions {
+    /// `--frame-interval-ms` and `--jpeg-quality` at their defaults,
+    /// [`SCRUB_PERIOD`] and [`LOSSLESS_DELAY`].
+    fn default() -> Self {
+        Self {
+            frame_interval: Duration::from_millis(DEFAULT_FRAME_INTERVAL_MS),
+            scrub_period: SCRUB_PERIOD,
+            lossless_delay: LOSSLESS_DELAY,
+            jpeg_quality: Some(JpegQuality::DEFAULT),
+        }
+    }
+}
+
 /// Serve a display channel until the client closes it.
 pub async fn run(ctx: ChannelContext, mut conn: ChannelConn<DisplayOpcode>) -> Result<()> {
     conn.start_acks(ACK_WINDOW).await?;
+    // Subscribed before INIT, so that no damage reported from here on is
+    // missed. The subscription starts with the whole desktop pending,
+    // which the first frame takes.
+    let damage = ctx
+        .platform
+        .screen
+        .subscribe_damage()
+        .context("subscribing to the desktop's damage")?;
+    let scrub_every = scrub_tick(ctx.display.scrub_period);
+    let lossy = LossyTiles::new(ctx.display.lossless_delay);
     let mut display = Display {
         ctx,
         conn,
         preferred_compression: None,
         initialised: false,
         surface: None,
-        encoder: FrameEncoder::new(),
+        encoder: UpdateEncoder::new(),
         capture_failures: 0,
+        damage,
+        damage_pending: false,
+        next_frame: Instant::now(),
+        capture_retry: Instant::now(),
+        scrub_top: 0,
+        lossy,
     };
 
     // Wait for INIT, handling whatever else arrives first.
@@ -90,28 +182,93 @@ pub async fn run(ctx: ChannelContext, mut conn: ChannelConn<DisplayOpcode>) -> R
         display.handle(&message)?;
     }
 
-    // The first tick creates the surface; if its capture fails, a later
-    // tick does.
-    display.tick().await?;
-
-    let interval = display.ctx.frame_interval;
-    let mut ticks = tokio::time::interval_at(Instant::now() + interval, interval);
-    ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut scrub_ticks = tokio::time::interval_at(Instant::now() + scrub_every, scrub_every);
+    scrub_ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
+        let now = Instant::now();
+        let cap_open = now >= display.next_frame;
+        let room = display.conn.may_send();
+        if display.damage_pending && cap_open && room {
+            display.frame().await?;
+            continue;
+        }
+        // A refresh is a frame too, but pending damage goes first.
+        let refresh_at = display.lossy.next_due();
+        let refresh_due = refresh_at.is_some_and(|at| at <= now);
+        if refresh_due && cap_open && room {
+            display.refresh().await?;
+            continue;
+        }
+        // Something blocks a frame or a refresh, or neither is wanted.
+        // Wait for what would unblock it, for the client, for the next
+        // lossy tile to fall due, and for the scrub, but never for damage
+        // already known to be pending: changed() would return at once,
+        // and the loop would spin.
+        let pending = display.damage_pending;
+        let wanted = pending || refresh_due;
+        let await_room = wanted && cap_open;
+        let next_frame = display.next_frame;
+        // Every branch is cancel-safe: next_incoming wraps recv() or
+        // wait_for_room(), each of which keeps whatever it read; changed()
+        // loses nothing when dropped; each sleep is made afresh each time
+        // round; and an interval's tick() is cancel-safe.
         tokio::select! {
-            message = display.conn.recv() => {
-                let Some(message) = message? else {
-                    return Ok(());
-                };
-                display.handle(&message)?;
-            }
-            _ = ticks.tick() => {
-                if display.conn.may_send() {
-                    display.tick().await?;
-                }
-            }
+            incoming = next_incoming(&mut display.conn, await_room) => match incoming? {
+                Incoming::Message(message) => display.handle(&message)?,
+                Incoming::Closed => return Ok(()),
+                Incoming::Room => {}
+            },
+            () = display.damage.changed(), if !pending => display.damage_pending = true,
+            () = tokio::time::sleep_until(next_frame), if wanted && !cap_open => {}
+            () = tokio::time::sleep_until(refresh_at.unwrap_or(now)),
+                if refresh_at.is_some() && !refresh_due => {}
+            _ = scrub_ticks.tick() => display.scrub().await?,
         }
     }
+}
+
+/// The scrub's tick: [`SCRUB_SLICES`] of them make `period`. Never zero,
+/// which a tokio interval refuses.
+fn scrub_tick(period: Duration) -> Duration {
+    (period / SCRUB_SLICES).max(Duration::from_millis(1))
+}
+
+/// The height of one scrub slice of a desktop `height` rows tall: whole
+/// [`TILE`] rows, enough of them that [`SCRUB_SLICES`] slices cover it.
+fn scrub_slice_height(height: u32) -> u32 {
+    height.div_ceil(TILE).div_ceil(SCRUB_SLICES).max(1) * TILE
+}
+
+/// What the client's side of the main loop's select produced.
+enum Incoming {
+    /// A message for the display channel.
+    Message(ReceivedMessage),
+    /// The client closed the channel.
+    Closed,
+    /// The ack window has room again.
+    Room,
+}
+
+/// Read the client: until the ack window has room if `await_room`, and
+/// otherwise until a message arrives. Cancel-safe, as
+/// [`ChannelConn::recv`] and [`ChannelConn::wait_for_room`] are.
+///
+/// `ACK`s are consumed inside the connection and never returned by
+/// [`ChannelConn::recv`], so a channel waiting for room must read the
+/// client through [`ChannelConn::wait_for_room`], which returns once an
+/// `ACK` makes room and keeps any other message for the next `recv`.
+async fn next_incoming(
+    conn: &mut ChannelConn<DisplayOpcode>,
+    await_room: bool,
+) -> Result<Incoming> {
+    if await_room {
+        conn.wait_for_room().await?;
+        return Ok(Incoming::Room);
+    }
+    Ok(match conn.recv().await? {
+        Some(message) => Incoming::Message(message),
+        None => Incoming::Closed,
+    })
 }
 
 /// One display channel's state.
@@ -125,13 +282,33 @@ struct Display {
     initialised: bool,
     /// The primary surface's size, once it has been created.
     surface: Option<Size>,
-    encoder: FrameEncoder,
+    /// The shadow of what the client's surface holds.
+    encoder: UpdateEncoder,
     /// How many captures in a row have failed.
     capture_failures: u32,
+    /// The desktop's damage, as this channel sees it.
+    damage: DamageSubscription,
+    /// Whether [`DamageSubscription::changed`] has said damage is pending
+    /// since the last frame took it.
+    damage_pending: bool,
+    /// The earliest the next frame may start.
+    next_frame: Instant,
+    /// The earliest the next capture of any kind may start, after a
+    /// failed one.
+    capture_retry: Instant,
+    /// The top row of the scrub's next slice.
+    scrub_top: u32,
+    /// The tiles last sent lossily, and when each is due to be sent again
+    /// losslessly.
+    lossy: LossyTiles,
 }
 
 impl Display {
-    /// Handle one message from the client.
+    /// Handle one message from the client. `PREFERRED_COMPRESSION` takes
+    /// effect from the next draw (see [`Display::encode_options`]);
+    /// `PREFERRED_VIDEO_CODEC_TYPE` and `STREAM_REPORT` are parsed and
+    /// ignored, since andris sends no streams. A malformed message fails,
+    /// closing the channel; an unknown one is ignored.
     fn handle(&mut self, message: &ReceivedMessage) -> Result<()> {
         let session = self.conn.session().id();
         match message.header.message_type {
@@ -175,13 +352,25 @@ impl Display {
         Ok(())
     }
 
-    /// Whether bands may be LZ4: the client can decode it and has not
-    /// asked for no compression.
-    fn lz4_allowed(&self) -> bool {
-        self.ctx
-            .caps
-            .has_channel_mask(capabilities::DISPLAY_LZ4_COMPRESSION)
-            && self.preferred_compression != Some(image_compression::OFF)
+    /// How images may be encoded: LZ4 if the client can decode it and has
+    /// not asked for no compression, and JPEG only if the client leaves
+    /// the choice to the server and `--jpeg-quality` allows it.
+    fn encode_options(&self) -> EncodeOptions {
+        let preferred = self.preferred_compression;
+        let jpeg = match preferred {
+            None | Some(image_compression::AUTO_GLZ | image_compression::AUTO_LZ) => {
+                self.ctx.display.jpeg_quality
+            }
+            Some(_) => None,
+        };
+        EncodeOptions {
+            lz4: self
+                .ctx
+                .caps
+                .has_channel_mask(capabilities::DISPLAY_LZ4_COMPRESSION)
+                && preferred != Some(image_compression::OFF),
+            jpeg,
+        }
     }
 
     /// Wait for room in the ack window, then send one message.
@@ -196,26 +385,38 @@ impl Display {
         self.conn.send_msg(op, message).await
     }
 
-    /// Capture the desktop. Captures may block, so this runs on the
-    /// blocking pool. It borrows `self` only to start, so the future
-    /// stays `Send` although the connection is not `Sync`.
-    fn capture(&self) -> impl Future<Output = Result<Frame>> + Send + 'static {
-        let frames = self.ctx.platform.frames.clone();
+    /// Capture `rects`, or the whole desktop if `None`. Captures may
+    /// block, so this runs on the blocking pool. It borrows `self` only to
+    /// start, so the future stays `Send` although the connection is not
+    /// `Sync`.
+    fn capture(
+        &self,
+        rects: Option<Vec<Rectangle>>,
+    ) -> impl Future<Output = Result<Capture>> + Send + 'static {
+        let screen = self.ctx.platform.screen.clone();
         async move {
-            tokio::task::spawn_blocking(move || frames.capture())
-                .await
-                .context("the capture task failed")?
-                .context("capturing the desktop")
+            tokio::task::spawn_blocking(move || match rects {
+                Some(rects) => screen.capture(&rects),
+                None => screen.capture_all(),
+            })
+            .await
+            .context("the capture task failed")?
+            .context("capturing the desktop")
         }
     }
 
-    /// Capture, counting failures. `None` skips this tick. Fails if the
-    /// desktop is gone, or once [`MAX_CAPTURE_FAILURES`] captures in a
-    /// row have failed.
-    async fn capture_or_skip(&mut self) -> Result<Option<Frame>> {
+    /// [`Display::capture`], counting failures. `None` skips this
+    /// capture. Fails if the desktop is gone, or once
+    /// [`MAX_CAPTURE_FAILURES`] captures in a row have failed.
+    async fn capture_or_skip(&mut self, rects: Option<Vec<Rectangle>>) -> Result<Option<Capture>> {
         let session = self.conn.session().id();
-        match self.capture().await {
-            Ok(frame) => {
+        let started = Instant::now();
+        match self.capture(rects).await {
+            Ok(capture) => {
+                self.conn
+                    .session()
+                    .counters()
+                    .capture_done(started.elapsed());
                 if self.capture_failures > 0 {
                     info!(
                         session,
@@ -224,11 +425,15 @@ impl Display {
                     );
                     self.capture_failures = 0;
                 }
-                Ok(Some(frame))
+                Ok(Some(capture))
             }
             Err(e) if platform::is_gone(&e) => Err(e),
             Err(e) => {
                 self.capture_failures += 1;
+                // Hold off every capture, the frames' and the scrub's.
+                let retry = Instant::now() + self.ctx.display.frame_interval.max(CAPTURE_RETRY);
+                self.capture_retry = retry;
+                self.next_frame = self.next_frame.max(retry);
                 if self.capture_failures >= MAX_CAPTURE_FAILURES {
                     return Err(
                         e.context(format!("{MAX_CAPTURE_FAILURES} captures in a row failed"))
@@ -246,21 +451,55 @@ impl Display {
         }
     }
 
-    /// Capture, and send what changed. A capture of another size than
-    /// the surface, or the first capture, creates the surface. A failed
-    /// capture sends nothing.
-    async fn tick(&mut self) -> Result<()> {
-        let Some(frame) = self.capture_or_skip().await? else {
+    /// Take the pending damage, capture it, and send what changed and
+    /// then `MARK`; or, for the first frame or after a resize, run the
+    /// start sequence from a capture of the whole desktop. A failed
+    /// capture sends nothing, and puts the damage back to be taken again.
+    async fn frame(&mut self) -> Result<()> {
+        self.damage_pending = false;
+        let region = self.damage.take().context("taking the desktop's damage")?;
+        if region.is_empty() {
             return Ok(());
-        };
-        if self.surface == Some(frame.size()) {
-            return self.send_frame(frame, false).await;
         }
+        let now = Instant::now();
+        self.next_frame = now + self.ctx.display.frame_interval;
+        // Damage postpones the refresh of the lossy tiles it touches,
+        // whatever the capture finds.
+        self.lossy.touch(&region, now);
+
+        // Without a surface of the region's size, the surface is created
+        // afresh, which needs all of the desktop.
+        let whole = self.surface != Some(region.size());
+        let rects = (!whole).then(|| region.rectangles(MAX_CAPTURE_RECTS));
+        let Some(mut capture) = self.capture_or_skip(rects).await? else {
+            return self.damage.restore(&region);
+        };
+        if !whole && self.surface != Some(capture.size()) {
+            // The desktop resized before its damage said so.
+            let Some(all) = self.capture_or_skip(None).await? else {
+                return self.damage.restore(&region);
+            };
+            capture = all;
+        }
+
+        if self.surface != Some(capture.size()) {
+            return self.replace_surface(capture).await;
+        }
+        if self.send_update(capture).await? > 0 {
+            self.send(DisplayOpcode::Mark, &[]).await?;
+            self.conn.session().counters().frame_sent(false);
+        }
+        Ok(())
+    }
+
+    /// Destroy the surface, if there is one, and start one at `capture`'s
+    /// size. `capture` must be of the whole desktop.
+    async fn replace_surface(&mut self, capture: Capture) -> Result<()> {
         if let Some(old) = self.surface.take() {
             debug!(
                 session = self.conn.session().id(),
                 from = %old,
-                to = %frame.size(),
+                to = %capture.size(),
                 "the desktop changed size; replacing the surface"
             );
             self.send_msg(
@@ -271,13 +510,19 @@ impl Display {
             )
             .await?;
         }
-        self.start_surface(frame).await
+        self.start_surface(capture).await
     }
 
-    /// Create the primary surface at `frame`'s size and draw all of it,
-    /// then describe the monitor and mark the display ready.
-    async fn start_surface(&mut self, frame: Frame) -> Result<()> {
-        let size = frame.size();
+    /// Create the primary surface at `capture`'s size and draw all of it,
+    /// then describe the monitor and mark the display ready. `capture`
+    /// must be of the whole desktop.
+    ///
+    /// `MONITORS_CONFIG`, with one head, goes only to a client with that
+    /// capability. `INVAL_ALL_PALETTES` is never sent: andris sends no
+    /// palettes, and keeps no pixmap cache or GLZ dictionary for `INIT` to
+    /// size.
+    async fn start_surface(&mut self, capture: Capture) -> Result<()> {
+        let size = capture.size();
         self.send_msg(
             DisplayOpcode::SurfaceCreate,
             &SurfaceCreate {
@@ -290,7 +535,11 @@ impl Display {
         )
         .await?;
         self.surface = Some(size);
-        self.send_frame(frame, true).await?;
+        // A new surface starts empty, so the client has nothing the old
+        // shadow describes, lossily or not.
+        self.encoder.reset();
+        self.lossy.reset(size);
+        self.send_update(capture).await?;
         if self
             .ctx
             .caps
@@ -311,25 +560,189 @@ impl Display {
             self.send_msg(DisplayOpcode::MonitorsConfig, &config)
                 .await?;
         }
-        self.send(DisplayOpcode::Mark, &[]).await
+        self.send(DisplayOpcode::Mark, &[]).await?;
+        self.conn.session().counters().frame_sent(false);
+        Ok(())
     }
 
-    /// Send `frame`'s bands: all of them if `complete`, otherwise those
-    /// that changed. Encoding is CPU-bound, so it runs on the blocking
-    /// pool.
-    async fn send_frame(&mut self, frame: Frame, complete: bool) -> Result<()> {
-        let lz4 = self.lz4_allowed();
+    /// Run `f` on the encoder on the blocking pool, since comparing and
+    /// encoding are CPU-bound, and put the encoder back.
+    ///
+    /// The encoder moves into the task, leaving a default one behind
+    /// until it returns. If the task panics, the encoder is lost with it:
+    /// this fails, the failure closes the channel, and the default
+    /// encoder left behind is never used. Dropping this future before
+    /// the task ends loses the encoder too, which happens only when the
+    /// channel itself is dropped.
+    async fn with_encoder<R: Send + 'static>(
+        &mut self,
+        f: impl FnOnce(&mut UpdateEncoder) -> R + Send + 'static,
+    ) -> Result<R> {
         let mut encoder = std::mem::take(&mut self.encoder);
-        let (encoder, bodies) = tokio::task::spawn_blocking(move || {
-            let bodies = encoder.encode(frame, complete, lz4);
-            (encoder, bodies)
+        let (encoder, result) = tokio::task::spawn_blocking(move || {
+            let result = f(&mut encoder);
+            (encoder, result)
         })
         .await
         .context("the encoding task failed")?;
         self.encoder = encoder;
-        for body in bodies? {
-            self.send(DisplayOpcode::DrawCopy, &body).await?;
+        Ok(result)
+    }
+
+    /// Send what in `capture` differs from what the client was last
+    /// sent: all of it after [`UpdateEncoder::reset`]. Returns how many
+    /// draws were sent.
+    async fn send_update(&mut self, capture: Capture) -> Result<usize> {
+        let options = self.encode_options();
+        let started = Instant::now();
+        let update = self
+            .with_encoder(move |encoder| encoder.update(&capture, options))
+            .await?
+            .context("encoding an update")?;
+        let counters = self.conn.session().counters();
+        counters.encode_done(started.elapsed());
+        counters.area_updated(update.captured_area, update.changed_area);
+        self.send_draws(&update.draws).await?;
+        Ok(update.draws.len())
+    }
+
+    /// Send `draws`, and record which tiles they leave lossy or exact.
+    async fn send_draws(&mut self, draws: &[Draw]) -> Result<()> {
+        for draw in draws {
+            self.send(DisplayOpcode::DrawCopy, &draw.body).await?;
+            self.conn
+                .session()
+                .counters()
+                .draw_sent(draw.encoding, draw.encoded_bytes());
+        }
+        self.lossy.record(draws, Instant::now());
+        Ok(())
+    }
+
+    /// Send the lossy tiles that are due again losslessly, from the
+    /// shadow, and then `MARK`: a frame of its own, which counts against
+    /// the rate cap as any frame does.
+    async fn refresh(&mut self) -> Result<()> {
+        let now = Instant::now();
+        let due = self.lossy.due(now);
+        if due.is_empty() {
+            return Ok(());
+        }
+        self.next_frame = now + self.ctx.display.frame_interval;
+        let options = self.encode_options().lossless();
+        let region = due.clone();
+        let started = Instant::now();
+        let draws = self
+            .with_encoder(move |encoder| encoder.refresh(&region, options))
+            .await?
+            .context("encoding a refresh")?
+            .draws;
+        self.conn
+            .session()
+            .counters()
+            .encode_done(started.elapsed());
+        debug!(
+            session = self.conn.session().id(),
+            tiles = due.tile_count(),
+            draws = draws.len(),
+            "sending lossy tiles again losslessly"
+        );
+        self.send_draws(&draws).await?;
+        // Every tile of the region was sent losslessly, whether or not a
+        // draw covered it wholly.
+        self.lossy.clear(&due);
+        if !draws.is_empty() {
+            self.send(DisplayOpcode::Mark, &[]).await?;
+            self.conn.session().counters().frame_sent(true);
         }
         Ok(())
+    }
+
+    /// Re-read the scrub's next slice of the desktop, and add each tile
+    /// that differs from the shadow to the pending damage, for the next
+    /// frame to send. Does nothing without a surface, without room in the
+    /// ack window, or within [`CAPTURE_RETRY`] of a failed capture. A
+    /// failed capture reads the same slice next time.
+    ///
+    /// The slices are full-width bands of whole tile rows, top to bottom
+    /// and wrapping, each [`SCRUB_SLICES`]th of the desktop's tile rows
+    /// rounded up; one is read each tick, so the whole desktop is read at
+    /// least once every `scrub_period`.
+    async fn scrub(&mut self) -> Result<()> {
+        let Some(size) = self.surface else {
+            return Ok(());
+        };
+        if !self.conn.may_send() || Instant::now() < self.capture_retry {
+            return Ok(());
+        }
+        if self.scrub_top >= size.height {
+            self.scrub_top = 0;
+        }
+        let height = scrub_slice_height(size.height);
+        let slice = Rectangle::new(
+            0,
+            self.scrub_top,
+            size.width,
+            height.min(size.height - self.scrub_top),
+        );
+        let Some(capture) = self.capture_or_skip(Some(vec![slice])).await? else {
+            return Ok(());
+        };
+        self.scrub_top = self.scrub_top.saturating_add(height);
+        if capture.size() != size {
+            // The desktop resized before its damage said so. Any damage
+            // starts a frame, whose capture finds the new size.
+            self.damage.add(&Region::full(size))?;
+            return Ok(());
+        }
+
+        let differences = self
+            .with_encoder(move |encoder| encoder.differences(&capture))
+            .await?
+            .context("comparing the scrub's slice")?;
+        if differences.is_empty() {
+            return Ok(());
+        }
+        // Tiles already pending are not counted: damage reported them.
+        let added = self.damage.add(&differences)?;
+        if added > 0 {
+            let total = self.conn.session().counters().scrub_found(added as u64);
+            debug!(
+                session = self.conn.session().id(),
+                slice = %slice,
+                tiles = added,
+                total,
+                "the scrub found changes the desktop's damage did not report"
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scrub_slices_are_whole_tile_rows_and_cover_the_desktop() {
+        // A desktop of 21 tile rows, the last partial: two rows a slice,
+        // eleven slices.
+        assert_eq!(scrub_slice_height(1308), 128);
+        for height in [1, 64, 65, 192, 768, 1024, 1308, 2160, 16384] {
+            let slice = scrub_slice_height(height);
+            assert_eq!(slice % TILE, 0, "{height} rows");
+            assert!(
+                height.div_ceil(slice) <= SCRUB_SLICES,
+                "{height} rows take more than {SCRUB_SLICES} slices of {slice}"
+            );
+        }
+        // A small desktop is one tile row a slice.
+        assert_eq!(scrub_slice_height(192), TILE);
+    }
+
+    #[test]
+    fn the_scrub_ticks_sixteen_times_a_period() {
+        assert_eq!(scrub_tick(SCRUB_PERIOD), Duration::from_millis(250));
+        assert_eq!(scrub_tick(Duration::ZERO), Duration::from_millis(1));
     }
 }

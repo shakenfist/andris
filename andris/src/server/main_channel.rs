@@ -5,7 +5,20 @@
 //! the channels andris serves, applies the client's mouse mode request,
 //! and pings every [`PING_INTERVAL`] to keep the connection measured.
 //! Everything else the client sends is read and ignored.
+//!
+//! # Metrics
+//!
+//! This channel also reports the session's metrics (see [`stats`]). Its
+//! task lives exactly as long as the session does: a session ends when
+//! its main channel does, and ending a session cancels the task. So it
+//! needs no task of its own and nothing to stop. Every
+//! [`STATS_INTERVAL`] it logs a summary of the interval if any frame was
+//! sent in it, and a [`SessionSummary`] guard logs the whole session's
+//! once when the task ends, however it ends.
+//!
+//! [`stats`]: super::stats
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -14,11 +27,12 @@ use shakenfist_spice_protocol::messages::{
 };
 use shakenfist_spice_protocol::{ChannelType, MOUSE_MODE_CLIENT, MOUSE_MODE_SERVER, main_client};
 use tokio::time::{Instant, MissedTickBehavior};
-use tracing::debug;
+use tracing::{debug, info};
 
 use super::channel::{ChannelConn, ChannelContext};
 use super::opcodes::MainOpcode;
-use super::session::MouseMode;
+use super::session::{MouseMode, Session};
+use super::stats::{Reporter, STATS_INTERVAL};
 
 /// How often the main channel pings the client.
 pub const PING_INTERVAL: Duration = Duration::from_secs(30);
@@ -41,16 +55,45 @@ const SUPPORTED_MOUSE_MODES: u16 = (MOUSE_MODE_SERVER | MOUSE_MODE_CLIENT) as u1
 
 /// Serve a main channel until the client closes it.
 pub async fn run(ctx: ChannelContext, conn: ChannelConn<MainOpcode>) -> Result<()> {
-    serve(ctx, conn, PING_INTERVAL).await
+    serve_reporting(ctx, conn, PING_INTERVAL, STATS_INTERVAL).await
+}
+
+/// Logs the whole session's metrics when dropped: that is, when the main
+/// channel's task ends or is cancelled, which is the session's end.
+struct SessionSummary(Arc<Session>);
+
+impl Drop for SessionSummary {
+    fn drop(&mut self) {
+        let elapsed = self.0.elapsed();
+        info!(
+            session = self.0.id(),
+            "session ends after {:.1} s: {}; {} kB written in all",
+            elapsed.as_secs_f64(),
+            self.0.stats().summary(elapsed),
+            self.0.stats().total_bytes() / 1000,
+        );
+    }
 }
 
 /// Serve a main channel, pinging every `ping_interval`.
 pub async fn serve(
     ctx: ChannelContext,
-    mut conn: ChannelConn<MainOpcode>,
+    conn: ChannelConn<MainOpcode>,
     ping_interval: Duration,
 ) -> Result<()> {
+    serve_reporting(ctx, conn, ping_interval, STATS_INTERVAL).await
+}
+
+/// Serve a main channel, pinging every `ping_interval` and logging the
+/// session's metrics every `stats_interval`.
+pub async fn serve_reporting(
+    ctx: ChannelContext,
+    mut conn: ChannelConn<MainOpcode>,
+    ping_interval: Duration,
+    stats_interval: Duration,
+) -> Result<()> {
     let session = ctx.session.clone();
+    let _summary = SessionSummary(session.clone());
 
     let init = MainInit {
         session_id: session.id(),
@@ -70,6 +113,11 @@ pub async fn serve(
 
     let mut pings = tokio::time::interval_at(Instant::now() + ping_interval, ping_interval);
     pings.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    let mut reports = tokio::time::interval_at(Instant::now() + stats_interval, stats_interval);
+    reports.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut reporter = Reporter::new(session.stats());
+    let mut reported = Instant::now();
 
     loop {
         tokio::select! {
@@ -112,6 +160,13 @@ pub async fn serve(
                     _ => conn.ignore(&message),
                 }
             }
+            _ = reports.tick() => {
+                let now = Instant::now();
+                if let Some(line) = reporter.interval_line(session.stats(), now - reported) {
+                    info!(session = session.id(), "metrics: {line}");
+                }
+                reported = now;
+            }
             _ = pings.tick() => {
                 ping_id = ping_id.wrapping_add(1);
                 send_ping(&ctx, &mut conn, ping_id).await?;
@@ -144,6 +199,7 @@ mod tests {
     use crate::platform::Size;
     use crate::platform::synthetic::SyntheticPlatform;
     use crate::server::channel::ClientCaps;
+    use crate::server::display::DisplayOptions;
     use crate::server::opcodes::ServerOpcode;
     use crate::server::session::SessionRegistry;
 
@@ -162,7 +218,7 @@ mod tests {
             platform: platform.platform(),
             caps: ClientCaps::default(),
             channel_id: 0,
-            frame_interval: Duration::from_millis(50),
+            display: DisplayOptions::default(),
         };
         let (server_end, mut client_end) = tokio::io::duplex(64 * 1024);
         let conn = ChannelConn::<MainOpcode>::new(server_end, session);

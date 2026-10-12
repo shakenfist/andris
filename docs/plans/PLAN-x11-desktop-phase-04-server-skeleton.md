@@ -630,7 +630,7 @@ diff.
 | 7 | high | opus | none | Complete | `make e2e` against Xvfb and ryll headless, and its CI job. See brief 7. |
 | 8 | medium | sonnet | none | Complete | Documentation. See brief 8. |
 | 9 | medium | management | none | Complete | The kerbside smoke test. See brief 9. |
-| 10 | medium | management | none | In progress | Push audit, pull request, queue. See brief 10. |
+| 10 | medium | management | none | Complete | Push audit, pull request, queue. See brief 10. |
 
 Steps 1 and 2 are gated (see the back brief) because their shape is
 cheap to propose and expensive to change once four channels sit on
@@ -1409,7 +1409,7 @@ in andris:
     in the master plan's Future work.
   - Mutation checks confirm the new tests fail without each fix.
 
-The pull request and its merge commit are recorded below once known.
+The phase landed as andris#7, merged as `1950cdb`.
 
 ## Back brief
 

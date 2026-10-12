@@ -7,8 +7,8 @@
 //! - [`opcodes`] lists what each channel may send;
 //! - [`main_channel`], [`display`], [`inputs`] and [`cursor`] serve the
 //!   four channels;
-//! - [`frames`] cuts captured frames into the display channel's
-//!   `DRAW_COPY` bands;
+//! - [`updates`] compares captures with what the display channel last
+//!   sent, and encodes what changed as `DRAW_COPY`s;
 //! - [`keymap`] decodes the inputs channel's set-1 scancodes to evdev
 //!   codes;
 //! - [`tls`] loads the TLS listener's certificate.
@@ -37,14 +37,15 @@
 pub mod channel;
 pub mod cursor;
 pub mod display;
-pub mod frames;
 pub mod inputs;
 pub mod keymap;
 pub mod link;
 pub mod main_channel;
 pub mod opcodes;
 pub mod session;
+pub mod stats;
 pub mod tls;
+pub mod updates;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
@@ -62,6 +63,7 @@ use tracing::{debug, info, warn};
 use crate::config::Ticket;
 use crate::platform::Platform;
 use channel::{ChannelConn, ChannelContext, drive};
+pub use display::DisplayOptions;
 pub use link::HandshakeTimeouts;
 use link::{HandshakeContext, Linked, ServedChannel, timed};
 use opcodes::{CursorOpcode, DisplayOpcode, InputsOpcode, MainOpcode};
@@ -114,7 +116,9 @@ pub struct ServerOptions {
     pub listen: SocketAddr,
     pub tls: Option<TlsOptions>,
     pub ticket: Ticket,
-    pub frame_interval: Duration,
+    /// How display channels pace their frames, and whether they may send
+    /// JPEG.
+    pub display: DisplayOptions,
     /// The handshake's time limits; tests shorten them.
     pub timeouts: HandshakeTimeouts,
 }
@@ -236,7 +240,7 @@ struct HandshakeSlot {
 struct Shared {
     ticket: Ticket,
     platform: Platform,
-    frame_interval: Duration,
+    display: DisplayOptions,
     timeouts: HandshakeTimeouts,
     registry: SessionRegistry,
     handshakes: Arc<Semaphore>,
@@ -290,7 +294,7 @@ impl Server {
             shared: Arc::new(Shared {
                 ticket: options.ticket,
                 platform,
-                frame_interval: options.frame_interval,
+                display: options.display,
                 timeouts: options.timeouts,
                 registry: SessionRegistry::new(),
                 handshakes: Arc::new(Semaphore::new(MAX_HANDSHAKES)),
@@ -625,7 +629,7 @@ async fn serve_channel(stream: SpiceStream, linked: Linked, shared: &Shared) {
         platform: shared.platform.clone(),
         caps: linked.caps,
         channel_id: linked.channel_id,
-        frame_interval: shared.frame_interval,
+        display: shared.display,
     };
     match linked.channel {
         ServedChannel::Main => {

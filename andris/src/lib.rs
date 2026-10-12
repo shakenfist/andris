@@ -7,6 +7,12 @@
 //! - [`platform`] holds the seams between the server and the desktop,
 //!   and their implementations;
 //! - [`server`] holds the SPICE server.
+//!
+//! Unsafe code is denied crate-wide. The one exception is the X11
+//! backend's MIT-SHM capture, `platform::x11::shm`, which maps memory the
+//! X server writes; it alone allows it, and justifies each block.
+
+#![deny(unsafe_code)]
 
 pub mod config;
 pub mod platform;
@@ -19,7 +25,7 @@ use config::{Config, PlatformConfig};
 use platform::Platform;
 use platform::synthetic::SyntheticPlatform;
 use platform::x11::X11Platform;
-use server::{HandshakeTimeouts, STOP_GRACE, Server, ServerOptions, TlsOptions};
+use server::{DisplayOptions, HandshakeTimeouts, STOP_GRACE, Server, ServerOptions, TlsOptions};
 
 /// Andris's name and version, as `--version` prints them.
 pub fn banner() -> String {
@@ -61,7 +67,11 @@ async fn serve(config: Config, platform: Platform) -> Result<()> {
         listen: config.listen,
         tls,
         ticket: config.ticket,
-        frame_interval: config.frame_interval,
+        display: DisplayOptions {
+            frame_interval: config.frame_interval,
+            jpeg_quality: config.jpeg_quality,
+            ..DisplayOptions::default()
+        },
         timeouts: HandshakeTimeouts::default(),
     };
     let mut handle = Server::bind(options, platform).await?.spawn()?;

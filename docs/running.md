@@ -41,7 +41,8 @@ andris --ticket-file PATH [options]
 | `--tls-listen ADDR:PORT` | none | A TLS listener; needs `--tls-cert` and `--tls-key` |
 | `--tls-cert PATH` | none | The TLS certificate chain, as PEM, leaf first |
 | `--tls-key PATH` | none | The TLS private key, as PEM |
-| `--frame-interval-ms MS` | `200` | How often the desktop is captured; at least 20 |
+| `--frame-interval-ms MS` | `33` | The shortest time between two frames, a cap on the frame rate (33 is about 30 frames a second); at least 20. It is a cap, not a timer: see [What a client gets](#what-a-client-gets) |
+| `--jpeg-quality QUALITY` | `85` | The JPEG quality, 1 to 100, for areas that look photographic; `0` never sends JPEG (see [What a client gets](#what-a-client-gets)) |
 
 `andris --help` prints the same list. Logs go to stderr at `info`
 level; set `RUST_LOG` (for example `RUST_LOG=andris=debug`) to
@@ -74,11 +75,29 @@ naming every problem it found, unless:
 - the root window's depth is 24 or 32, stored at 32 bits a pixel;
 - the image byte order is LSBFirst and the root visual is TrueColor
   with the usual BGRX masks (`0xff0000`, `0x00ff00`, `0x0000ff`);
-- the XTEST, XFIXES and XKEYBOARD extensions are present.
+- the XTEST, XFIXES, XKEYBOARD and DAMAGE extensions are present.
 
 Xvfb at 24 bits meets these, and the end-to-end test runs against
-it. The server's keyboard layout is read once at startup, so a layout changed
-afterwards with `setxkbmap` is not noticed until andris restarts.
+it.
+
+The DAMAGE extension is how andris learns which parts of the desktop
+changed, so an X server without it is refused. MIT-SHM is optional.
+Andris reads the screen with it when it can: it shares a memfd with
+the X server (`ShmAttachFd`, MIT-SHM 1.2), so pixels do not cross the
+X socket. It falls back to the slower `GetImage` when the server lacks
+MIT-SHM 1.2, when the display is reached over TCP (a file descriptor
+cannot cross it), or when the server refuses the shared segment. Which
+it uses, and why, is logged at info at startup, as
+`capturing the screen with MIT-SHM, through a shared memfd` or
+`capturing the screen with GetImage, because ...` followed by the
+reason. Use a local display (`:10`, not `host:10`) to get MIT-SHM.
+If captures through the shared segment keep failing, as they do if
+another client detaches it, andris attaches a fresh one once and then
+switches to `GetImage` for good, logging a warning each time.
+
+The server's keyboard layout is read once at startup, so a layout
+changed afterwards with `setxkbmap` is not noticed until andris
+restarts.
 
 ## The synthetic platform
 
@@ -180,18 +199,57 @@ A connection opens four channels, and ryll opens all four:
 | inputs | Applies the client's keys and pointer events to the desktop, and reports the desktop's lock-key state |
 | cursor | The pointer's shape as it changes, as an alpha cursor |
 
-**Display.** Every `--frame-interval-ms` andris captures the whole
-desktop and cuts it into bands of 64 rows. It sends the first frame
-whole, and after that only the bands whose pixels changed since the
-previous capture. Each band is an LZ4-compressed image when the
-client can decode LZ4 and the result is smaller, and an uncompressed
-bitmap otherwise; a client that asks for no compression gets bitmaps.
+**Display.** Andris sends the first frame whole. After that it
+captures only the parts of the desktop the platform reports as
+damaged, compares them, in tiles of 64x64 pixels, with what it last
+sent, and sends only the tiles whose pixels changed, merged into at
+most 32 rectangles a frame and followed by a `MARK`, which ryll counts
+as a frame. A desktop that does not change captures and sends no
+frames. Frames start at most once every `--frame-interval-ms`, and
+only when there is damage to send, so the option bounds the frame rate
+and the work a busy desktop costs; it does nothing for a still one.
+Each rectangle is a JPEG
+when it looks photographic and JPEG is allowed (below), an
+LZ4-compressed image when the client can decode LZ4 and the result is
+smaller, and an uncompressed bitmap otherwise; a client that asks for
+no compression gets bitmaps.
 If the desktop changes size, the display surface is recreated at the
-new size. A slow client is not flooded: a capture is skipped while
-too much is unacknowledged. A capture that fails, as one can while the
-desktop is being resized, is skipped and logged as a warning; the
-display channel closes after ten failures in a row, or at once if the
-connection to the X display has gone.
+new size. A slow client is not flooded: while too much is
+unacknowledged, no frame starts, and changes merge until the client
+catches up, when one frame brings it up to date. A capture that fails,
+as one can while the desktop is being resized, is retried and logged
+as a warning; the display channel closes after ten failed captures in a row,
+frame or scrub, or at once if the connection to the X display has gone.
+
+**The scrub.** The X server does not report every change, so andris
+also re-reads the whole desktop every four seconds, in 16 slices of
+whole tile rows, 250 ms apart. It compares each slice with what it last
+sent, and any tile that differs is sent in the next frame as if it had
+been reported. A change damage missed therefore reaches the client
+within about four seconds. The scrub runs even on a still desktop,
+where it sends nothing but still costs a slice's capture and
+comparison each tick (see [High CPU use](#high-cpu-use)). It
+pauses while the client is behind (the ack window is full) and for a
+moment after a failed capture.
+
+**JPEG.** Andris sends JPEG, at `--jpeg-quality`,
+only when the client leaves the choice of compression to the server:
+it has sent no compression preference, or has asked for `auto-glz` (ryll's default) or
+`auto-lz`. A client that asks for a particular compression (`lz4`,
+say) gets lossless images only, and one that asks for `OFF` gets bitmaps, and `--jpeg-quality 0` turns JPEG off
+for every client. A rectangle goes as JPEG when it covers at least 4096
+pixels and its shortest side is at least 16 pixels, LZ4 would save less than half of its bytes, and the JPEG
+is at most half the size of what would otherwise be sent. Text and
+user interface compress far better than that, so they are never sent
+as JPEG; photographs are. Smooth gradients compress well
+enough with LZ4 that they stay lossless.
+
+A JPEG is approximate, so the tiles it drew are sent again
+losslessly once they have gone half a second without changing. That
+refresh is a frame of its own, followed by a `MARK`, and waits for the
+frame rate cap and for a slow client like any frame. A still screen
+therefore always ends up exact, while an area that keeps changing,
+such as a video, stays JPEG for as long as it changes.
 
 **Keys.** Keys are typed by position, not by character. The client's
 scancodes become evdev key codes, and those become whichever
@@ -233,6 +291,64 @@ Two quirks of ryll shape what andris sends:
 Ryll's protocol crate also does not yet name the inputs channel's
 `KEY_SCANCODE` capability, so andris defines the constant itself
 ([ryll#503](https://github.com/shakenfist/ryll/issues/503)).
+
+## Metrics
+
+While a client is receiving frames, andris logs one line at info every
+10 seconds, and one more when the session ends, for the whole session.
+Nothing is logged for an interval in which no frame or refresh was sent, so an
+idle desktop is silent. A line reads:
+
+```
+metrics: 12.4 fps (1 refreshes), draws lz4=118 bitmap=0 jpeg=6, display 842 kbit/s, capture 1.8 ms, encode 3.2 ms, ack lag 4.1 ms, ping 0.6 ms, scrub tiles 0, changed 31.5% of captured
+```
+
+- `fps` is frames per second over the interval, and `refreshes` how
+  many of them were lossless resends of JPEG areas.
+- `draws` counts the rectangles sent, by encoding.
+- `display` is the display channel's output.
+- `capture` and `encode` are mean milliseconds per desktop capture and
+  per comparing-and-encoding pass.
+- `ack lag` is the mean time from sending the message that completes
+  an acknowledgement window to the client's `ACK`; it rises when the
+  client or the network falls behind.
+- `ping` is the latest round trip to the client.
+- `scrub tiles` is how many tiles the periodic re-read found changed
+  that the X server's damage reports had not; a steadily nonzero
+  figure means damage is being missed.
+- `changed` is the share of captured pixels that had actually
+  changed; a low figure means damage reports are coarser than the
+  real changes.
+
+A `-` means there was nothing to average in the interval.
+
+### High CPU use
+
+On a still desktop andris should use very little: no frames are
+captured, and the only work is the scrub's. If it uses more, or a busy
+desktop uses more than you expect, look at the [metrics](#metrics)
+line and the startup log:
+
+- The startup log says how the screen is captured. `GetImage` means
+  every pixel crosses the X socket, which costs far more than MIT-SHM;
+  the reason it gives (no MIT-SHM 1.2, a TCP display, a refused
+  segment) is the thing to fix. A local display is the usual cure.
+- `capture` is the time to read the pixels and `encode` the time to
+  compare and compress them. A `capture` of many milliseconds with
+  `GetImage` is the socket; with MIT-SHM it is the X server being
+  slow, such as under software rendering. A large `encode` means a lot
+  of pixels are changing, or a lot are being sent as JPEG.
+- A high `fps` that sits at the cap (about 30 at the default) is a
+  desktop that never stops changing, such as a video. Raising
+  `--frame-interval-ms` lowers the frame rate, and so the CPU use, at
+  the price of smoothness; `--jpeg-quality 0` removes JPEG's encode
+  cost.
+- A steadily nonzero `scrub tiles` means the X server is missing
+  damage, so the scrub is doing real work; a `changed` figure that is
+  low means damage reports are coarse and most of each capture is
+  unchanged.
+- No metrics line at all means no frame or refresh was sent in the interval, so
+  any CPU use is the scrub's.
 
 ## Connecting with ryll
 

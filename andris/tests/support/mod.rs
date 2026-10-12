@@ -18,7 +18,9 @@ use std::time::Duration;
 use andris::config::Ticket;
 use andris::platform::Size;
 use andris::platform::synthetic::SyntheticPlatform;
-use andris::server::{HandshakeTimeouts, Server, ServerHandle, ServerOptions, TlsOptions};
+use andris::server::{
+    DisplayOptions, HandshakeTimeouts, Server, ServerHandle, ServerOptions, TlsOptions,
+};
 use shakenfist_spice_protocol::link::{
     SpiceLinkMess, SpiceLinkReply, SpiceStream, default_channel_caps, perform_auth,
     perform_link_with_caps,
@@ -55,6 +57,15 @@ fn init_logging() {
         .try_init();
 }
 
+/// The display options of a test server unless a test says otherwise:
+/// andris's own, but for [`FRAME_INTERVAL`].
+pub fn display_options() -> DisplayOptions {
+    DisplayOptions {
+        frame_interval: FRAME_INTERVAL,
+        ..DisplayOptions::default()
+    }
+}
+
 /// An andris serving a synthetic desktop on loopback. Dropping it shuts
 /// the server down.
 pub struct TestServer {
@@ -71,10 +82,28 @@ impl TestServer {
         Self::start_with(false, FRAME_INTERVAL, HandshakeTimeouts::default()).await
     }
 
-    /// A server with only a plain listener, capturing every
-    /// `frame_interval`.
+    /// A server with only a plain listener, starting display frames at
+    /// most every `frame_interval`.
     pub async fn start_with_frame_interval(frame_interval: Duration) -> Self {
         Self::start_with(false, frame_interval, HandshakeTimeouts::default()).await
+    }
+
+    /// A server with only a plain listener, starting display frames at
+    /// most every `frame_interval`, whose scrub re-reads the whole
+    /// desktop every `scrub_period`.
+    pub async fn start_with_intervals(frame_interval: Duration, scrub_period: Duration) -> Self {
+        let display = DisplayOptions {
+            frame_interval,
+            scrub_period,
+            ..display_options()
+        };
+        Self::start_full(false, display, HandshakeTimeouts::default()).await
+    }
+
+    /// A server with only a plain listener, whose display channels run
+    /// with `display`.
+    pub async fn start_tuned(display: DisplayOptions) -> Self {
+        Self::start_full(false, display, HandshakeTimeouts::default()).await
     }
 
     /// A server with only a plain listener and the handshake time limits
@@ -95,6 +124,14 @@ impl TestServer {
     }
 
     async fn start_with(tls: bool, frame_interval: Duration, timeouts: HandshakeTimeouts) -> Self {
+        let display = DisplayOptions {
+            frame_interval,
+            ..display_options()
+        };
+        Self::start_full(tls, display, timeouts).await
+    }
+
+    async fn start_full(tls: bool, display: DisplayOptions, timeouts: HandshakeTimeouts) -> Self {
         init_logging();
         let platform = SyntheticPlatform::new(Size {
             width: 256,
@@ -121,7 +158,7 @@ impl TestServer {
             listen: "127.0.0.1:0".parse().unwrap(),
             tls: tls_options,
             ticket: Ticket::new(TICKET).unwrap(),
-            frame_interval,
+            display,
             timeouts,
         };
         let handle = Server::bind(options, platform.platform())

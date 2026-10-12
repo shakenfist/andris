@@ -19,7 +19,7 @@ use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use shakenfist_spice_protocol::main_client;
@@ -29,6 +29,7 @@ use shakenfist_spice_protocol::messages::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::debug;
 
+use super::display::DisplayOptions;
 use super::opcodes::{AckedOpcode, ServerOpcode};
 use super::session::Session;
 use crate::platform::Platform;
@@ -47,6 +48,20 @@ pub const MAX_PENDING: usize = 64;
 
 /// How much the receive buffer grows by for each read.
 const READ_CHUNK: usize = 16 * 1024;
+
+/// The longest `PING` round trip recorded. The round trip is taken from
+/// the timestamp the client echoes, so a longer one, like one from a
+/// timestamp in the future, says only that the client sent a timestamp
+/// andris never did, and is discarded rather than skewing the metrics.
+pub const MAX_PLAUSIBLE_RTT: Duration = Duration::from_secs(60);
+
+/// The round trip of a `PING` stamped `sent_ns` whose `PONG` arrived at
+/// `now_ns`, both on the session clock, or `None` if it is implausible:
+/// sent in the future, or longer than [`MAX_PLAUSIBLE_RTT`].
+fn round_trip(now_ns: u64, sent_ns: u64) -> Option<Duration> {
+    let rtt = Duration::from_nanos(now_ns.checked_sub(sent_ns)?);
+    (rtt <= MAX_PLAUSIBLE_RTT).then_some(rtt)
+}
 
 /// A byte stream a channel runs over: TCP, TLS, or an in-memory pipe in
 /// tests.
@@ -98,8 +113,9 @@ pub struct ChannelContext {
     pub caps: ClientCaps,
     /// The channel id the client linked; always 0 today.
     pub channel_id: u8,
-    /// How often the display channel captures the desktop.
-    pub frame_interval: Duration,
+    /// How a display channel paces its frames, and whether it may send
+    /// JPEG.
+    pub display: DisplayOptions,
 }
 
 impl ChannelContext {
@@ -150,6 +166,11 @@ pub struct AckWindow {
     window: u32,
     synced: bool,
     unacked: u64,
+    /// Messages sent since `SET_ACK`.
+    total_sent: u64,
+    /// When each message that completed a window was sent, for the
+    /// `ACK`s still to come.
+    window_ends: VecDeque<Instant>,
 }
 
 impl AckWindow {
@@ -159,11 +180,17 @@ impl AckWindow {
             window,
             synced: false,
             unacked: 0,
+            total_sent: 0,
+            window_ends: VecDeque::new(),
         }
     }
 
     fn sent(&mut self) {
         self.unacked = self.unacked.saturating_add(1);
+        self.total_sent = self.total_sent.saturating_add(1);
+        if self.window != 0 && self.total_sent.is_multiple_of(u64::from(self.window)) {
+            self.window_ends.push_back(Instant::now());
+        }
     }
 
     fn ack_sync(&mut self, generation: u32) {
@@ -178,10 +205,14 @@ impl AckWindow {
         }
     }
 
-    fn ack(&mut self) {
-        if self.synced {
-            self.unacked = self.unacked.saturating_sub(u64::from(self.window));
+    /// Account for an `ACK`. Returns how long ago the message that
+    /// completed the window it acknowledges was sent.
+    fn ack(&mut self) -> Option<Duration> {
+        if !self.synced {
+            return None;
         }
+        self.unacked = self.unacked.saturating_sub(u64::from(self.window));
+        self.window_ends.pop_front().map(|sent| sent.elapsed())
     }
 
     /// False while more than twice the window is unacknowledged.
@@ -259,6 +290,9 @@ impl<O: ServerOpcode> ChannelConn<O> {
         if let Some(ack) = &mut self.ack {
             ack.sent();
         }
+        self.session
+            .counters()
+            .bytes_sent(O::CHANNEL, message.len() as u64);
         Ok(())
     }
 
@@ -353,13 +387,23 @@ impl<O: ServerOpcode> ChannelConn<O> {
         match message.header.message_type {
             main_client::PONG => {
                 let pong = Pong::decode(message.payload()).context("a malformed PONG")?;
-                let rtt = self.session.clock_ns().saturating_sub(pong.timestamp);
-                debug!(
-                    channel,
-                    id = pong.id,
-                    rtt_us = rtt / 1000,
-                    "PONG round trip"
-                );
+                match round_trip(self.session.clock_ns(), pong.timestamp) {
+                    Some(rtt) => {
+                        self.session.counters().ping_round_trip(rtt);
+                        debug!(
+                            channel,
+                            id = pong.id,
+                            rtt_us = rtt.as_micros(),
+                            "PONG round trip"
+                        );
+                    }
+                    None => debug!(
+                        channel,
+                        id = pong.id,
+                        timestamp = pong.timestamp,
+                        "a PONG with an implausible timestamp; not recorded"
+                    ),
+                }
                 Ok(Common::Handled)
             }
             main_client::ACK_SYNC => {
@@ -371,8 +415,8 @@ impl<O: ServerOpcode> ChannelConn<O> {
                 Ok(Common::Handled)
             }
             main_client::ACK => {
-                if let Some(ack) = &mut self.ack {
-                    ack.ack();
+                if let Some(lag) = self.ack.as_mut().and_then(AckWindow::ack) {
+                    self.session.counters().ack_lag(lag);
                 }
                 Ok(Common::Handled)
             }
@@ -419,6 +463,9 @@ impl<O: AckedOpcode> ChannelConn<O> {
     /// Read from the client until [`ChannelConn::may_send`] is true.
     /// Channel messages that arrive meanwhile are kept, up to
     /// [`MAX_PENDING`], for [`ChannelConn::recv`] to return in order.
+    ///
+    /// Cancel-safe: a message read is kept, with no await in between, so
+    /// a dropped call loses nothing.
     pub async fn wait_for_room(&mut self) -> Result<()> {
         while !self.may_send() {
             match self.next_event().await? {
@@ -481,6 +528,63 @@ mod tests {
         let mut body = vec![0; header.message_size as usize];
         client.read_exact(&mut body).await.unwrap();
         (header.message_type, body)
+    }
+
+    #[test]
+    fn implausible_round_trips_are_discarded() {
+        let second = 1_000_000_000;
+        assert_eq!(
+            round_trip(5 * second, 4 * second),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(round_trip(5, 5), Some(Duration::ZERO));
+        assert_eq!(round_trip(4 * second, 5 * second), None, "the future");
+        assert_eq!(
+            round_trip(61 * second, second),
+            Some(MAX_PLAUSIBLE_RTT),
+            "exactly the limit"
+        );
+        assert_eq!(round_trip(62 * second, second), None, "over a minute");
+        assert_eq!(round_trip(u64::MAX, 0), None);
+    }
+
+    #[tokio::test]
+    async fn only_plausible_pongs_are_recorded() {
+        let (mut conn, mut client) = pair::<DisplayOpcode>();
+        for (id, timestamp) in [(1, u64::MAX), (2, 0)] {
+            client_send_msg(&mut client, main_client::PONG, &Pong { id, timestamp }).await;
+        }
+        client_send(&mut client, display_client::INIT, &[0; 14]).await;
+        let message = tokio::time::timeout(WAIT, conn.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.header.message_type, display_client::INIT);
+        // Only the second: the session began moments ago.
+        assert_eq!(conn.session().stats().ping.count, 1);
+    }
+
+    #[test]
+    fn ack_lag_is_taken_from_the_message_completing_each_window() {
+        let mut ack = AckWindow::new(1, 2);
+        ack.ack_sync(1);
+        assert_eq!(ack.ack(), None, "nothing is outstanding");
+        ack.sent();
+        assert!(ack.window_ends.is_empty(), "a window is not yet complete");
+        ack.sent();
+        ack.sent();
+        ack.sent();
+        assert_eq!(ack.window_ends.len(), 2);
+        assert!(ack.ack().is_some());
+        assert!(ack.ack().is_some());
+        assert_eq!(ack.ack(), None);
+
+        // Before ACK_SYNC an ACK counts for nothing, lag included.
+        let mut unsynced = AckWindow::new(1, 1);
+        unsynced.sent();
+        assert_eq!(unsynced.ack(), None);
+        assert_eq!(unsynced.window_ends.len(), 1);
     }
 
     #[test]

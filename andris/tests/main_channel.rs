@@ -9,14 +9,14 @@ mod support;
 
 use andris::server::session::MouseMode;
 use shakenfist_spice_protocol::messages::{
-    ChannelEntry, ChannelsList, MainInit, MainMouseMode, MouseModeRequest, Ping, ReceivedMessage,
-    WireType,
+    ChannelEntry, ChannelsList, MainInit, MainMouseMode, MouseModeRequest, Ping, Pong,
+    ReceivedMessage, WireType,
 };
 use shakenfist_spice_protocol::{
     ChannelType, MOUSE_MODE_CLIENT, MOUSE_MODE_SERVER, main_client, main_server,
 };
 
-use support::{TestClient, TestServer};
+use support::{TestClient, TestServer, wait_until};
 
 fn body<T: WireType>(message: &T) -> Vec<u8> {
     let mut out = Vec::new();
@@ -165,4 +165,31 @@ async fn malformed_mouse_mode_request_closes_the_main_channel() {
     client.send(main_client::MOUSE_MODE_REQUEST, &[1]).await;
     client.expect_closed().await;
     server.wait_for_no_session().await;
+}
+
+#[tokio::test]
+async fn the_ping_round_trip_is_recorded() {
+    let server = TestServer::start().await;
+    let (mut client, _) = server.open_main().await;
+    client.recv().await;
+    let message = client.recv().await;
+    assert_eq!(message.header.message_type, main_server::PING);
+    let ping = Ping::decode(message.payload()).unwrap();
+    let session = server.handle.session().unwrap();
+    assert_eq!(session.stats().ping.count, 0);
+
+    let pong = Pong {
+        id: ping.id,
+        timestamp: ping.timestamp,
+    };
+    client.send(main_client::PONG, &body(&pong)).await;
+    wait_until("the round trip is recorded", || {
+        session.stats().ping.count == 1
+    })
+    .await;
+    let stats = session.stats();
+    assert!(stats.ping.latest().is_some());
+    assert_eq!(stats.ping.mean(), stats.ping.latest());
+    // The main channel's own writes (INIT and PING) are counted.
+    assert!(stats.main_bytes > 0);
 }

@@ -12,7 +12,18 @@ up. It asserts, in order:
               FRAME_BOUND passes; the last pixel seen is reported on
               failure;
   keys        after `send_key` presses of 0x1E and 0xE04B, the keylogger
-              prints `a` and then `Left` within KEY_BOUND.
+              prints `a` and then `Left` within KEY_BOUND;
+  idle        with nothing changing, no `surface_drawn` event arrives for
+              IDLE_WINDOW. andris sends only on X damage, so an idle
+              desktop must be silent. To make "nothing changing" true, the
+              driver first waits for QUIET seconds without any event (the
+              key presses above, and their echo through andris's capture,
+              settle), and only then starts the IDLE_WINDOW clock;
+  change      `send_key` of 0x2D makes the keylogger repaint a 64x64 square;
+              a screenshot shows the new colour there within CHANGE_BOUND,
+              and the whole change took fewer `surface_drawn` events than
+              the screen has 64-row bands (height / 64). Events are counted
+              until QUIET seconds pass without another, so late ones count.
 
 Every wait gives up at once if a process named with --watch (andris, ryll,
 the keylogger) exits, rather than running out its bound.
@@ -47,24 +58,41 @@ FRAME_BOUND = 10.0
 # From the key presses: the keylogger must have printed both keysyms.
 KEY_BOUND = 5.0
 
+# Idle check: how long to demand silence, and how long without an event
+# counts as settled. QUIET is longer than andris's frame interval by a wide
+# margin; QUIET_BOUND stops a never-quiet desktop from hanging the test.
+IDLE_WINDOW = 2.0
+QUIET = 0.75
+QUIET_BOUND = 15.0
+
+# The small change: from the key press, a screenshot must show the colour.
+CHANGE_BOUND = 2.0
+
 POLL = 0.25
+
+# ryll queues 256 events per client, then sends `dropped`; counts are unsound
+# after that, so it is a failure.
+BAND = 64
 
 # The keys sent, as (logical set-1 make code, the keysym name the keylogger
 # must print).
 KEYS = ((0x1E, 'a'), (0xE04B, 'Left'))
+
+# The key that makes the keylogger repaint its square: set-1 'x'.
+SQUARE_SCANCODE = 0x2D
 
 
 def log(message):
     print(f'{PREFIX} {message}', flush=True)
 
 
-def keylogger_colour():
-    """Import COLOUR from the keylogger, so the oracle has one definition."""
+def keylogger_module():
+    """Import the keylogger, so the oracles have one definition."""
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'e2e-keylogger.py')
     spec = importlib.util.spec_from_file_location('e2e_keylogger', path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.COLOUR
+    return module
 
 
 class Control:
@@ -76,6 +104,8 @@ class Control:
         self.sock.connect(path)
         self.buf = bytearray()
         self.next_id = 0
+        # Events seen while waiting for a response, as (monotonic time, name).
+        self.events = []
 
     def close(self):
         self.sock.close()
@@ -100,6 +130,32 @@ class Control:
             msg = self._recv_line()
             if msg.get('id') == req_id:
                 return msg
+            self._note(msg)
+
+    def _note(self, msg):
+        if 'event' in msg:
+            if msg['event'] == 'dropped':
+                raise Failure(f'ryll dropped control events: {msg}')
+            self.events.append((time.monotonic(), msg['event']))
+
+    def pump(self, seconds):
+        """Read events for up to `seconds`, leaving them in self.events."""
+        deadline = time.monotonic() + seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            try:
+                self.sock.settimeout(remaining)
+                msg = self._recv_line()
+            except socket.timeout:
+                return
+            finally:
+                self.sock.settimeout(10.0)
+            self._note(msg)
+
+    def drawn(self):
+        return sum(1 for _, name in self.events if name == 'surface_drawn')
 
     def call(self, method, params=None):
         """Return a request's result, or raise if ryll refused it."""
@@ -227,6 +283,78 @@ def send_keys(control, keylog, watch):
     raise Failure(f'keylogger did not print {wanted} in order within {KEY_BOUND:.0f} s; it printed {seen}')
 
 
+def wait_quiet(control, watch):
+    """Return once QUIET seconds have passed with no event at all."""
+    deadline = time.monotonic() + QUIET_BOUND
+    while time.monotonic() < deadline:
+        control.events.clear()
+        control.pump(QUIET)
+        watch.check()
+        if not control.events:
+            return
+    raise Failure(f'events never stopped for {QUIET} s within {QUIET_BOUND:.0f} s')
+
+
+def check_idle(control, watch):
+    wait_quiet(control, watch)
+    control.events.clear()
+    control.pump(IDLE_WINDOW)
+    watch.check()
+    if control.events:
+        names = sorted({name for _, name in control.events})
+        raise Failure(f'{len(control.events)} events ({", ".join(names)}) arrived in {IDLE_WINDOW:.0f} s of idle')
+    log(f'idle: no events for {IDLE_WINDOW:.0f} s')
+
+
+def pixel_at(control, surface_id, x, y):
+    result = control.call('screenshot', {'surface_id': surface_id, 'format': 'rgba'})
+    width = result['width']
+    data = base64.b64decode(result['data_base64'])
+    offset = (y * width + x) * 4
+    return tuple(data[offset:offset + 3])
+
+
+def check_small_change(control, surface_id, keylogger, height, watch):
+    centre = keylogger.SQUARE_SIZE // 2
+    x = keylogger.SQUARE_X + centre
+    y = keylogger.SQUARE_Y + centre
+    wanted = keylogger.SQUARE_COLOUR
+    if pixel_at(control, surface_id, x, y) == wanted:
+        raise Failure('the square already has its new colour before the key was sent')
+    control.events.clear()
+    start = time.monotonic()
+    control.call('send_key', {'scancode': SQUARE_SCANCODE, 'state': 'press'})
+    pixel = None
+    while time.monotonic() - start < CHANGE_BOUND:
+        pixel = pixel_at(control, surface_id, x, y)
+        if pixel == wanted:
+            break
+        watch.check()
+        control.pump(0.05)
+    else:
+        raise Failure(f'pixel ({x},{y}) did not become #{bytes(wanted).hex()} within {CHANGE_BOUND:.0f} s; '
+                      f'last seen #{bytes(pixel).hex()}')
+    log(f'square changed after {time.monotonic() - start:.2f} s')
+    wait_quiet_counting(control, watch)
+    bands = height // BAND
+    count = control.drawn()
+    if count == 0 or count >= bands:
+        raise Failure(f'the small change took {count} surface_drawn events; expected 1 to {bands - 1}')
+    log(f'small change: {count} surface_drawn events (fewer than {bands} bands)')
+
+
+def wait_quiet_counting(control, watch):
+    """Like wait_quiet, but keep the events seen on the way."""
+    deadline = time.monotonic() + QUIET_BOUND
+    while time.monotonic() < deadline:
+        mark = len(control.events)
+        control.pump(QUIET)
+        watch.check()
+        if len(control.events) == mark:
+            return
+    raise Failure(f'events never stopped for {QUIET} s within {QUIET_BOUND:.0f} s')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--socket', required=True, help="ryll's control socket")
@@ -238,14 +366,20 @@ def main():
     args = parser.parse_args()
     watch = Watch(args.watch)
 
-    colour = keylogger_colour()
+    keylogger = keylogger_module()
+    colour = keylogger.COLOUR
     deadline = time.monotonic() + SURFACE_BOUND
     control = None
     try:
         control = connect(args.socket, deadline, watch)
         surface = wait_surface(control, deadline, args.width, args.height, watch)
         wait_frame(control, surface['surface_id'], colour, watch)
+        subscribed = control.call('subscribe', {'events': ['surface_drawn']})['subscribed']
+        if 'surface_drawn' not in subscribed:
+            raise Failure(f'ryll would not subscribe to surface_drawn: {subscribed}')
         send_keys(control, args.keylog, watch)
+        check_idle(control, watch)
+        check_small_change(control, surface['surface_id'], keylogger, args.height, watch)
     except (Failure, RuntimeError, EOFError, OSError) as e:
         log(f'FAIL: {e}')
         return 1

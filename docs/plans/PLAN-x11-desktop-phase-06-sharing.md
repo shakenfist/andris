@@ -252,7 +252,7 @@ diff.
 | Step | Effort | Model | Isolation | Status | Brief for sub-agent |
 |------|--------|-------|-----------|--------|---------------------|
 | 0 | low | management | none | Complete | Commit the phase 5 close-out and this plan. See brief 0. |
-| 1 | high | opus | none | Not started | The containerised xrdp test bed, with a smoke run. Gated. See brief 1. |
+| 1 | high | opus | none | Complete | The containerised xrdp test bed, with a smoke run. Gated. See brief 1. |
 | 2 | high | opus | none | Not started | Interleaving checks as `make e2e-xrdp`, with their results recorded. Gates step 4. See brief 2. |
 | 3 | high | opus | none | Complete | Process lifetime: SIGTERM, and exiting when the desktop goes. See brief 3. |
 | 4 | high | opus | none | Not started | Fixes that step 2 calls for, if any. Gated. See brief 4. |
@@ -568,6 +568,17 @@ section. Then push and open the pull request when the operator asks.
 ## Result
 
 Filled in as the steps complete.
+
+**Departures from the plan:**
+- **Step 1 put the test bed's session on `:50`, not `:10`**, by setting
+  `X11DisplayOffset=50` in the container's `sesman.ini`. A command aimed
+  at the container's own `:10` reads, to a reviewer or to a permission
+  check, exactly like one aimed at the operator's desktop. The number is
+  still read from sesman's log rather than assumed.
+- **Step 1 was built in a worktree of its own** and cherry-picked, so
+  that its release build could not pick up step 3's code half-written.
+  It also added `scripts/xrdp-testbed/smoke.py`, which reuses
+  `scripts/e2e-drive.py`'s helpers for the control-socket checks.
 
 ## Back brief
 

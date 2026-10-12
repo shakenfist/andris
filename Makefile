@@ -131,7 +131,7 @@ DOCKER_RUN_OFFLINE_RW := docker run --rm --network none \
 	$(DOCKER_BASE_ARGS) $(WORKSPACE_MOUNT_RW) $(CACHE_MOUNTS_RO)
 
 .PHONY: all build release clean devcontainer ensure-cache fetch lock \
-	target-dir lint lint-fix test ryll-headless e2e help
+	target-dir lint lint-fix test ryll-headless e2e e2e-xrdp help
 
 all: build
 
@@ -145,6 +145,7 @@ help:
 	@echo "  make test                   - Run tests"
 	@echo "  make ryll-headless          - Build ryll's headless client at the pinned revision"
 	@echo "  make e2e                    - Run the end-to-end test against Xvfb and ryll"
+	@echo "  make e2e-xrdp               - Run andris against a real xrdp session, in a container"
 	@echo "  make lint                   - Run rustfmt and clippy checks"
 	@echo "  make lint-fix               - Run rustfmt and clippy with auto-fix"
 	@echo "  make clean                  - Remove build artifacts"
@@ -278,6 +279,13 @@ e2e: build ryll-headless
 		-e ANDRIS=/workspace/target/debug/andris \
 		$(ANDRIS_IMAGE) \
 		sh -c "cargo test --frozen --no-run --test x11 && scripts/e2e.sh"
+
+# Share a real xrdp session with andris, in a throwaway container built
+# from the devcontainer image, and drive it with ryll's headless client;
+# see scripts/e2e-xrdp.sh. Local only, not run in CI. The release build is
+# the one tested, as the one an operator runs alongside xrdp.
+e2e-xrdp: release ryll-headless
+	RYLL="$(RYLL_BIN)" ANDRIS=target/release/andris scripts/e2e-xrdp.sh
 
 # Clean build artifacts.
 #

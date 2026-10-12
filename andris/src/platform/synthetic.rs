@@ -242,13 +242,26 @@ impl SyntheticPlatform {
     /// fits and moving it to the left edge otherwise, and report the
     /// resize. Fails if `size` is refused by [`Size::check`].
     pub fn set_size(&self, size: Size) -> Result<()> {
+        // Reported under the lock, as every change is: see the module.
+        let _state = self.resize_scene(size)?;
+        self.damage.resize(size)
+    }
+
+    /// Resize the desktop, as [`SyntheticPlatform::set_size`] does,
+    /// without reporting it: a capture that finds the new size before
+    /// damage says so, as X11's capture thread can.
+    pub fn set_size_unreported(&self, size: Size) -> Result<()> {
+        self.resize_scene(size).map(drop)
+    }
+
+    fn resize_scene(&self, size: Size) -> Result<MutexGuard<'_, State>> {
         size.check()?;
         let mut state = self.state()?;
         state.size = size;
         if state.square_x + SQUARE_SIZE > size.width {
             state.square_x = 0;
         }
-        self.damage.resize(size)
+        Ok(state)
     }
 
     /// The events injected so far, oldest first: at most the last
@@ -713,6 +726,20 @@ mod tests {
         };
         platform.set_size(smaller).unwrap();
         assert_eq!(subscription.take().unwrap(), Region::full(smaller));
+    }
+
+    #[test]
+    fn set_size_unreported_changes_capture_and_reports_nothing() {
+        let platform = SyntheticPlatform::new(SIZE).unwrap();
+        let subscription = platform.subscribe_damage().unwrap();
+        subscription.take().unwrap();
+        let smaller = Size {
+            width: 100,
+            height: 200,
+        };
+        platform.set_size_unreported(smaller).unwrap();
+        assert_eq!(platform.capture_all().unwrap().size(), smaller);
+        assert!(damaged(&subscription).is_empty());
     }
 
     #[test]

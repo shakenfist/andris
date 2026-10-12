@@ -171,7 +171,7 @@ written with `/next-phase` as each phase comes up.
 | 2. Server-role wire types (ryll) | PLAN-x11-desktop-phase-02-wire-types.md | Complete | ryll `3763158` (#477); andris `a9e79cf` (#5) |
 | 3. Image encoders (ryll) | PLAN-x11-desktop-phase-03-encoders.md | Complete | ryll `cd2fe41` (#487); andris `591e062` (#6) |
 | 4. Server skeleton | PLAN-x11-desktop-phase-04-server-skeleton.md | Complete | andris `1950cdb` (#7) |
-| 5. Damage and flow control | PLAN-x11-desktop-phase-05-damage.md | In progress | |
+| 5. Damage and flow control | PLAN-x11-desktop-phase-05-damage.md | Complete | andris `68b1058` (#8); andris `43bfe88` (#11) |
 | 6. Sharing the xrdp session | Not yet written | Not started | |
 | 7. In-process agent: resize and clipboard | Not yet written | Not started | |
 | 8. Video streams | Not yet written | Not started | |

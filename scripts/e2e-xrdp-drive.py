@@ -126,8 +126,10 @@ drive = load('e2e_drive', 'e2e-drive.py')
 Failure = drive.Failure
 
 # What a check can fail with: its own Failure, ryll refusing a request
-# (RuntimeError), a socket or process error, or the X connection breaking.
-ERRORS = (Failure, RuntimeError, EOFError, OSError, subprocess.SubprocessError, xerror.XError,
+# (RuntimeError), a socket or process error, the X connection breaking, or
+# a process missing from the watch list (KeyError) because an earlier check
+# failed between stopping it and starting its replacement.
+ERRORS = (Failure, RuntimeError, EOFError, OSError, KeyError, subprocess.SubprocessError, xerror.XError,
           xerror.ConnectionClosedError)
 
 
@@ -338,7 +340,7 @@ class Bed:
         self.unfocus_rdp()
         self.focus_rdp()
         try:
-            self.wait_session_locks(NUM_MASK, 'FreeRDP to synchronise the session\'s locks')
+            self.wait_session_locks(NUM_MASK, "FreeRDP to synchronise the session's locks")
         except Failure:
             # FreeRDP did not synchronise; put the session right over SPICE.
             mask = self.session_mask()
@@ -346,7 +348,7 @@ class Bed:
                 self.spice('Caps_Lock')
             if not mask & NUM_MASK:
                 self.spice('Num_Lock')
-            self.wait_session_locks(NUM_MASK, 'SPICE lock keys to align the session\'s locks')
+            self.wait_session_locks(NUM_MASK, "SPICE lock keys to align the session's locks")
 
     def rdp(self, key, action='key'):
         self.xdotool(action, key)
@@ -445,6 +447,15 @@ def typed(key):
     return key['shifted'] if key['state'] & SHIFT_MASK else key['name']
 
 
+def release(what, action):
+    """Run a check's cleanup, logging rather than raising its failure, so that it cannot hide the failure that
+    led to it. A cleanup that fails after a check passed shows up in the next check, as a stuck key."""
+    try:
+        action()
+    except ERRORS as e:
+        log(f'NOTE: could not {what}: {e!r}')
+
+
 def x2(bed):
     """Shift held on one side, x typed on the other, both ways."""
     bed.keylog.mark()
@@ -456,7 +467,7 @@ def x2(bed):
         key = expect_one(bed.keylog.take(1, bed.watch), 'x', 'SPICE x with RDP Shift held')
         observed.append(f'RDP Shift + SPICE x typed {typed(key)} (state 0x{key["state"]:x})')
     finally:
-        bed.rdp('Shift_L', 'keyup')
+        release('release the RDP Shift', lambda: bed.rdp('Shift_L', 'keyup'))
     try:
         bed.spice('Shift_L', 'down')
         expect_one(bed.keylog.take(1, bed.watch), 'Shift_L', 'SPICE Shift down')
@@ -464,7 +475,7 @@ def x2(bed):
         key = expect_one(bed.keylog.take(1, bed.watch), 'x', 'RDP x with SPICE Shift held')
         observed.append(f'SPICE Shift + RDP x typed {typed(key)} (state 0x{key["state"]:x})')
     finally:
-        bed.spice('Shift_L', 'up')
+        release('release the SPICE Shift', lambda: bed.spice('Shift_L', 'up'))
     for side in ('RDP', 'SPICE'):
         bed.type('x', side)
         key = expect_one(bed.keylog.take(1, bed.watch), 'x', f'{side} x after both Shifts were released')
@@ -483,15 +494,15 @@ def x3(bed):
 
     # RDP turns Caps Lock on, in the session and on its own display.
     bed.rdp('Caps_Lock')
-    bed.wait_session_locks(LOCK_MASK | NUM_MASK, 'RDP Caps Lock to turn the session\'s Caps Lock on')
+    bed.wait_session_locks(LOCK_MASK | NUM_MASK, "RDP Caps Lock to turn the session's Caps Lock on")
     bed.spice('a')
     key = expect_one(bed.keylog.take(1, bed.watch), 'a', 'SPICE a with RDP Caps Lock on')
-    notes.append(f'RDP Caps Lock turned the session\'s on, and SPICE a then typed with state 0x{key["state"]:x}')
+    notes.append(f"RDP Caps Lock turned the session's on, and SPICE a then typed with state 0x{key['state']:x}")
 
     # Ryll synchronises as its inputs channel opens, with Caps Lock off.
     bed.restart_ryll()
-    bed.wait_session_locks(NUM_MASK, 'ryll\'s KEY_MODIFIERS to turn the session\'s Caps Lock off')
-    notes.append('a restarted ryll\'s KEY_MODIFIERS turned it off again (it synchronised last)')
+    bed.wait_session_locks(NUM_MASK, "ryll's KEY_MODIFIERS to turn the session's Caps Lock off")
+    notes.append("a restarted ryll's KEY_MODIFIERS turned it off again (it synchronised last)")
 
     # Recorded: does FreeRDP synchronise again when its window takes the
     # focus? Its own display still has Caps Lock on.
@@ -499,14 +510,14 @@ def x3(bed):
     bed.focus_rdp()
     try:
         bed.wait_session_locks(LOCK_MASK | NUM_MASK, 'FreeRDP')
-        log('NOTE: X3: refocusing FreeRDP, whose display has Caps Lock on, turned the session\'s back on: '
+        log("NOTE: X3: refocusing FreeRDP, whose display has Caps Lock on, turned the session's back on: "
             'FreeRDP synchronises on focus, and then it was last')
         refocus = 'FreeRDP synchronised again on focus and won'
     except Failure:
         log(f'NOTE: X3: refocusing FreeRDP left the session with {locks(bed.session_mask())}')
         refocus = 'refocusing FreeRDP did not synchronise'
         bed.rdp('Caps_Lock')
-        bed.wait_session_locks(LOCK_MASK | NUM_MASK, 'RDP Caps Lock to turn the session\'s Caps Lock on')
+        bed.wait_session_locks(LOCK_MASK | NUM_MASK, "RDP Caps Lock to turn the session's Caps Lock on")
 
     # Recorded: ryll's idle keepalive restates the KEY_MODIFIERS it last sent
     # once its inputs channel has been quiet for 10 s.
@@ -514,12 +525,12 @@ def x3(bed):
     bed.keylog.take(1, bed.watch)
     start = time.monotonic()
     try:
-        wait_for('the session\'s Caps Lock to change', KEEPALIVE_BOUND,
+        wait_for("the session's Caps Lock to change", KEEPALIVE_BOUND,
                  lambda: not bed.session_mask() & LOCK_MASK, bed.watch)
         elapsed = time.monotonic() - start
         log(f'NOTE: X3: with Caps Lock on from RDP, an idle ryll turned it off {elapsed:.1f} s after its last key: '
             'its keepalive restates KEY_MODIFIERS, which andris applies like any other')
-        keepalive = f'ryll\'s idle keepalive turned Caps Lock off {elapsed:.1f} s after its last key'
+        keepalive = f"ryll's idle keepalive turned Caps Lock off {elapsed:.1f} s after its last key"
     except Failure:
         log(f'NOTE: X3: the session kept Caps Lock on for {KEEPALIVE_BOUND:.0f} s with ryll idle')
         keepalive = f'Caps Lock stayed on for {KEEPALIVE_BOUND:.0f} s with ryll idle'
@@ -558,8 +569,8 @@ def x4(bed):
     before = bed.session_size()
     bed.xdotool('windowsize', '--sync', bed.window, str(RESIZE[0]), str(RESIZE[1]))
     try:
-        after = wait_for(f'the session to resize from {before[0]}x{before[1]}', RESIZE_BOUND,
-                         lambda: bed.session_size() != before and bed.session_size(), bed.watch)
+        wait_for(f'the session to resize from {before[0]}x{before[1]}', RESIZE_BOUND,
+                 lambda: bed.session_size() != before and bed.session_size(), bed.watch)
     except Failure:
         raise Failure(f'the FreeRDP window is {RESIZE[0]}x{RESIZE[1]}, but the session stayed '
                       f'{before[0]}x{before[1]}') from None
@@ -588,12 +599,16 @@ def x5(bed):
         time.sleep(POLL * 2.5)
     size = bed.session_size()
     bed.start_freerdp()
-    if (bed.watch.pids['andris'], bed.watch.pids['ryll']) != (andris, ryll):
-        raise Failure('andris or ryll changed process while FreeRDP was away')
+    for name, pid in (('andris', andris), ('ryll', ryll)):
+        if not alive(pid):
+            raise Failure(f'{name} (pid {pid}) exited while FreeRDP was away')
+        if bed.watch.pids.get(name) != pid:
+            raise Failure(f'{name} is now pid {bed.watch.pids.get(name)}, not pid {pid}, which was running '
+                          'before FreeRDP went')
     if not bed.control.call('status').get('spice_connected'):
         raise Failure('ryll is not connected once FreeRDP is back')
     if keylogger_pid() != keylogger:
-        raise Failure('the session\'s window manager, the keylogger, is not the one that was running')
+        raise Failure("the session's window manager, the keylogger, is not the one that was running")
     bed.keylog.mark()
     for key, side in (('a', 'RDP'), ('b', 'SPICE')):
         bed.type(key, side)
@@ -601,7 +616,7 @@ def x5(bed):
     after = bed.session_size()
     wait_ryll_surface(bed, after)
     return (f'ryll stayed connected through {polls} status polls in {RDP_GAP:.0f} s without FreeRDP; FreeRDP '
-            f'reconnected to the same session ({size[0]}x{size[1]} before, {after[0]}x{after[1]} after, and ryll\'s '
+            f"reconnected to the same session ({size[0]}x{size[1]} before, {after[0]}x{after[1]} after, and ryll's "
             'surface followed); a from RDP and b from SPICE both arrived')
 
 
@@ -621,7 +636,7 @@ def x6(bed):
                 raise Failure(f'{key} from {side}: the keylogger saw {describe(keys)}')
             seen[key, side] = keys[0]
     report = ', '.join(f'{side} {key} -> {k["name"]} (keycode {k["keycode"]})' for (key, side), k in seen.items())
-    report = f'the session\'s layout went from {before} to {after}; {report}; keymap changes: {bed.keylog.noted()}'
+    report = f"the session's layout went from {before} to {after}; {report}; keymap changes: {bed.keylog.noted()}"
     wrong = [f'SPICE {key} typed {seen[key, "SPICE"]["name"]}, not {german}'
              for key, german in (('y', 'z'), ('z', 'y')) if seen[key, 'SPICE']['name'] != german]
     wrong += [f'SPICE {key} came from keycode {seen[key, "SPICE"]["keycode"]}, RDP {key} from '
@@ -708,7 +723,7 @@ def main():
     try:
         bed = Bed(args)
     except ERRORS as e:
-        log(f'FAIL: could not reach the test bed\'s X servers, so no check ran: {e!r}')
+        log(f"FAIL: could not reach the test bed's X servers, so no check ran: {e!r}")
         return 1
     try:
         run('setup', setup, bed)

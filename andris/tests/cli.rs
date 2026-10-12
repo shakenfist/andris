@@ -64,19 +64,38 @@ fn ticket_file(contents: &[u8]) -> NamedTempFile {
 }
 
 /// Run andris on the synthetic platform with `ticket` and `extra`, and
-/// return what it printed to stderr; it must have failed.
+/// return what it printed to stderr; it must have refused the
+/// configuration, which is exit status 2.
 fn refused(ticket: &NamedTempFile, extra: &[&str]) -> String {
     let path = ticket.path().to_str().unwrap();
     let mut args = vec!["--ticket-file", path, "--platform", "synthetic"];
     args.extend_from_slice(extra);
     let output = andris(&args);
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        !output.status.success(),
+    assert_eq!(
+        output.status.code(),
+        Some(2),
         "andris {args:?} exited with {}: {stderr}",
         output.status
     );
     stderr
+}
+
+#[test]
+fn refused_configuration_exits_with_status_two_and_says_why() {
+    // A ticket file others can read is refused before anything starts.
+    // Status 2, not 1, tells systemd not to restart andris over it.
+    let mut ticket = NamedTempFile::new().unwrap();
+    ticket.write_all(b"secret\n").unwrap();
+    std::fs::set_permissions(ticket.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let stderr = refused(&ticket, &[]);
+    let error = stderr
+        .lines()
+        .find(|line| line.starts_with("Error: "))
+        .unwrap_or_else(|| panic!("no Error: line in {stderr}"));
+    assert!(error.contains("--ticket-file"), "{stderr}");
+    assert!(stderr.contains("chmod 600"), "{stderr}");
 }
 
 #[test]

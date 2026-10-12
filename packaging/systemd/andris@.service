@@ -18,9 +18,22 @@ EnvironmentFile=-%h/.config/andris/andris.env
 ExecStart=andris --display :%i --ticket-file %h/.config/andris/ticket $ANDRIS_ARGS
 # Andris exits 1 when the desktop goes away, and 0 when stopped.
 Restart=on-failure
+# Status 2 means the configuration was refused (a bad option, or a
+# ticket file that is missing or not private). Restarting cannot fix
+# that, so stop and leave the reason in the journal.
+RestartPreventExitStatus=2
+# RestartSteps and RestartMaxDelaySec need systemd 254 or newer.
 RestartSec=2s
 RestartSteps=5
 RestartMaxDelaySec=60s
+# Hardening that costs andris nothing: it never gains privileges,
+# changes personality, runs realtime or generates code at run time, and
+# it needs only Unix sockets (X11) and TCP (SPICE).
+NoNewPrivileges=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryDenyWriteExecute=yes
 
 [Install]
 WantedBy=default.target

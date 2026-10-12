@@ -25,7 +25,9 @@ sudo install -m 755 target/release/andris /usr/local/bin/
 ```
 
 The unit is a systemd *user* unit, so it runs as the session's user,
-which is the user the X server accepts. It is a template: the part
+which is the user the X server accepts. It needs systemd 254 or newer,
+for its `RestartSteps=` and `RestartMaxDelaySec=` settings; Debian 13
+has 257. It is a template: the part
 after the `@` in the instance name is the display number it exports.
 Copy
 [`andris@.service`](https://github.com/shakenfist/andris/blob/develop/packaging/systemd/andris@.service)
@@ -46,16 +48,18 @@ to give a full path.
 The unit reads two things from `~/.config/andris/`.
 
 The ticket file, `ticket`, holds the password SPICE clients must
-present. It must be private to the user, so make it as you would for a
-manual run:
+present. It must be private to the user, so make it, and the directory
+holding it, as you would for a manual run:
 
 ```bash
-mkdir -p ~/.config/andris
+mkdir -m 700 -p ~/.config/andris
 (umask 077; head -c 24 /dev/urandom | base64 > ~/.config/andris/ticket)
 ```
 
 `andris.env` is optional. It is an environment file, and the unit
-reads two variables from it:
+reads two variables from it. It must not hold secrets: the ticket lives
+only in the ticket file, and there is no option to give it any other
+way.
 
 ```bash
 # ~/.config/andris/andris.env
@@ -104,12 +108,44 @@ journalctl --user -u andris@10 -f     # follow it
 ```
 
 Andris logs to stderr, which the journal captures. Set `RUST_LOG` in
-`andris.env` to change the log level.
+`andris.env` to change the log level. At `debug` and `trace` andris
+may log details of the client's input, such as the keys it sends, to
+the journal, which members of the `adm` and `systemd-journal` groups
+can read; use those levels only while troubleshooting.
+
+Andris's exit status says why it stopped:
+
+| Status | Meaning | What systemd does |
+|--------|---------|-------------------|
+| 0 | Stopped by SIGINT or SIGTERM | Nothing; the stop was asked for |
+| 1 | The desktop went away, or another failure while running | Restarts it, as described below |
+| 2 | The configuration was refused | Does not restart it; read the journal for the reason, fix it, and start the instance again |
 
 Then connect ryll to the address andris listens on, with the ticket
 from the ticket file, as described in [running.md](running.md). To put
 kerbside in front, see
 [Fronting andris with kerbside](running.md#fronting-andris-with-kerbside).
+
+## On a shared host
+
+Loopback is not private to one user: every account on the host can
+reach `127.0.0.1`. Bear that in mind on a host with more than one
+user.
+
+- **Each user needs their own port.** Every instance listens on
+  `127.0.0.1:5900` unless told otherwise, so only one could start.
+  Give each user a distinct `--listen` port in their `andris.env`.
+- **A plain SPICE client cannot tell andris from an impostor.** If
+  another local user binds the port first, while andris is not running
+  (between sessions, or while systemd waits to restart it), a client
+  connecting there talks to their program, and hands it the ticket. On
+  a shared host, use TLS (`--tls-listen`, `--tls-cert` and
+  `--tls-key`, described in [running.md](running.md)) even on
+  loopback, so the client can check it is talking to andris, or reach
+  andris only through kerbside.
+- **Rotate the ticket if it may have leaked.** Write a new ticket file
+  as in [Configuring](#configuring), and restart the instance with
+  `systemctl --user restart andris@10`.
 
 ## When the session ends
 
@@ -137,7 +173,12 @@ Nothing needs to be done by hand. A SPICE client has to reconnect,
 since its connection was closed, and it sees the new session's
 desktop. If the new session lands on a different display number, the
 instance name no longer matches: enable the instance for the new
-number.
+number, and disable the old one with
+`systemctl --user disable --now andris@N`, where `N` is the old number.
+An instance left pointing at the old number is kept off another user's
+session there only by X access control, since that session's cookie is
+not the one andris holds. For the same reason, never pair andris with
+`xhost +`, which turns that access control off.
 
 **Disconnecting RDP.** Closing the RDP client, or losing its
 connection, does not end the session: xrdp keeps the session and its

@@ -64,6 +64,18 @@ Options are checked together before anything starts, and each error
 names the option at fault and how to fix it. The three TLS options go
 together: give all or none.
 
+So andris exits with one of three statuses:
+
+| Status | Meaning |
+|--------|---------|
+| 0 | Stopped by SIGINT or SIGTERM |
+| 1 | The desktop went away, or another failure after the options were accepted, such as an X server that cannot be reached, a TLS certificate or key that cannot be loaded, or a listener that cannot bind |
+| 2 | The options were refused (a bad combination, or a ticket file that is unreadable, not private, empty or too long), and nothing was started |
+
+Status 2 means a person has to change something before andris can
+start; the systemd unit in [xrdp.md](xrdp.md) does not restart after
+it.
+
 ## Exporting an X display
 
 ```bash

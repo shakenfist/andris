@@ -258,7 +258,7 @@ diff.
 | 4 | high | opus | none | Skipped | Fixes that step 2 calls for, if any. Gated. See brief 4. |
 | 5 | medium | sonnet | none | Complete | The systemd user unit and the documentation. See brief 5. |
 | 6 | medium | management | none | Not started | Operator acceptance on `:10`, by hand. See brief 6. |
-| 7 | medium | management | none | Not started | Push audit, pull request, queue. See brief 7. |
+| 7 | medium | management | none | In progress | Push audit, pull request, queue. See brief 7. |
 
 Steps 1 and 3 touch different files and may run in parallel. Step 2
 needs step 1, step 4 needs step 2, and step 5 needs steps 3 and 4.
@@ -665,6 +665,81 @@ that is X3 waiting for ryll's keepalive. Cold, with the test-bed image
 rebuilt and the binaries already built, it takes 62 s. A rebuild of the
 release andris adds about 30 s. `make e2e`, `make lint test` and
 `pre-commit run --all-files` pass.
+
+**Step 3's mutations.** Four mutations were each caught: the gone branch
+of `serve_until` ignored (the in-process vanish test fails); the X11
+threads never setting the signal (`make e2e` fails: andris does not exit
+when Xvfb goes); SIGTERM unhandled (`make e2e` fails with status 143);
+and `stop()` skipped on a signal (the in-process held-key test fails).
+Only the damage thread's path to the gone signal is exercised end to
+end, because it is always the first to see the connection close. The
+capture, input and cursor threads reach the same `lost()` helper, and
+that is a known gap rather than a tested property.
+
+**The push audit** (step 7) audited `origin/develop...HEAD`.
+
+- **Wave 1 passed:** pre-commit, `make lint`, `make test` (320 tests),
+  `make e2e`, and `make e2e-xrdp` with X1 to X7.
+- **Wave 2:** style passed. Code quality and tests had advisory items
+  only. Documentation had one blocking item: the master plan still
+  said andris did not handle SIGTERM. Security had no critical or high
+  findings, one medium and three lows.
+
+Fixed in the audit's commit:
+- **Security medium 1, a squatted port on a shared host.** Every
+  instance defaults to `127.0.0.1:5900`, loopback is open to every
+  local user, and a plain SPICE client cannot authenticate the server,
+  so a local user who binds the port first can learn the ticket.
+  `docs/xrdp.md` now has an "On a shared host" section: a port per
+  user, TLS or kerbside on shared hosts, and rotating the ticket.
+- **Security low 2:** `docs/xrdp.md` warns that `debug` and `trace` logs
+  may hold input details, in a journal others can read.
+- **Security low 3:** the unit gains `NoNewPrivileges`,
+  `LockPersonality`, `RestrictRealtime`, `RestrictAddressFamilies` and
+  `MemoryDenyWriteExecute`.
+- **Security low 4:** a refused configuration now exits 2, not 1, and
+  the unit has `RestartPreventExitStatus=2`, so systemd stops rather
+  than retrying a setup andris will never accept. `tests/cli.rs`
+  checks status 2 for every refusal; making it 1 again fails four of
+  them.
+- **Security informational 6 and 8:** a stale instance is documented as
+  refused only by X access control, and `~/.config/andris` is made
+  0700, with no secrets in `andris.env`.
+- **Documentation:** the master plan's phase 6 section is in the past
+  tense, and `docs/xrdp.md` names systemd 254 as the minimum.
+- **Code quality:**
+  - X7 requires exit status exactly 1;
+  - a failure part-way through X5 no longer crashes the later checks;
+  - X2's clean-up no longer hides the original failure;
+  - X5's process check now compares the processes before and after,
+    rather than a value with itself;
+  - a dead assignment and a stale comment are gone, and the escaped
+    quotes are double-quoted strings.
+
+**Declined, with reasons:**
+- **Security informational 5, one dropped connection ends andris.** Any
+  of the four X connections failing counts as the desktop gone. A
+  single connection dropping on a live desktop, for example through
+  `xkill` on one of andris's windows, is rare, and the restart that
+  follows recovers it.
+- **Security informational 7, a stronger test-bed guard.** The marker
+  file, `--network none` and running only through `make e2e-xrdp` are
+  enough. Checking for `/.dockerenv` would add nothing those do not.
+- **`SystemCallFilter=@system-service`** from security low 3. A
+  syscall filter that has not been tested could break MIT-SHM or the
+  memfd. It can be added once the soak shows it is safe.
+- **A TLS certificate or key that fails to load exits 1, not 2.** These
+  load in `run()`, not in validation, so systemd keeps retrying a bad
+  certificate. Moving them into validation is a small follow-up, but
+  it changes nothing for this phase's loopback setup.
+- **Test review advisories:** the remaining timing bounds are generous
+  for the one-second grace. The checks run locally (decision 2).
+  Signals and the desktop going at the same moment, and the grace
+  expiring, are not tested. Neither path does anything a single test
+  of each would not show.
+- **Code quality advisories:** the helpers shared by `smoke.py` and
+  `e2e-xrdp-drive.py`, the long script headers, and type hints in the
+  test scripts. None of the existing test scripts has type hints.
 
 ## Back brief
 

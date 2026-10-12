@@ -381,9 +381,9 @@ time:
 - **Interleaving checks** for keys, modifiers, lock keys, an RDP
   resize, an RDP reconnect and a change of layout, with fixes for
   whatever they find.
-- **Process lifetime.** Today andris neither exits when the X server
-  goes away nor handles SIGTERM; it serves until Ctrl-C. This phase
-  makes it exit non-zero when the desktop goes, and stop cleanly on
+- **Process lifetime.** Andris neither exited when the X server went
+  away nor handled SIGTERM; it served until Ctrl-C. This phase makes
+  it exit non-zero when the desktop goes, and stop cleanly on
   SIGTERM, so systemd can restart it.
 - **A systemd user unit, `andris@.service`,** keyed by display
   number, with `XAUTHORITY` from the default. The manager's own

@@ -28,8 +28,10 @@
 # If they pass, the interleaving checks X1 to X7 follow
 # (scripts/e2e-xrdp-drive.py): keys from RDP and SPICE in turn, held
 # modifiers, lock keys, an RDP resize, an RDP reconnect with the same and
-# with another layout, and last, the session ending, which andris must
-# survive by exiting with an error.
+# with another layout, and last, the session ending. Andris must handle
+# that by exiting by itself, promptly and with status 1, the status it
+# gives when the desktop goes, rather than hanging, crashing or exiting
+# 0.
 #
 # Sesman numbers sessions from X11DisplayOffset, 10 by default, so a
 # session here would be :10, the same number as the operator's real xrdp
@@ -194,9 +196,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Background jobs of a non-interactive shell ignore SIGINT, and step 2
-# stops ryll and andris with it. Job control puts each in its own process
-# group with default signal dispositions.
+# Background jobs of a non-interactive shell ignore SIGINT and SIGQUIT.
+# Nothing here sends those (the checks stop ryll and FreeRDP with SIGTERM,
+# and the cleanup kills with SIGKILL), but job control puts each process in
+# its own process group with default signal dispositions, so each runs as
+# it would when started from a terminal or by systemd.
 set -m
 
 say "$("$RYLL" --version 2>&1 | head -n1 || true); $("$ANDRIS" --version 2>&1 | head -n1 || true)"
@@ -338,12 +342,14 @@ fi
 if alive "${pids[andris]}"; then
     fail "X7 (exit status): andris is still running"
 else
+    # Exactly 1, as scripts/e2e.sh's fails_within requires: andris
+    # returning an error. A crash or a signal gives another status.
     status=0
     wait "${pids[andris]}" || status=$?
-    if [ "$status" -ne 0 ]; then
+    if [ "$status" -eq 1 ]; then
         pass "X7 (exit status): andris exited with status $status"
     else
-        fail "X7 (exit status): andris exited with status 0 when the desktop went"
+        fail "X7 (exit status): andris exited with status $status when the desktop went, not 1"
     fi
 fi
 if [ "$failures" -ne 0 ]; then

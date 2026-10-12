@@ -76,7 +76,7 @@ def main():
         control = drive.connect(args.socket, deadline, watch)
         surface = check_surface(drive, control, deadline, width, height, watch)
         drive.wait_frame(control, surface['surface_id'], keylogger.COLOUR, watch)
-        log('PASS: a frame of the keylogger\'s window reached ryll')
+        log("PASS: a frame of the keylogger's window reached ryll")
     except (drive.Failure, RuntimeError, EOFError, OSError) as e:
         log(f'FAIL: {e}')
         return 1

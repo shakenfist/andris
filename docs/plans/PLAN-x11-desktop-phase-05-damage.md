@@ -347,7 +347,7 @@ diff.
 | 7 | medium | sonnet | none | Complete | `make e2e`: idle sends nothing, a small change sends a little. See brief 7. |
 | 8 | medium | sonnet | none | Complete | Documentation. See brief 8. |
 | 9 | medium | management | none | Complete | Measurements: idle CPU and scrolling frame rate. See brief 9. |
-| 10 | medium | management | none | Not started | Push audit, pull request, queue. See brief 10. |
+| 10 | medium | management | none | Complete | Push audit, pull request, queue. See brief 10. |
 
 Step 1 is gated because the seam's shape is cheap to propose and
 expensive to change once steps 2 to 5 sit on it. Step 2 runs in a
@@ -847,7 +847,9 @@ After the fixes, 313 tests pass. `make e2e` and `cargo deny` pass.
   which has no X server. It runs under `make e2e`, and now says when
   it skips.
 
-The pull request and its merge commit are recorded below once known.
+Landed as shakenfist/andris#8, merge commit `68b1058`. Its automated
+review's two document items and its resize test gap were addressed in
+a follow-up pull request; the other consider items were declined there.
 
 ## Appendix: the damage spike
 

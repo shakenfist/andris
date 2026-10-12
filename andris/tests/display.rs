@@ -632,6 +632,81 @@ async fn a_size_change_replaces_the_surface() {
     expect_quiet(&mut client).await;
 }
 
+/// Expect the surface to be replaced by one of `size`, and the new
+/// surface's first frame to show the desktop exactly.
+async fn expect_replaced_surface(
+    server: &TestServer,
+    client: &mut TestClient,
+    size: Size,
+) -> Screen {
+    let message = client.recv().await;
+    assert_eq!(message.header.message_type, display_server::SURFACE_DESTROY);
+    assert_eq!(
+        SurfaceDestroy::decode(message.payload()).unwrap(),
+        SurfaceDestroy { surface_id: 0 }
+    );
+    expect_surface_create(client, size).await;
+    let mut screen = Screen::new(size);
+    expect_complete_frame(client, &mut screen).await;
+    screen.assert_shows(&server.platform.desktop().unwrap());
+    expect_monitors_config(client, size).await;
+    expect_mark(client).await;
+    screen
+}
+
+#[tokio::test]
+async fn a_frame_that_finds_an_unreported_size_replaces_the_surface() {
+    let (server, _main, mut client) = open_display(capabilities::DEFAULT_DISPLAY).await;
+    start(&server, &mut client, image_compression::AUTO_GLZ).await;
+
+    // The capture thread sees the new size before damage reports it: the
+    // damage is still at the old size, inside the surface.
+    let size = Size {
+        width: 320,
+        height: 256,
+    };
+    server.platform.set_size_unreported(size).unwrap();
+    server
+        .platform
+        .report_damage(Rectangle::new(0, 0, 64, 64))
+        .unwrap();
+    let mut screen = expect_replaced_surface(&server, &mut client, size).await;
+    expect_quiet(&mut client).await;
+
+    // The resize, reported late, finds nothing left to send.
+    server.platform.set_size(size).unwrap();
+    expect_quiet(&mut client).await;
+    advance_and_expect_frame(&server, &mut client, &mut screen).await;
+    expect_quiet(&mut client).await;
+}
+
+#[tokio::test]
+async fn a_scrub_that_finds_an_unreported_size_replaces_the_surface() {
+    let server = TestServer::start_with_intervals(INTERVAL, SHORT_SCRUB).await;
+    let (server, _main, mut client) = open_display_on(server, capabilities::DEFAULT_DISPLAY).await;
+    start(&server, &mut client, image_compression::AUTO_GLZ).await;
+
+    // No damage at all: only the scrub's capture can notice.
+    let size = Size {
+        width: 192,
+        height: 192,
+    };
+    server.platform.set_size_unreported(size).unwrap();
+    let resized = Instant::now();
+    let mut screen = expect_replaced_surface(&server, &mut client, size).await;
+    let took = resized.elapsed();
+    assert!(
+        took < SHORT_SCRUB + Duration::from_millis(500),
+        "the resize took {took:?} to arrive"
+    );
+    expect_quiet(&mut client).await;
+
+    server.platform.set_size(size).unwrap();
+    expect_quiet(&mut client).await;
+    advance_and_expect_frame(&server, &mut client, &mut screen).await;
+    expect_quiet(&mut client).await;
+}
+
 #[tokio::test]
 async fn init_with_a_negative_cache_size_closes_the_channel() {
     let (_server, _main, mut client) = open_display(capabilities::DEFAULT_DISPLAY).await;

@@ -222,9 +222,9 @@ as a warning; the display channel closes after ten failed captures in a row,
 frame or scrub, or at once if the connection to the X display has gone.
 
 **The scrub.** The X server does not report every change, so andris
-also re-reads the whole desktop every four seconds, in 16 slices of
-whole tile rows, 250 ms apart. It compares each slice with what it last
-sent, and any tile that differs is sent in the next frame as if it had
+also re-reads the whole desktop at least once every four seconds, one
+slice of whole tile rows every 250 ms. It compares each slice with
+what it last sent, and any tile that differs is sent in the next frame as if it had
 been reported. A change damage missed therefore reaches the client
 within about four seconds. The scrub runs even on a still desktop,
 where it sends nothing but still costs a slice's capture and

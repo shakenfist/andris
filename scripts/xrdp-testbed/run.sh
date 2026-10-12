@@ -25,6 +25,12 @@
 #   channels  ryll's log shows the main, display, inputs and cursor
 #             channels connected.
 #
+# If they pass, the interleaving checks X1 to X7 follow
+# (scripts/e2e-xrdp-drive.py): keys from RDP and SPICE in turn, held
+# modifiers, lock keys, an RDP resize, an RDP reconnect with the same and
+# with another layout, and last, the session ending, which andris must
+# survive by exiting with an error.
+#
 # Sesman numbers sessions from X11DisplayOffset, 10 by default, so a
 # session here would be :10, the same number as the operator's real xrdp
 # desktop on the host. Nothing here could reach that one (the container
@@ -166,10 +172,12 @@ cleanup() {
         { wait "${pids[$name]}"; } 2>/dev/null || true
     done
     if ! $passed; then
-        for log in "${names[@]/#/$work/}" "$work/keylogger" "$work/smoke"; do
-            if [ -f "$log.log" ]; then
-                echo "===== $(basename "$log").log ====="
-                cat "$log.log"
+        # Every process's log, including those the interleaving checks
+        # restarted, and the keylogger's.
+        for log in "$work"/*.log; do
+            if [ -f "$log" ]; then
+                echo "===== $(basename "$log") ====="
+                cat "$log"
             fi
         done
         # Sesman runs the session's Xorg in tester's home, logging to
@@ -210,7 +218,7 @@ echo "$TESTER:$TESTER_PASSWORD" | chpasswd
 chown "$TESTER:" "$work"
 cat >"$TESTER_HOME/startwm.sh" <<EOF
 #!/bin/sh
-exec python3 -u $scripts/e2e-keylogger.py --display "\$DISPLAY" >$work/keylogger.log 2>&1
+exec python3 -u $scripts/e2e-keylogger.py --display "\$DISPLAY" --detail >$work/keylogger.log 2>&1
 EOF
 chown "$TESTER:" "$TESTER_HOME/startwm.sh"
 chmod 0755 "$TESTER_HOME/startwm.sh"
@@ -231,12 +239,16 @@ wait_until "$DAEMON_BOUND" xrdp "xrdp listening on 127.0.0.1:$RDP_PORT" \
 
 # 3. The RDP client, on an Xvfb of its own, larger than the session so the
 # whole FreeRDP window fits on it. /dynamic-resolution lets a resize of
-# that window resize the session.
+# that window resize the session. -grab-keyboard stops FreeRDP grabbing
+# the client's keyboard while it has the focus, so that the interleaving
+# checks can change the client's own lock keys without FreeRDP seeing them.
+# The checks restart FreeRDP with this same command.
 start client-xvfb Xvfb "$CLIENT_DISPLAY" -screen 0 "${CLIENT_GEOMETRY}x24" -nolisten tcp
 wait_until "$XVFB_BOUND" client-xvfb "the client's Xvfb answering on $CLIENT_DISPLAY" \
     xdpyinfo -display "$CLIENT_DISPLAY"
-start freerdp env DISPLAY="$CLIENT_DISPLAY" xfreerdp3 "/v:127.0.0.1:$RDP_PORT" "/u:$TESTER" \
-    "/p:$TESTER_PASSWORD" /cert:ignore "/size:$RDP_SIZE" /dynamic-resolution
+freerdp_command=(env DISPLAY="$CLIENT_DISPLAY" xfreerdp3 "/v:127.0.0.1:$RDP_PORT" "/u:$TESTER"
+    "/p:$TESTER_PASSWORD" /cert:ignore "/size:$RDP_SIZE" /dynamic-resolution -grab-keyboard)
+start freerdp "${freerdp_command[@]}"
 
 # 4. The session's Xorg, and the keylogger on it. FreeRDP is the process
 # watched: if the RDP connection fails, it exits.
@@ -266,7 +278,8 @@ start andris "${as_tester[@]}" RUST_LOG=info "$ANDRIS" --platform x11 --display 
     --listen "127.0.0.1:$SPICE_PORT" --ticket-file "$work/ticket"
 wait_until "$ANDRIS_BOUND" andris "andris listening on $SPICE_PORT" \
     grep -q "plain listener ready" "$work/andris.log"
-start ryll "${as_tester[@]}" "$RYLL" --headless --file "$work/andris.vv" --control-socket "$sock" --verbose
+ryll_command=("${as_tester[@]}" "$RYLL" --headless --file "$work/andris.vv" --control-socket "$sock" --verbose)
+start ryll "${ryll_command[@]}"
 
 # The smoke checks. smoke.py bounds its own waits, and gives up early if a
 # process it depends on exits.
@@ -310,16 +323,33 @@ if [ "$failures" -ne 0 ]; then
     exit 1
 fi
 
-# ---------------------------------------------------------------------------
-# HOOK: the interleaving checks (scripts/e2e-xrdp-drive.py) run here, once
-# the smoke checks have passed. They can use:
-#   $session              the xrdp session's display, as tester sees it
-#   $CLIENT_DISPLAY       FreeRDP's own display, for xdotool
-#   $sock                 ryll's control socket
-#   $work/keylogger.log   the keylogger's output
-#   ${pids[...]}          andris, ryll, freerdp, xrdp, sesman, client-xvfb
-#   "${as_tester[@]}", start, wait_until, alive, pass, fail
-# ---------------------------------------------------------------------------
+# The interleaving checks, X1 to X7 (scripts/e2e-xrdp-drive.py). They
+# restart ryll and FreeRDP with the commands above, and end the session
+# last, in X7. Andris is this script's child, so X7's last part, andris's
+# exit status, is checked here once the drive has seen it exit.
+rc=0
+python3 "$scripts/e2e-xrdp-drive.py" --socket "$sock" --session "$session" --client-display "$CLIENT_DISPLAY" \
+    --work "$work" --xauthority "$TESTER_HOME/.Xauthority" --xrdp-log "$XRDP_LOG" \
+    --andris "${pids[andris]}" --ryll "${pids[ryll]}" --freerdp "${pids[freerdp]}" \
+    --ryll-command "${ryll_command[*]@Q}" --freerdp-command "${freerdp_command[*]@Q}" || rc=$?
+if [ "$rc" -ne 0 ]; then
+    failures=$((failures + 1))
+fi
+if alive "${pids[andris]}"; then
+    fail "X7 (exit status): andris is still running"
+else
+    status=0
+    wait "${pids[andris]}" || status=$?
+    if [ "$status" -ne 0 ]; then
+        pass "X7 (exit status): andris exited with status $status"
+    else
+        fail "X7 (exit status): andris exited with status 0 when the desktop went"
+    fi
+fi
+if [ "$failures" -ne 0 ]; then
+    say "$failures interleaving check(s) failed"
+    exit 1
+fi
 
 passed=true
 say "PASS"

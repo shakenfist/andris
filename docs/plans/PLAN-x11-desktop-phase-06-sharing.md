@@ -253,7 +253,7 @@ diff.
 |------|--------|-------|-----------|--------|---------------------|
 | 0 | low | management | none | Complete | Commit the phase 5 close-out and this plan. See brief 0. |
 | 1 | high | opus | none | Complete | The containerised xrdp test bed, with a smoke run. Gated. See brief 1. |
-| 2 | high | opus | none | Not started | Interleaving checks as `make e2e-xrdp`, with their results recorded. Gates step 4. See brief 2. |
+| 2 | high | opus | none | Complete | Interleaving checks as `make e2e-xrdp`, with their results recorded. Gates step 4. See brief 2. |
 | 3 | high | opus | none | Complete | Process lifetime: SIGTERM, and exiting when the desktop goes. See brief 3. |
 | 4 | high | opus | none | Not started | Fixes that step 2 calls for, if any. Gated. See brief 4. |
 | 5 | medium | sonnet | none | Not started | The systemd user unit and the documentation. See brief 5. |
@@ -579,6 +579,75 @@ Filled in as the steps complete.
   that its release build could not pick up step 3's code half-written.
   It also added `scripts/xrdp-testbed/smoke.py`, which reuses
   `scripts/e2e-drive.py`'s helpers for the control-socket checks.
+- **Step 2 checks X7's exit status in `run.sh`, not in the drive
+  script.** Andris is `run.sh`'s child, and bash reaps it as soon as it
+  exits, so only `run.sh`'s `wait` can see its status. The drive script
+  checks the rest of X7: the time to exit, and the log line.
+- **Step 2 starts FreeRDP with `-grab-keyboard`.** FreeRDP 3 grabs the
+  client display's keyboard while its window has the focus, which made
+  it impossible to change the client's own lock keys without FreeRDP
+  sending them on. The checks need that, to align the two clients' lock
+  state before counting keys.
+
+**Step 2: the interleaving checks.** `make e2e-xrdp` runs X1 to X7 after
+the smoke checks (`scripts/e2e-xrdp-drive.py`). The keylogger gained a
+`--detail` mode, which prints each key's keysyms, keycode and state, and
+each `MappingNotify`; `make e2e` uses its old output unchanged. Before
+X1 the lock keys are aligned (Num Lock on, Caps Lock off, which is what
+ryll asserts), so that neither client's synchronisation toggles a lock
+while keys are being counted.
+
+| Check | Outcome | What was observed |
+|-------|---------|-------------------|
+| X1 | Pass | 80 keys, alternating RDP and SPICE, each arrived once, in order, with the right keysym. Every switch of source device sends the keylogger two `MappingNotify` events (keyboard, then modifiers): 158 in 80 keys. That is the core keyboard taking each device's keymap, as survey finding 5 expected, and is harmless to a client that refreshes its keymap on `MappingNotify`. |
+| X2 | Pass | Modifiers merge across devices. Shift held over RDP made SPICE's x type `X` (state 0x11), and Shift held over SPICE made RDP's x type `X`. Once each side released its Shift, x from either side was unshifted: nothing stuck. |
+| X3 | Pass, with a finding | An RDP Caps Lock turned the session's Caps Lock on. A restarted ryll's `KEY_MODIFIERS` turned it off again, since ryll synchronised last (decision 6). FreeRDP synchronises again whenever its window takes the focus, and then wins. **But an idle ryll turned an RDP-set Caps Lock off 10.0 s after its last key, in every run.** See the finding below. |
+| X4 | Pass | Resizing the FreeRDP window to 1024x768 resized the session through RandR from 1280x800 to exactly 1024x768. Ryll got a 1024x768 surface, and a screenshot of that size. |
+| X5 | Pass | With FreeRDP killed, ryll stayed connected through 20 status polls in 5 s, and andris and ryll kept their processes. FreeRDP reconnected to the same session, with the same keylogger. Its `/size:1280x800` resized the session back from 1024x768 to 1280x800, and ryll's surface followed. A key from each side arrived. |
+| X6 | Pass | Reconnecting with `/kbd:layout:0x407` made xrdp load layout `de` into the running session (`setxkbmap -query`: `us`, then `de`). SPICE scancode 0x15 typed `z` and 0x2C typed `y`, from keycodes 29 and 52, the same keycodes RDP's y and z used. The XTEST device types through the new layout, and andris's table, keyed by XKB key name, needed no reload. Brief 4's keymap reload is not needed. |
+| X7 | Pass | Ending the session's window manager (the keylogger) ended the session. Andris exited 0.1 s later with status 1, logging `the desktop has gone, so andris is stopping: the X11 damage thread lost its connection to the X display`. |
+
+**Finding: ryll's idle keepalive undoes lock keys set over RDP.** Ryll
+restates the last `KEY_MODIFIERS` it sent whenever its inputs channel
+has been quiet for 10 s, as a keepalive. Andris applies every
+`KEY_MODIFIERS` against the desktop's current locks, as spice-server
+does, so the keepalive toggles back any lock another client changed.
+With a ryll client connected and idle, a Caps Lock or Num Lock pressed
+over RDP lasts about 10 s. In effect ryll always wins, not the last
+client to synchronise. Ryll's source confirms it, and shows more: ryll
+sends `KEY_MODIFIERS` once, as its inputs channel opens, with the fixed
+value `NUM_LOCK` rather than the Mac's own lock state
+(`shakenfist-spice-renderer/src/channels/inputs.rs:249`). Its keepalive
+(`:390-398`, `:966-975`) restates that value, on the stated assumption
+that "the guest sees no change". So, while ryll is connected, an idle
+desktop is put back to Num Lock on and Caps Lock off every 10 s. This is not one of the gating checks, and the
+choice of fix is the management session's:
+- **In andris:** apply a client's `KEY_MODIFIERS` only when it differs
+  from the last one that client sent, or is the first on its channel.
+  A restatement then changes nothing, from ryll or from any other client
+  that does the same.
+- **In ryll (an issue):** the keepalive should not carry state, or should
+  restate the state the server last reported. Andris never sends
+  `KEY_MODIFIERS` when the desktop's locks change; spice-server does,
+  and ryll ignores it for the keepalive.
+
+Either way, `docs/xrdp.md` should say how locks and held modifiers
+behave.
+
+**Other test-side findings.** FreeRDP 3 overwrites the password in its
+own `argv`, so the checks restart it with the command `run.sh` passes
+them rather than reading `/proc`. In development, the first connection
+to a restarted ryll's control socket was once reset while the new ryll
+was starting, so the checks remove the old socket before starting ryll,
+and retry a failed connection until their bound.
+
+**Runs.** Seven consecutive `make e2e-xrdp` runs passed, each check with
+the same observations every time. Warm (image and binaries current), a
+whole run takes 26 to 27 s, of which the checks take about 20 s; 10 s of
+that is X3 waiting for ryll's keepalive. Cold, with the test-bed image
+rebuilt and the binaries already built, it takes 62 s. A rebuild of the
+release andris adds about 30 s. `make e2e`, `make lint test` and
+`pre-commit run --all-files` pass.
 
 ## Back brief
 

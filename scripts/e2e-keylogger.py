@@ -6,6 +6,25 @@ takes the input focus, and prints READY once the window is mapped. Then it
 prints one line per KeyPress: the name of the key's unshifted keysym, as
 XKeysymToString(XLookupKeysym(event, 0)) would give it (so 'a', 'Left').
 
+With --detail, which the xrdp test bed's checks use, each KeyPress line is
+instead
+
+    KEY name=a shifted=A keycode=38 state=0x10
+
+giving the unshifted and shifted keysyms of the event's keycode in its
+group, the keycode, and the event's modifier and lock state (the core
+protocol's state field, with the XKB group in bits 13-14). Every
+MappingNotify is printed too, as
+
+    MAPPING request=1 first=8 count=248
+
+The keysyms are read from the core keyboard mapping, which the keylogger
+fetches again on every MappingNotify. The X server sends one when the core
+keyboard's keymap changes, including when it takes another device's
+keymap because that device sent the next event, so a key from either the
+xrdp session's own keyboard or andris's XTEST device is named by the
+keymap it was typed through.
+
 The key 'x' also repaints a small square (SQUARE_SIZE pixels, at SQUARE_X,
 SQUARE_Y) in SQUARE_COLOUR, which scripts/e2e-drive.py uses to check that a
 small change reaches ryll as a few small updates, not a full-screen one. It
@@ -63,9 +82,30 @@ def keysym_names():
     return names
 
 
+# The core protocol's Shift modifier, and where the XKB group sits in an
+# event's state.
+SHIFT_MASK = 0x01
+GROUP_SHIFT = 13
+GROUP_MASK = 0x03
+
+
+def detail(d, names, event):
+    """A KeyPress, as --detail prints it."""
+    group = (event.state >> GROUP_SHIFT) & GROUP_MASK
+    unshifted = d.keycode_to_keysym(event.detail, 2 * group)
+    shifted = d.keycode_to_keysym(event.detail, 2 * group + 1)
+    if shifted == X.NoSymbol:
+        shifted = unshifted
+    name = names.get(unshifted, f'keysym-0x{unshifted:x}')
+    shifted_name = names.get(shifted, f'keysym-0x{shifted:x}')
+    return f'KEY name={name} shifted={shifted_name} keycode={event.detail} state=0x{event.state:x}'
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--display', required=True, help='the X display, for example :99')
+    parser.add_argument('--detail', action='store_true',
+                        help='print each key with its keycode, shifted keysym and state, and each MappingNotify')
     args = parser.parse_args()
 
     d = xdisplay.Display(args.display)
@@ -101,13 +141,18 @@ def main():
         elif event.type == X.Expose:
             window.set_input_focus(X.RevertToParent, X.CurrentTime)
             d.flush()
+        elif event.type == X.MappingNotify:
+            d.refresh_keyboard_mapping(event)
+            if args.detail:
+                print(f'MAPPING request={event.request} first={event.first_keycode} count={event.count}',
+                      flush=True)
         elif event.type == X.KeyPress:
             keysym = d.keycode_to_keysym(event.detail, 0)
             name = names.get(keysym, f'keysym-0x{keysym:x}')
             if name == SQUARE_KEY:
                 window.fill_rectangle(square_gc, SQUARE_X, SQUARE_Y, SQUARE_SIZE, SQUARE_SIZE)
                 d.flush()
-            print(name, flush=True)
+            print(detail(d, names, event) if args.detail else name, flush=True)
 
 
 if __name__ == '__main__':

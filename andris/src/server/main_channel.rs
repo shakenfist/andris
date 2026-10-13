@@ -192,7 +192,7 @@ async fn send_ping(
 
 #[cfg(test)]
 mod tests {
-    use shakenfist_spice_protocol::messages::take_message;
+    use shakenfist_spice_protocol::messages::ReceiveBuffer;
     use tokio::io::AsyncReadExt;
 
     use super::*;
@@ -224,12 +224,12 @@ mod tests {
         let conn = ChannelConn::<MainOpcode>::new(server_end, session);
         let task = tokio::spawn(serve(ctx, conn, Duration::from_millis(20)));
 
-        let mut buf = Vec::new();
+        let mut buf = ReceiveBuffer::new();
         let mut ping_ids = Vec::new();
         let mut last_timestamp = 0;
         while ping_ids.len() < 4 {
             let message = loop {
-                if let Some(message) = take_message(&mut buf, 1 << 20).unwrap() {
+                if let Some(message) = buf.take_message(1 << 20).unwrap() {
                     break message;
                 }
                 let mut chunk = [0u8; 4096];

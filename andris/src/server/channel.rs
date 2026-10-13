@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail, ensure};
 use shakenfist_spice_protocol::main_client;
 use shakenfist_spice_protocol::messages::{
-    AckSync, Disconnecting, Pong, ReceivedMessage, SetAck, WireType, make_message, take_message,
+    AckSync, Disconnecting, Pong, ReceiveBuffer, ReceivedMessage, SetAck, WireType, make_message,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::debug;
@@ -246,7 +246,7 @@ enum Common {
 /// channel's messages.
 pub struct ChannelConn<O: ServerOpcode> {
     stream: Box<dyn ChannelStream>,
-    buf: Vec<u8>,
+    buf: ReceiveBuffer,
     pending: VecDeque<ReceivedMessage>,
     ack: Option<AckWindow>,
     session: Arc<Session>,
@@ -259,7 +259,7 @@ impl<O: ServerOpcode> ChannelConn<O> {
     pub fn new(stream: impl ChannelStream + 'static, session: Arc<Session>) -> Self {
         Self {
             stream: Box::new(stream),
-            buf: Vec::new(),
+            buf: ReceiveBuffer::new(),
             pending: VecDeque::new(),
             ack: None,
             session,
@@ -353,7 +353,9 @@ impl<O: ServerOpcode> ChannelConn<O> {
             return Ok(Event::Closed);
         }
         loop {
-            if let Some(message) = take_message(&mut self.buf, O::MAX_CLIENT_BODY)
+            if let Some(message) = self
+                .buf
+                .take_message(O::MAX_CLIENT_BODY)
                 .with_context(|| format!("reading the {} channel", O::CHANNEL.name()))?
             {
                 return Ok(match self.handle_common(&message)? {
@@ -365,8 +367,9 @@ impl<O: ServerOpcode> ChannelConn<O> {
                     Common::Channel => Event::Channel(message),
                 });
             }
-            self.buf.reserve(READ_CHUNK);
-            let read = self.stream.read_buf(&mut self.buf).await?;
+            let mut chunk = [0u8; READ_CHUNK];
+            let read = self.stream.read(&mut chunk).await?;
+            self.buf.extend_from_slice(&chunk[..read]);
             if read == 0 {
                 if !self.buf.is_empty() {
                     debug!(

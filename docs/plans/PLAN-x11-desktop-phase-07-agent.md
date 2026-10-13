@@ -272,7 +272,7 @@ its conventions in its `AGENTS.md`.
 | 0 | low | management | none | Complete | Commit the phase 6 close-out and this plan; create the ryll worktree. See brief 0. |
 | 1 | high | opus | none | Complete | Spike: xorgxrdp's refusal, Xvfb's RandR, and chansrv's clipboard, on the test bed. Gated. See brief 1. |
 | 2 | high | opus | none | In progress | Ryll: headless clipboard, and control verbs for the clipboard and resize. Ryll PR. See brief 2. |
-| 3 | medium | sonnet | none | Not started | Andris: bump the ryll pin to step 2's merge. See brief 3. |
+| 3 | medium | sonnet | none | Complete | Andris: bump the ryll pin to step 2's merge. See brief 3. |
 | 4 | high | opus | none | Not started | The agent protocol on the main channel, the two seams, and the synthetic platform's side. See brief 4. |
 | 5 | high | opus | none | Not started | X11 display control through RandR. See brief 5. |
 | 6 | high | opus | none | Not started | The X11 clipboard thread. See brief 6. |
@@ -606,6 +606,20 @@ open the pull request when the operator asks.
 ## Result
 
 Filled in as the steps complete.
+
+**Departure: step 3 ran before step 2 merged.** The agent reassembler
+andris needs was already on ryll's `develop`, so step 3 pinned
+`7e3705e` (ryll's `develop` on 2026-10-14) rather than waiting for the
+ryll pull request, and step 4 could start at once. A second bump, to
+that pull request's merge commit, lands before step 7, whose checks
+need the new control-socket verbs.
+
+**Step 3: the pin bump.** `502199e` to `7e3705e`. The only break was
+ryll#510's `ReceiveBuffer`, which replaced the free `take_message`;
+andris's channel reader now reads into a 16 KiB chunk and appends it,
+since `ReceiveBuffer` cannot take tokio's `read_buf`. Behaviour is
+unchanged, and framing many queued messages is now linear rather than
+quadratic. `make lint test e2e e2e-xrdp` passed.
 
 **Step 1: the spike** (2026-10-14, about 12 minutes, all in the test-bed
 container; nothing touched `:10`). It confirmed survey findings 1 and 8

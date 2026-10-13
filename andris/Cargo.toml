@@ -33,13 +33,13 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 x11rb = { version = "0.14", features = ["damage", "shm", "xfixes", "xkb", "xtest"] }
 
-# ryll's shared crates, pinned to ryll's develop at 502199e (2026-10-11).
+# ryll's shared crates, pinned to ryll's develop at 7e3705e.
 # Both crates come from one ryll workspace, so they must always carry the
 # same rev, here and in [dev-dependencies]; move them together.
-shakenfist-spice-protocol = { version = "0.1.7", git = "https://github.com/shakenfist/ryll", rev = "502199e9b87789b2dd45cb9c13a8b6709e5ab7f8" }
+shakenfist-spice-protocol = { version = "0.1.7", git = "https://github.com/shakenfist/ryll", rev = "7e3705e90ad07efb0cc4ef9745030157345598de" }
 # Only the encoders. openh264 is still built, because the crate depends on
 # it unconditionally (ryll#499).
-shakenfist-spice-compression = { version = "0.1.7", git = "https://github.com/shakenfist/ryll", rev = "502199e9b87789b2dd45cb9c13a8b6709e5ab7f8", default-features = false, features = [
+shakenfist-spice-compression = { version = "0.1.7", git = "https://github.com/shakenfist/ryll", rev = "7e3705e90ad07efb0cc4ef9745030157345598de", default-features = false, features = [
     "encode",
 ] }
 
@@ -48,7 +48,7 @@ rcgen = "0.14"
 # The LZ4 and pure-Rust JPEG decoders too, so tests can decode what the
 # encoders produced. Cargo unifies these features with the ones above in
 # test builds.
-shakenfist-spice-compression = { version = "0.1.7", git = "https://github.com/shakenfist/ryll", rev = "502199e9b87789b2dd45cb9c13a8b6709e5ab7f8", default-features = false, features = [
+shakenfist-spice-compression = { version = "0.1.7", git = "https://github.com/shakenfist/ryll", rev = "7e3705e90ad07efb0cc4ef9745030157345598de", default-features = false, features = [
     "encode",
     "jpeg",
     "lz4",

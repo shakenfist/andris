@@ -25,7 +25,7 @@ use shakenfist_spice_protocol::link::{
     SpiceLinkMess, SpiceLinkReply, SpiceStream, default_channel_caps, perform_auth,
     perform_link_with_caps,
 };
-use shakenfist_spice_protocol::messages::{ReceivedMessage, make_message, take_message};
+use shakenfist_spice_protocol::messages::{ReceiveBuffer, ReceivedMessage, make_message};
 use shakenfist_spice_protocol::{ChannelType, SpiceError, capabilities};
 use tempfile::NamedTempFile;
 use tokio::io::AsyncReadExt;
@@ -285,7 +285,7 @@ fn pem_file(contents: &str) -> NamedTempFile {
 /// A SPICE client for one channel.
 pub struct TestClient {
     stream: SpiceStream,
-    buf: Vec<u8>,
+    buf: ReceiveBuffer,
     /// The public key from the last successful link reply.
     last_key: Option<Vec<u8>>,
 }
@@ -299,7 +299,7 @@ impl TestClient {
             .unwrap();
         Self {
             stream: SpiceStream::Plain(tcp),
-            buf: Vec::new(),
+            buf: ReceiveBuffer::new(),
             last_key: None,
         }
     }
@@ -310,7 +310,7 @@ impl TestClient {
     pub async fn connect_from(addr: SocketAddr, source: IpAddr) -> Self {
         Self {
             stream: SpiceStream::Plain(tcp_from(addr, source).await),
-            buf: Vec::new(),
+            buf: ReceiveBuffer::new(),
             last_key: None,
         }
     }
@@ -334,7 +334,7 @@ impl TestClient {
             .unwrap();
         Self {
             stream: SpiceStream::Tls(tls),
-            buf: Vec::new(),
+            buf: ReceiveBuffer::new(),
             last_key: None,
         }
     }
@@ -433,7 +433,7 @@ impl TestClient {
     pub async fn recv_within(&mut self, wait: Duration) -> Option<ReceivedMessage> {
         tokio::time::timeout(wait, async {
             loop {
-                if let Some(message) = take_message(&mut self.buf, MAX_BODY).unwrap() {
+                if let Some(message) = self.buf.take_message(MAX_BODY).unwrap() {
                     return message;
                 }
                 let mut chunk = [0u8; 16 * 1024];

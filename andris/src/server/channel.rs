@@ -339,6 +339,14 @@ impl<O: ServerOpcode> ChannelConn<O> {
         }
     }
 
+    /// Whether the client has sent anything this connection has read but
+    /// [`ChannelConn::recv`] has not yet returned or handled: a message,
+    /// or part of one. False once andris has caught up with everything
+    /// read from the socket, though more may be waiting in it.
+    pub fn has_unread(&self) -> bool {
+        !self.pending.is_empty() || !self.buf.is_empty()
+    }
+
     /// The session this channel belongs to.
     pub fn session(&self) -> &Arc<Session> {
         &self.session

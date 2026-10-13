@@ -273,8 +273,8 @@ its conventions in its `AGENTS.md`.
 | 1 | high | opus | none | Complete | Spike: xorgxrdp's refusal, Xvfb's RandR, and chansrv's clipboard, on the test bed. Gated. See brief 1. |
 | 2 | high | opus | none | In progress | Ryll: headless clipboard, and control verbs for the clipboard and resize. Ryll PR. See brief 2. |
 | 3 | medium | sonnet | none | Complete | Andris: bump the ryll pin to step 2's merge. See brief 3. |
-| 4 | high | opus | none | Not started | The agent protocol on the main channel, the two seams, and the synthetic platform's side. See brief 4. |
-| 5 | high | opus | none | Not started | X11 display control through RandR. See brief 5. |
+| 4 | high | opus | none | Complete | The agent protocol on the main channel, the two seams, and the synthetic platform's side. See brief 4. |
+| 5 | high | opus | none | In progress | X11 display control through RandR. See brief 5. |
 | 6 | high | opus | none | Not started | The X11 clipboard thread. See brief 6. |
 | 7 | high | opus | none | Not started | End-to-end checks: `make e2e` and `make e2e-xrdp`. See brief 7. |
 | 8 | medium | sonnet | none | Not started | Documentation, and the xorgxrdp feature request drafted. See brief 8. |
@@ -620,6 +620,24 @@ andris's channel reader now reads into a 16 KiB chunk and appends it,
 since `ReceiveBuffer` cannot take tokio's `read_buf`. Behaviour is
 unchanged, and framing many queued messages is now linear rather than
 quadratic. `make lint test e2e e2e-xrdp` passed.
+
+**Step 4: the agent protocol.** Departures from brief 4, each taken in
+review:
+- `AgentConnectedTokens` is not added to `MainOpcode`: the agent is
+  connected from `MAIN_INIT` (decision 3), so it is never sent.
+- Tokens come back in batches of five, and only once andris has
+  handled everything it has read, so that a client sending past its
+  window in one burst is caught rather than refilled.
+- The reassembler is capped at 16 MiB plus 4 KiB. A clipboard message
+  over it is dropped with a warning; any other closes the channel. A
+  monitors config that decodes but asks for an impossible size gets an
+  error `REPLY`; one that does not decode closes the channel.
+- Added: desktop text present before the client announces is offered
+  once it does; losing the desktop's text releases a standing grab;
+  grabs go only to a client that announced `CLIPBOARD_BY_DEMAND`; the
+  outgoing queue is capped at about 32 MiB.
+- `X11Platform` refuses resizes and has an empty clipboard until steps
+  5 and 6 replace them.
 
 **Step 1: the spike** (2026-10-14, about 12 minutes, all in the test-bed
 container; nothing touched `:10`). It confirmed survey findings 1 and 8

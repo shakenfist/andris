@@ -92,9 +92,9 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::x11_utils::X11Error;
 
 use super::{
-    Capture, CursorReceiver, CursorSource, DamageHub, DamageSubscription, DisplayGeometry, Gone,
-    GoneSender, GoneSignal, InputEvent, InputSink, LockState, Platform, Rectangle, ScreenSource,
-    Size,
+    Capture, Clipboard, ClipboardReceiver, CursorReceiver, CursorSource, DamageHub,
+    DamageSubscription, DisplayControl, DisplayGeometry, Gone, GoneSender, GoneSignal, InputEvent,
+    InputSink, LockState, Platform, Rectangle, Resize, ScreenSource, Size,
 };
 use capture::{CaptureRequest, Capturer, serve_capture};
 use checks::ServerFacts;
@@ -186,6 +186,9 @@ pub struct X11Platform {
     /// Set by whichever backend thread first finds its connection dead;
     /// each holds a sender.
     gone: GoneSignal,
+    /// The desktop's clipboard text, which nothing yet reports: always
+    /// `None`. See the [`Clipboard`] implementation.
+    clipboard: watch::Sender<Option<Arc<str>>>,
 }
 
 impl X11Platform {
@@ -288,6 +291,7 @@ impl X11Platform {
             damage,
             using_shm,
             gone,
+            clipboard: watch::Sender::new(None),
         }))
     }
 
@@ -302,13 +306,15 @@ impl X11Platform {
         }
     }
 
-    /// This platform as all four seams, and its gone signal.
+    /// This platform as all six seams, and its gone signal.
     pub fn platform(self: &Arc<Self>) -> Platform {
         Platform {
             geometry: self.clone(),
             screen: self.clone(),
             input: self.clone(),
             cursor: self.clone(),
+            display_control: self.clone(),
+            clipboard: self.clone(),
             gone: self.gone.clone(),
         }
     }
@@ -367,6 +373,29 @@ impl CursorSource for X11Platform {
         let mut receiver = self.cursor.clone();
         receiver.mark_unchanged();
         receiver
+    }
+}
+
+// Placeholders: the X11 backend cannot yet resize the desktop or reach its
+// clipboard, so it refuses every resize and reports an empty clipboard
+// that never changes. Steps 5 (RandR) and 6 (a clipboard thread) of
+// docs/plans/PLAN-x11-desktop-phase-07-agent.md replace both.
+impl DisplayControl for X11Platform {
+    fn set_size(&self, _size: Size) -> Result<Resize> {
+        Ok(Resize::Refused(
+            "andris cannot yet resize an X display".to_string(),
+        ))
+    }
+}
+
+impl Clipboard for X11Platform {
+    fn changes(&self) -> ClipboardReceiver {
+        self.clipboard.subscribe()
+    }
+
+    /// Drops the text: nothing yet owns the X selection for andris.
+    fn set(&self, _text: Arc<str>) -> Result<()> {
+        Ok(())
     }
 }
 

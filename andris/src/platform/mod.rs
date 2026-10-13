@@ -1,13 +1,16 @@
 //! The platform seams: what andris needs from the desktop it exports.
 //!
-//! Four traits separate the SPICE server from the display system:
+//! Six traits separate the SPICE server from the display system:
 //!
 //! - [`DisplayGeometry`] reports the size of the desktop;
 //! - [`ScreenSource`] reports where the desktop changed, as damage, and
 //!   captures parts of it, or all of it, as BGRX;
 //! - [`InputSink`] injects keys, pointer motion and buttons, and reads
 //!   the lock-key state;
-//! - [`CursorSource`] yields the cursor shape as it changes.
+//! - [`CursorSource`] yields the cursor shape as it changes;
+//! - [`DisplayControl`] asks the desktop to change its size;
+//! - [`Clipboard`] follows the text on the desktop's clipboard, and puts
+//!   text there.
 //!
 //! [`Platform`] bundles one implementation of each, with a [`GoneSignal`]
 //! that is set, with the reason, once the desktop has gone for good: when
@@ -29,13 +32,19 @@
 //! - [`CursorSource::subscribe`] never blocks, and its receiver is
 //!   awaited;
 //! - [`ScreenSource::subscribe_damage`] never blocks, and its
-//!   [`DamageSubscription::changed`] is awaited.
+//!   [`DamageSubscription::changed`] is awaited;
+//! - [`DisplayControl::set_size`] **may block**, for as long as the
+//!   desktop takes to answer;
+//! - [`Clipboard::changes`] and [`Clipboard::set`] never block: the
+//!   receiver is awaited, and `set` only queues the text.
 //!
 //! [`damage`] holds the types damage is reported in, and how it is
 //! accumulated.
 //!
 //! This module knows nothing of SPICE. Mapping SPICE's scancodes, button
-//! ids and modifier flags onto these types is the server's job.
+//! ids and modifier flags onto these types is the server's job, as is
+//! speaking the guest agent protocol that resizes and clipboard text
+//! arrive in.
 
 pub mod damage;
 pub mod synthetic;
@@ -51,6 +60,10 @@ use shakenfist_spice_compression::{MAX_IMAGE_DIMENSION, MAX_IMAGE_PIXELS};
 use tokio::sync::watch;
 
 pub use damage::{DamageHub, DamageSubscription, Rectangle, Region, TILE};
+
+/// The most clipboard text andris carries in either direction, in bytes.
+/// Larger text is dropped, with a warning, rather than copied.
+pub const MAX_CLIPBOARD_TEXT: usize = 16 * 1024 * 1024;
 
 /// The size of a desktop or frame, in pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -601,6 +614,52 @@ pub trait CursorSource: Send + Sync {
     fn subscribe(&self) -> CursorReceiver;
 }
 
+/// What became of a [`DisplayControl::set_size`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resize {
+    /// The desktop is now the size asked for, or the nearest size the
+    /// desktop allows. The change reaches subscribers as a resize, as any
+    /// other does.
+    Applied,
+    /// The desktop was already that size; nothing changed.
+    Unchanged,
+    /// The desktop does not allow the change, for the reason given, and
+    /// was left as it was.
+    Refused(String),
+}
+
+/// Changes the size of the desktop.
+pub trait DisplayControl: Send + Sync {
+    /// Make the desktop `size`. May block, for as long as the desktop
+    /// takes to answer. A desktop that will not change says so with
+    /// [`Resize::Refused`]; an error means the request could not be made
+    /// at all, and is [`Gone`] once the desktop has gone.
+    fn set_size(&self, size: Size) -> Result<Resize>;
+}
+
+/// The receiving end of a [`Clipboard`]: the text another program on the
+/// desktop last put on its clipboard, `None` when there is none or it is
+/// not text, and each change as it happens.
+pub type ClipboardReceiver = watch::Receiver<Option<Arc<str>>>;
+
+/// The desktop's clipboard, as text.
+///
+/// Only text that other programs on the desktop put there is reported:
+/// text andris sets with [`Clipboard::set`] is not reported back to it.
+/// A program that copies the same text again is reported again, as a
+/// change to the same value.
+pub trait Clipboard: Send + Sync {
+    /// A receiver that holds the desktop's current text and sees every
+    /// later change. Never blocks. Intermediate texts may be skipped;
+    /// only the latest matters.
+    fn changes(&self) -> ClipboardReceiver;
+
+    /// Put `text` on the desktop's clipboard, for other programs to paste.
+    /// Never blocks: the text is queued. An error means the clipboard can
+    /// take no more, because its connection to the desktop has gone.
+    fn set(&self, text: Arc<str>) -> Result<()>;
+}
+
 /// One implementation of each seam, shared by the server's tasks, and the
 /// signal that the desktop behind them has gone.
 #[derive(Clone)]
@@ -609,6 +668,8 @@ pub struct Platform {
     pub screen: Arc<dyn ScreenSource>,
     pub input: Arc<dyn InputSink>,
     pub cursor: Arc<dyn CursorSource>,
+    pub display_control: Arc<dyn DisplayControl>,
+    pub clipboard: Arc<dyn Clipboard>,
     /// Set once the desktop has gone for good; `andris` exits when it is.
     pub gone: GoneSignal,
 }

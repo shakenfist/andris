@@ -93,6 +93,10 @@ server_opcodes! {
         Init = main_server::INIT,
         ChannelsList = main_server::CHANNELS_LIST,
         MouseMode = main_server::MOUSE_MODE,
+        /// A chunk of a guest agent message; see `server::agent`.
+        AgentData = main_server::AGENT_DATA,
+        /// Agent tokens handed back to the client.
+        AgentToken = main_server::AGENT_TOKEN,
     }
 }
 

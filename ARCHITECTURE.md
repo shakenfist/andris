@@ -85,6 +85,11 @@ XKB `GetNames` at startup), and sends the press or release to the
 server with XTEST. Using names rather than numbers is what makes keys
 land correctly whichever keycode set the server was configured with.
 
+When the platform reports the desktop gone, as the X11 platform does
+when its connection to the X server drops, the process closes its
+clients and exits with a non-zero status, so a supervisor can restart
+it against the next session.
+
 ## Relationship to ryll and kerbside
 
 Andris is the third member of a SPICE trio in the shakenfist

@@ -46,14 +46,35 @@ andris --ticket-file PATH [options]
 
 `andris --help` prints the same list. Logs go to stderr at `info`
 level; set `RUST_LOG` (for example `RUST_LOG=andris=debug`) to
-change that. Ctrl-C (SIGINT) shuts andris down. It closes the client's
+change that. SIGINT (Ctrl-C) and SIGTERM (what systemd and `kill`
+send) each shut andris down cleanly. It closes the client's
 connections, releases any key or mouse button the client still held,
 and waits up to five seconds for the desktop to take those releases
-before it exits, so nothing is left held down on the desktop.
+before it exits with status 0, so nothing is left held down on the
+desktop.
+
+Andris attaches to a desktop; it does not own one. If the X server it
+exports goes away (the session logs out, or the server exits or is
+killed), andris logs an error saying why, closes the client's
+connections within a second, and exits with status 1. There is no
+desktop left to release held keys into. It does not wait for a new X
+server; whatever started andris must start it again once there is one.
 
 Options are checked together before anything starts, and each error
 names the option at fault and how to fix it. The three TLS options go
 together: give all or none.
+
+So andris exits with one of three statuses:
+
+| Status | Meaning |
+|--------|---------|
+| 0 | Stopped by SIGINT or SIGTERM |
+| 1 | The desktop went away, or another failure after the options were accepted, such as an X server that cannot be reached or a listener that cannot bind |
+| 2 | The options were refused (a bad combination, a ticket file that is unreadable, not private, empty or too long, or a TLS certificate or key that cannot be loaded), and nothing was started |
+
+Status 2 means a person has to change something before andris can
+start; the systemd unit in [xrdp.md](xrdp.md) does not restart after
+it.
 
 ## Exporting an X display
 
@@ -68,6 +89,8 @@ xrdp session is the session's user. The display comes from
 `--display`, or failing that `DISPLAY`; with neither, andris refuses
 to start. Authorisation uses the usual X mechanisms, so set
 `XAUTHORITY` if the session's cookie is not in `~/.Xauthority`.
+
+To run andris as a service beside xrdp, see [xrdp.md](xrdp.md).
 
 Before it listens, andris checks the X server and refuses to start,
 naming every problem it found, unless:
@@ -351,6 +374,13 @@ line and the startup log:
   any CPU use is the scrub's.
 
 ## Connecting with ryll
+
+Use a ryll built from its `develop` branch, at or after the revision
+andris's `Cargo.lock` pins, until a ryll release after 0.1.7 carries
+the same changes. Ryll 0.1.7 and earlier decode LZ4 images differently
+from how spice-server and andris send them (shakenfist/ryll#475): the
+pointer moves, but the display never paints, and ryll logs
+`LZ4 unsupported spice format` for every draw.
 
 Ryll's `--direct` option has no password, so a ticket needs a
 virt-viewer `.vv` file. Write one:

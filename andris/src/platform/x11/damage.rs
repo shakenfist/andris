@@ -18,8 +18,8 @@ use x11rb::protocol::damage::{self as xdamage, ReportLevel};
 use x11rb::protocol::xproto::{self, ChangeWindowAttributesAux, EventMask, Window};
 use x11rb::rust_connection::RustConnection;
 
-use super::{create_wake_window, is_wake, log_lost, x_error};
-use crate::platform::{DamageHub, Rectangle, Size};
+use super::{create_wake_window, is_wake, lost, x_error};
+use crate::platform::{DamageHub, GoneSender, Rectangle, Size};
 
 /// The DAMAGE version andris asks for. Andris uses only what 1.0 has:
 /// `Create`, and the `Notify` event.
@@ -120,6 +120,8 @@ pub(super) struct DamageThread {
     pub size: Size,
     /// Where damage and resizes are reported.
     pub hub: Arc<DamageHub>,
+    /// Set when the thread stops for any reason but the platform's drop.
+    pub gone: GoneSender,
 }
 
 impl DamageThread {
@@ -155,9 +157,9 @@ impl DamageThread {
 }
 
 /// Follow damage and resizes until woken to stop or something fails.
-/// Unless it was woken, the hub is made [`gone`] as the thread stops, so
-/// every subscription learns the desktop has gone rather than waiting for
-/// damage that will never come.
+/// Unless it was woken, the platform's gone signal is set and the hub is
+/// made [`gone`] as the thread stops, so every subscription learns the
+/// desktop has gone rather than waiting for damage that will never come.
 ///
 /// [`gone`]: DamageHub::gone
 pub(super) fn serve_damage(mut thread: DamageThread) {
@@ -165,6 +167,7 @@ pub(super) fn serve_damage(mut thread: DamageThread) {
         debug!("the X11 damage thread is stopping");
         return;
     };
+    thread.gone.set(why.clone());
     if let Err(e) = thread.hub.gone(why) {
         error!(
             error = format!("{e:#}"),
@@ -212,9 +215,11 @@ fn follow(thread: &mut DamageThread) -> Option<String> {
             return Some(format!("the X11 damage thread cannot report damage: {e:#}"));
         }
         if let Some(e) = failure {
-            log_lost("damage", "damage is no longer followed", &e);
-            return Some(format!(
-                "the X11 damage thread lost its connection to the X display: {e}"
+            return Some(lost(
+                &thread.gone,
+                "damage",
+                "damage is no longer followed",
+                &e,
             ));
         }
         if batch.stop {

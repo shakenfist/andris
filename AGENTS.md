@@ -87,6 +87,8 @@ locally:
 - **`make e2e` runs andris against Xvfb and ryll's headless client.**
   It needs nothing on the host beyond Docker, and runs in CI's merge
   tier.
+- **Tests involving xrdp run on the test bed** (`make e2e-xrdp`,
+  session on `:50`), never against a live session.
 - **Server opcodes come from the per-channel enums in
   `server/opcodes.rs`**, never raw numbers. Its test checks that
   ryll names every variant.

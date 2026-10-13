@@ -1,0 +1,42 @@
+# A systemd user unit that shares one X display over SPICE. The instance
+# name is the display number: andris@10.service exports :10.
+# See https://github.com/shakenfist/andris/blob/develop/docs/xrdp.md
+
+[Unit]
+Description=Andris SPICE server for X display :%i
+Documentation=https://github.com/shakenfist/andris/blob/develop/docs/xrdp.md
+# Never give up restarting: the X server may not exist yet, or may be
+# between sessions.
+StartLimitIntervalSec=0
+
+[Service]
+# An empty default, which andris.env overrides, so that an unset
+# ANDRIS_ARGS draws no warning from systemd.
+Environment=ANDRIS_ARGS=
+# Optional. Sets ANDRIS_ARGS (listen address, TLS options) and, if the
+# session's cookie is not in ~/.Xauthority, XAUTHORITY.
+EnvironmentFile=-%h/.config/andris/andris.env
+# A bare name is looked up in systemd's standard binary search path, so
+# this works for /usr/local/bin/andris and /usr/bin/andris alike.
+ExecStart=andris --display :%i --ticket-file %h/.config/andris/ticket $ANDRIS_ARGS
+# Andris exits 1 when the desktop goes away, and 0 when stopped.
+Restart=on-failure
+# Status 2 means the configuration was refused (a bad option, or a
+# ticket file that is missing or not private). Restarting cannot fix
+# that, so stop and leave the reason in the journal.
+RestartPreventExitStatus=2
+# RestartSteps and RestartMaxDelaySec need systemd 254 or newer.
+RestartSec=2s
+RestartSteps=5
+RestartMaxDelaySec=60s
+# Hardening that costs andris nothing: it never gains privileges,
+# changes personality, runs realtime or generates code at run time, and
+# it needs only Unix sockets (X11) and TCP (SPICE).
+NoNewPrivileges=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=default.target

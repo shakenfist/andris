@@ -171,8 +171,8 @@ written with `/next-phase` as each phase comes up.
 | 2. Server-role wire types (ryll) | PLAN-x11-desktop-phase-02-wire-types.md | Complete | ryll `3763158` (#477); andris `a9e79cf` (#5) |
 | 3. Image encoders (ryll) | PLAN-x11-desktop-phase-03-encoders.md | Complete | ryll `cd2fe41` (#487); andris `591e062` (#6) |
 | 4. Server skeleton | PLAN-x11-desktop-phase-04-server-skeleton.md | Complete | andris `1950cdb` (#7) |
-| 5. Damage and flow control | PLAN-x11-desktop-phase-05-damage.md | In progress | |
-| 6. Sharing the xrdp session | Not yet written | Not started | |
+| 5. Damage and flow control | PLAN-x11-desktop-phase-05-damage.md | Complete | andris `68b1058` (#8); andris `43bfe88` (#11) |
+| 6. Sharing the xrdp session | PLAN-x11-desktop-phase-06-sharing.md | In progress | |
 | 7. In-process agent: resize and clipboard | Not yet written | Not started | |
 | 8. Video streams | Not yet written | Not started | |
 | 9. Audio | Not yet written | Not started | |
@@ -369,16 +369,27 @@ working.
 
 ### Phase 6: Sharing the xrdp session
 
-Run andris against `:10` with RDP connected at the same time. This
-covers:
+Detail is in
+[PLAN-x11-desktop-phase-06-sharing.md](PLAN-x11-desktop-phase-06-sharing.md).
+Run andris against an xrdp session with RDP connected at the same
+time:
 
-- a systemd user unit that finds the session's `DISPLAY` and
-  `XAUTHORITY`;
-- behaviour when the X server goes away (exit cleanly, let systemd
-  restart);
-- confirming that RDP and SPICE input interleave sanely.
-
-Document the operator setup in `docs/`.
+- **A containerised xrdp test bed** (`make e2e-xrdp`): a real xrdp,
+  xorgxrdp and FreeRDP client in a container. Interleaving, resizes,
+  reconnects and logout are tested there, never on the operator's
+  live `:10`.
+- **Interleaving checks** for keys, modifiers, lock keys, an RDP
+  resize, an RDP reconnect and a change of layout, with fixes for
+  whatever they find.
+- **Process lifetime.** Andris neither exited when the X server went
+  away nor handled SIGTERM; it served until Ctrl-C. This phase makes
+  it exit non-zero when the desktop goes, and stop cleanly on
+  SIGTERM, so systemd can restart it.
+- **A systemd user unit, `andris@.service`,** keyed by display
+  number, with `XAUTHORITY` from the default. The manager's own
+  `DISPLAY` arrives too late in an xrdp session to rely on.
+- **The operator setup** in `docs/xrdp.md`, and an acceptance run on
+  `:10` with the operator present.
 
 ### Phase 7: In-process agent: resize and clipboard
 
@@ -419,7 +430,7 @@ kHz and honours the client's volume and mute messages.
 
 ### Phase 10: Packaging and dogfood soak
 
-Ship a `.deb` and the systemd user unit, and write the kerbside
+Ship a `.deb` carrying phase 6's systemd user unit, and write the kerbside
 static-source configuration into `docs/`. Automate phase 4's
 kerbside smoke test, either here or as a "custom backend" lane in
 kerbside's own CI. Then the operator uses
@@ -514,6 +525,10 @@ file) and keep its status in step with the Execution table.
   server mode draws the pointer where the desktop has it. Phase 4
   advertises server mode and applies relative motion, but reports no
   position.
+- Running phase 6's xrdp test bed (`make e2e-xrdp`) in CI. Phase 6
+  keeps it local, because it guards xrdp's behaviour rather than
+  andris's, and an RDP client driven through `xdotool` on a shared
+  runner is likely to flake.
 - End-to-end coverage of the X11 pointer and lock-state paths (XTEST
   motion and buttons, XKB indicators) against Xvfb. Phase 4's `make
   e2e` drives only frames and keys, because ryll's control socket has

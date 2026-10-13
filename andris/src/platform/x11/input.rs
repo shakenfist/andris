@@ -15,8 +15,8 @@ use x11rb::protocol::{Event, xkb, xtest};
 use x11rb::rust_connection::RustConnection;
 
 use super::keymap::{self, KeyName, Keymap, Unmapped};
-use super::{Fault, answer, connection_failed, log_lost, stopped};
-use crate::platform::{Button, InputEvent, LockState};
+use super::{Fault, answer, connection_failed, lost, stopped};
+use crate::platform::{Button, GoneSender, InputEvent, LockState};
 
 /// A request to the input thread.
 pub(super) enum InputRequest {
@@ -348,23 +348,23 @@ fn x_button(button: Button) -> u8 {
 
 /// Serve input requests until the queue closes or the connection fails,
 /// flushing after each batch: every request already queued when the
-/// thread wakes.
-pub(super) fn serve_input(mut injector: Injector, requests: InputReceiver) {
+/// thread wakes. Sets `gone` if the connection fails.
+pub(super) fn serve_input(mut injector: Injector, requests: InputReceiver, gone: GoneSender) {
     while let Some(first) = requests.recv() {
         let mut next = Some(first);
         while let Some(request) = next {
-            let gone = match request {
+            let failed = match request {
                 InputRequest::Event(event) => injector.inject(event).err().map(connection_failed),
                 InputRequest::LockState(reply) => answer(reply, injector.lock_state()),
             };
-            if let Some(e) = gone {
-                log_lost("input", "input has stopped", &e);
+            if let Some(e) = failed {
+                lost(&gone, "input", "input has stopped", &e);
                 return;
             }
             next = requests.try_recv();
         }
         if let Err(e) = injector.finish_batch() {
-            log_lost("input", "input has stopped", &e);
+            lost(&gone, "input", "input has stopped", &e);
             return;
         }
     }

@@ -44,6 +44,8 @@
 //! nothing, as a change XDamage missed would, and
 //! [`SyntheticPlatform::report_damage`] reports damage and changes
 //! nothing. A capture renders only the rectangles asked for.
+//! [`SyntheticPlatform::vanish`] makes the desktop go for good, as an X
+//! server that exits does.
 //!
 //! Every change is reported while the state lock is still held, so
 //! damage and resizes reach the hub in the order the changes were made:
@@ -61,8 +63,8 @@ use tokio::sync::watch;
 
 use super::{
     Capture, CursorReceiver, CursorShape, CursorSource, DamageHub, DamageSubscription,
-    DisplayGeometry, EvdevCode, Frame, InputEvent, InputSink, LockState, Patch, Platform,
-    Rectangle, ScreenSource, Size,
+    DisplayGeometry, EvdevCode, Frame, GoneSender, GoneSignal, InputEvent, InputSink, LockState,
+    Patch, Platform, Rectangle, ScreenSource, Size,
 };
 
 /// The side of the moving square, in pixels.
@@ -129,6 +131,10 @@ pub struct SyntheticPlatform {
     events: Mutex<VecDeque<InputEvent>>,
     cursor: watch::Sender<Option<Arc<CursorShape>>>,
     damage: DamageHub,
+    /// Set by [`SyntheticPlatform::vanish`].
+    gone: GoneSender,
+    /// What [`SyntheticPlatform::platform`] hands out.
+    gone_signal: GoneSignal,
 }
 
 /// What a capture draws from: a copy of the parts of [`State`] that
@@ -145,6 +151,7 @@ impl SyntheticPlatform {
     /// refused by [`Size::check`].
     pub fn new(size: Size) -> Result<Arc<Self>> {
         size.check()?;
+        let (gone, gone_signal) = GoneSignal::new();
         Ok(Arc::new(Self {
             state: Mutex::new(State {
                 size,
@@ -157,17 +164,28 @@ impl SyntheticPlatform {
             events: Mutex::new(VecDeque::new()),
             cursor: watch::Sender::new(Some(Arc::new(default_cursor()))),
             damage: DamageHub::new(size),
+            gone,
+            gone_signal,
         }))
     }
 
-    /// This platform as all four seams.
+    /// This platform as all four seams, and its gone signal.
     pub fn platform(self: &Arc<Self>) -> Platform {
         Platform {
             geometry: self.clone(),
             screen: self.clone(),
             input: self.clone(),
             cursor: self.clone(),
+            gone: self.gone_signal.clone(),
         }
+    }
+
+    /// Make the desktop go away for good, because of `why`, as an X
+    /// server that exits does: set the platform's gone signal, and make
+    /// every damage subscription fail with [`Gone`](super::Gone).
+    pub fn vanish(&self, why: &str) -> Result<()> {
+        self.gone.set(why.to_string());
+        self.damage.gone(why.to_string())
     }
 
     /// Move the square right by [`SQUARE_STEP`] pixels, back to the left

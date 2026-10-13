@@ -18,9 +18,14 @@
 # frame of the window arrived, that two keys reached it, that an idle
 # desktop is silent for two seconds once it has settled, and that a small
 # change arrives as few draws. It also checks ryll's log for all four
-# channels, since nothing else uses the cursor channel. Last, ryll and
-# andris are stopped with SIGINT and must exit 0, and andris's log must
-# hold the session-end metrics line.
+# channels, since nothing else uses the cursor channel. Then ryll is
+# stopped with SIGINT and andris with SIGTERM, as systemd stops it; both
+# must exit 0, and andris's log must say SIGTERM stopped it and hold the
+# session-end metrics line.
+#
+# Last, a second andris is started against the same display, and Xvfb is
+# killed under it. That andris must exit 1 within GONE_BOUND seconds,
+# saying in its log that the desktop has gone and why.
 #
 # It fails if any step fails or times out, if any process exits before it
 # is stopped, or if andris logged an ERROR. On failure it prints every log.
@@ -44,6 +49,7 @@ XVFB_BOUND=10
 KEYLOGGER_BOUND=10
 ANDRIS_BOUND=10
 STOP_BOUND=15
+GONE_BOUND=10
 
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d /tmp/e2e.XXXXXX)
@@ -117,6 +123,27 @@ stop() {
     say "$name exited $rc after SIG$signal"
 }
 
+# fails_within NAME BOUND: wait up to BOUND seconds for process NAME to
+# exit by itself, which it must do with status 1, as andris returning an
+# error does. A crash or a signal gives another status.
+fails_within() {
+    local name=$1 bound=$2 pid=${pids[$1]} rc=0
+    local deadline=$((SECONDS + bound))
+    while alive "$pid"; do
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            say "FAIL: $name did not exit within ${bound}s"
+            return 1
+        fi
+        sleep 0.1
+    done
+    wait "$pid" || rc=$?
+    if [ "$rc" -ne 1 ]; then
+        say "FAIL: $name exited $rc, not 1"
+        return 1
+    fi
+    say "$name exited $rc"
+}
+
 cleanup() {
     local name
     for name in "${names[@]}"; do
@@ -140,9 +167,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Background jobs of a non-interactive shell ignore SIGINT, and ryll and
-# andris are stopped with it. Job control puts each in its own process
-# group with default signal dispositions.
+# Background jobs of a non-interactive shell ignore SIGINT, and ryll is
+# stopped with it. Job control puts each in its own process group with
+# default signal dispositions.
 set -m
 
 say "$("$RYLL" --version 2>&1 | head -n1 || true); $("$ANDRIS" --version 2>&1 | head -n1 || true)"
@@ -218,11 +245,11 @@ for name in "${names[@]}"; do
     fi
 done
 
-# 8. Stop everything, clients first.
+# 8. Stop everything but Xvfb, clients first. Andris is stopped as
+# systemd stops a unit, with SIGTERM.
 stop ryll INT
-stop andris INT
+stop andris TERM
 stop keylogger TERM any
-stop xvfb TERM any
 
 # 9. Andris must not have logged an error. Colour is off, but strip any
 # escape codes anyway so the match cannot be split by one.
@@ -237,6 +264,29 @@ if ! sed 's/\x1b\[[0-9;]*m//g' "$work/andris.log" | grep 'session ends after .*k
     exit 1
 fi
 say "andris logged the session-end metrics line"
+
+if ! sed 's/\x1b\[[0-9;]*m//g' "$work/andris.log" | grep 'SIGTERM: shutting down' >/dev/null; then
+    say "FAIL: andris never logged that SIGTERM stopped it"
+    exit 1
+fi
+say "andris logged that SIGTERM stopped it"
+
+# 11. The desktop going away: a second andris on the same display, and
+# Xvfb killed under it.
+start andris-gone env RUST_LOG=info NO_COLOR=1 "$ANDRIS" --platform x11 --display "$X_DISPLAY" \
+    --listen "127.0.0.1:$PORT" --ticket-file "$work/ticket"
+wait_until "$ANDRIS_BOUND" andris-gone "second andris listening on $PORT" \
+    grep -q "plain listener ready" "$work/andris-gone.log"
+killed=$(date +%s%N)
+stop xvfb TERM any
+fails_within andris-gone "$GONE_BOUND"
+say "andris exited $(( ($(date +%s%N) - killed) / 1000000 ))ms after Xvfb was told to stop"
+if ! sed 's/\x1b\[[0-9;]*m//g' "$work/andris-gone.log" \
+    | grep 'the desktop has gone.*lost its connection to the X display' >/dev/null; then
+    say "FAIL: andris did not log that the desktop had gone, and why"
+    exit 1
+fi
+say "andris logged that the desktop had gone, and why"
 
 passed=true
 say "PASS"

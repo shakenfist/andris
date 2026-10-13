@@ -18,9 +18,13 @@
 # against andris, through a .vv file because a password needs one.
 # scripts/e2e-drive.py then asserts over ryll's control socket that a
 # frame of the window arrived, that two keys reached it, that an idle
-# desktop is silent for two seconds once it has settled, and that a small
-# change arrives as few draws. It also checks ryll's log for all four
-# channels, since nothing else uses the cursor channel. Then ryll is
+# desktop is silent for two seconds once it has settled, that a small
+# change arrives as few draws, that clipboard text crosses both ways
+# through andris's agent, small, over one agent chunk and over the INCR
+# threshold, and that a resize from ryll within Xvfb's -screen size is
+# applied while one above it is refused, logged once. This script then
+# checks ryll's log for all four channels, since nothing else uses the
+# cursor channel. Then ryll is
 # stopped with SIGINT and andris with SIGTERM, as systemd stops it; both
 # must exit 0, and andris's log must say SIGTERM stopped it and hold the
 # session-end metrics line.
@@ -214,7 +218,8 @@ start ryll env NO_COLOR=1 "$RYLL" --headless --file "$work/andris.vv" --control-
 # 7. The assertions. The driver bounds its own waits, and gives up early
 # if a process it depends on exits.
 rc=0
-python3 "$here/e2e-drive.py" --socket "$sock" --keylog "$work/keylogger.log" \
+python3 "$here/e2e-drive.py" --socket "$sock" --keylog "$work/keylogger.log" --display "$X_DISPLAY" \
+    --andris-log "$work/andris.log" --ryll-log "$work/ryll.log" \
     --watch "andris=${pids[andris]}" --watch "ryll=${pids[ryll]}" --watch "keylogger=${pids[keylogger]}" \
     >"$work/drive.log" 2>&1 || rc=$?
 cat "$work/drive.log"

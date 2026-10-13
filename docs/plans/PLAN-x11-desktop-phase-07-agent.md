@@ -276,7 +276,7 @@ its conventions in its `AGENTS.md`.
 | 4 | high | opus | none | Complete | The agent protocol on the main channel, the two seams, and the synthetic platform's side. See brief 4. |
 | 5 | high | opus | none | Complete | X11 display control through RandR. See brief 5. |
 | 6 | high | opus | none | Complete | The X11 clipboard thread. See brief 6. |
-| 7 | high | opus | none | In progress | End-to-end checks: `make e2e` and `make e2e-xrdp`. See brief 7. |
+| 7 | high | opus | none | Complete | End-to-end checks: `make e2e` and `make e2e-xrdp`. See brief 7. |
 | 8 | medium | sonnet | none | Complete | Documentation, and the xorgxrdp feature request drafted. See brief 8. |
 | 9 | medium | management | none | Not started | Operator acceptance on `:10`, by hand. See brief 9. |
 | 10 | medium | management | none | Not started | Push audit, pull request, queue. See brief 10. |
@@ -620,6 +620,31 @@ andris's channel reader now reads into a 16 KiB chunk and appends it,
 since `ReceiveBuffer` cannot take tokio's `read_buf`. Behaviour is
 unchanged, and framing many queued messages is now linear rather than
 quadratic. `make lint test e2e e2e-xrdp` passed.
+
+**Step 7: the end-to-end checks**, against a temporary pin to
+ryll#534's head (`1858569`), which must move to its merge commit before
+step 10. ryll's control socket takes one client, so the stand-in for the
+Mac's shared pasteboard is a class inside the drive script, sharing its
+connection. Two consecutive runs of each target gave identical results:
+
+| Check | Result |
+|-------|--------|
+| e2e clipboard | Both ways at 133 B, 6196 B (over one agent chunk) and 1.5 MB (INCR, 2 pieces): 0.1 to 0.3 s each way |
+| e2e resize | 768x576 and back to 1024x768 applied, a new surface in ryll in 0.25 s; 1280x1024 and 1536x1280 refused, one warning, surface unchanged |
+| X8, RDP to SPICE | Two lines copied on FreeRDP's display reach ryll with LF, in 0.25 s |
+| X9, SPICE to RDP | Two lines set in ryll paste on FreeRDP's display in 0.16 to 0.48 s |
+| X10, no loop | A two-line copy each way crosses once, 0.10 s after the copy, then nothing for 5 s. With the echo comparison disabled, 420 crossings in 5 s |
+| X11, resize on xorgxrdp | 1152x720 and 800x600 refused with `BadMatch`, logged once; the surface stays 1280x800; an RDP resize afterwards still reaches ryll |
+
+**Finding: CRLF from RDP.** Text copied over RDP reaches the desktop
+with CRLF, and andris offered it unchanged despite announcing
+`GUEST_LINEEND_LF`, so a multi-line copy crossed twice and came back
+to the Mac rewritten. Fixed in the agent: desktop text is converted to
+LF before it is compared and offered. A paste inside the session can
+still be CRLF while chansrv owns the clipboard; that is xrdp's.
+
+`make e2e` now takes about 24 s warm (from 22), and `make e2e-xrdp`
+about 45 s (from 31 to 37).
 
 **Step 6: the clipboard thread.** A fifth connection, with a timer
 thread to wake it, since x11rb has no wait with a timeout and `poll(2)`

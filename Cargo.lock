@@ -1208,7 +1208,7 @@ dependencies = [
 [[package]]
 name = "shakenfist-spice-compression"
 version = "0.1.7"
-source = "git+https://github.com/shakenfist/ryll?rev=7e3705e90ad07efb0cc4ef9745030157345598de#7e3705e90ad07efb0cc4ef9745030157345598de"
+source = "git+https://github.com/shakenfist/ryll?rev=1858569780db05145bdf849b2fbabd30b6addc07#1858569780db05145bdf849b2fbabd30b6addc07"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -1229,7 +1229,7 @@ dependencies = [
 [[package]]
 name = "shakenfist-spice-protocol"
 version = "0.1.7"
-source = "git+https://github.com/shakenfist/ryll?rev=7e3705e90ad07efb0cc4ef9745030157345598de#7e3705e90ad07efb0cc4ef9745030157345598de"
+source = "git+https://github.com/shakenfist/ryll?rev=1858569780db05145bdf849b2fbabd30b6addc07#1858569780db05145bdf849b2fbabd30b6addc07"
 dependencies = [
  "anyhow",
  "byteorder",

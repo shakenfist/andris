@@ -12,6 +12,8 @@ use clap::{Parser, ValueEnum};
 use tracing::warn;
 
 use crate::platform::Size;
+use crate::server::TlsOptions;
+use crate::server::tls::load_server_config;
 use crate::server::updates::JpegQuality;
 
 /// The longest ticket SPICE allows, in bytes (`SPICE_MAX_PASSWORD_LENGTH`
@@ -106,14 +108,6 @@ pub struct Args {
     pub jpeg_quality: u8,
 }
 
-/// A TLS listener and the certificate it presents.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TlsConfig {
-    pub listen: SocketAddr,
-    pub cert: PathBuf,
-    pub key: PathBuf,
-}
-
 /// The platform to build, with what it needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlatformConfig {
@@ -159,8 +153,9 @@ impl std::fmt::Debug for Ticket {
 pub struct Config {
     /// The plain listener's address.
     pub listen: SocketAddr,
-    /// The TLS listener, if there is one.
-    pub tls: Option<TlsConfig>,
+    /// The TLS listener, with its certificate and key loaded, if there
+    /// is one.
+    pub tls: Option<TlsOptions>,
     pub ticket: Ticket,
     pub platform: PlatformConfig,
     pub frame_interval: Duration,
@@ -169,12 +164,17 @@ pub struct Config {
 }
 
 impl Args {
-    /// Check the options together, read the ticket file, and produce a
-    /// [`Config`]. Each error names the option at fault and says how to
-    /// fix it.
+    /// Check the options together, read the ticket file and any TLS
+    /// certificate and key, and produce a [`Config`]. Each error names
+    /// the option at fault and says how to fix it. Every file andris
+    /// needs is read here, so that a bad one is a refused configuration
+    /// (exit status 2), which a supervisor does not retry.
     pub fn validate(self) -> Result<Config> {
         let tls = match (self.tls_listen, self.tls_cert, self.tls_key) {
-            (Some(listen), Some(cert), Some(key)) => Some(TlsConfig { listen, cert, key }),
+            (Some(listen), Some(cert), Some(key)) => Some(TlsOptions {
+                listen,
+                config: load_server_config(&cert, &key)?,
+            }),
             (None, None, None) => None,
             _ => bail!(
                 "--tls-listen, --tls-cert and --tls-key go together: give all three for a TLS \
@@ -379,6 +379,14 @@ mod tests {
         format!("{:#}", args.validate().unwrap_err())
     }
 
+    /// A self-signed certificate and its key, as PEM files of mode 0600.
+    fn tls_files() -> (NamedTempFile, NamedTempFile) {
+        let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = ticket_file(generated.cert.pem().as_bytes(), 0o600);
+        let key = ticket_file(generated.signing_key.serialize_pem().as_bytes(), 0o600);
+        (cert, key)
+    }
+
     #[test]
     fn defaults() {
         let ticket = ticket_file(b"secret\n", 0o600);
@@ -414,26 +422,23 @@ mod tests {
     #[test]
     fn tls_options_go_together() {
         let ticket = ticket_file(b"secret", 0o600);
+        let (cert, key) = tls_files();
         let config = parse(
             &ticket,
             &[
                 "--tls-listen",
                 "0.0.0.0:5901",
                 "--tls-cert",
-                "/c.pem",
+                cert.path().to_str().unwrap(),
                 "--tls-key",
-                "/k.pem",
+                key.path().to_str().unwrap(),
             ],
         )
         .validate()
         .unwrap();
         assert_eq!(
-            config.tls,
-            Some(TlsConfig {
-                listen: "0.0.0.0:5901".parse().unwrap(),
-                cert: "/c.pem".into(),
-                key: "/k.pem".into(),
-            })
+            config.tls.map(|tls| tls.listen),
+            Some("0.0.0.0:5901".parse().unwrap())
         );
 
         for partial in [
@@ -464,6 +469,7 @@ mod tests {
 
         // With TLS, the plain listener only redirects, so it may bind
         // anywhere.
+        let (cert, key) = tls_files();
         assert!(
             parse(
                 &ticket,
@@ -473,14 +479,55 @@ mod tests {
                     "--tls-listen",
                     "0.0.0.0:5901",
                     "--tls-cert",
-                    "/c.pem",
+                    cert.path().to_str().unwrap(),
                     "--tls-key",
-                    "/k.pem",
+                    key.path().to_str().unwrap(),
                 ],
             )
             .validate()
             .is_ok()
         );
+    }
+
+    #[test]
+    fn tls_certificate_and_key_are_loaded_by_validation() {
+        // So that a bad one is refused before anything starts, rather
+        // than failing while running, which systemd would retry.
+        let ticket = ticket_file(b"secret", 0o600);
+        let (cert, key) = tls_files();
+        let tls = |cert: &str, key: &str| {
+            error(parse(
+                &ticket,
+                &[
+                    "--tls-listen",
+                    "127.0.0.1:5901",
+                    "--tls-cert",
+                    cert,
+                    "--tls-key",
+                    key,
+                ],
+            ))
+        };
+        let cert = cert.path().to_str().unwrap();
+        let key_path = key.path().to_str().unwrap();
+
+        let message = tls("/nonexistent/c.pem", key_path);
+        assert!(
+            message.contains("--tls-cert /nonexistent/c.pem"),
+            "{message}"
+        );
+        let message = tls(cert, "/nonexistent/k.pem");
+        assert!(
+            message.contains("--tls-key /nonexistent/k.pem"),
+            "{message}"
+        );
+        // The certificate is not a key.
+        let message = tls(cert, cert);
+        assert!(message.contains("holds no private key"), "{message}");
+
+        std::fs::set_permissions(key.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+        let message = tls(cert, key_path);
+        assert!(message.contains("chmod 600"), "{message}");
     }
 
     #[test]

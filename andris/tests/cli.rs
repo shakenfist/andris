@@ -107,6 +107,27 @@ fn non_loopback_listener_without_tls_is_refused() {
 }
 
 #[test]
+fn tls_certificate_that_cannot_be_read_is_refused() {
+    // Loaded while validating, so that systemd does not retry it.
+    let ticket = ticket_file(b"a-long-enough-ticket\n");
+    let stderr = refused(
+        &ticket,
+        &[
+            "--tls-listen",
+            "127.0.0.1:0",
+            "--tls-cert",
+            "/nonexistent/cert.pem",
+            "--tls-key",
+            "/nonexistent/key.pem",
+        ],
+    );
+    assert!(
+        stderr.contains("--tls-cert /nonexistent/cert.pem"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn empty_ticket_file_is_refused() {
     let ticket = ticket_file(b"");
     let stderr = refused(&ticket, &[]);

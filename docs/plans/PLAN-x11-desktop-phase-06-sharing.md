@@ -762,10 +762,6 @@ Fixed in the audit's commit:
 - **`SystemCallFilter=@system-service`** from security low 3. A
   syscall filter that has not been tested could break MIT-SHM or the
   memfd. It can be added once the soak shows it is safe.
-- **A TLS certificate or key that fails to load exits 1, not 2.** These
-  load in `run()`, not in validation, so systemd keeps retrying a bad
-  certificate. Moving them into validation is a small follow-up, but
-  it changes nothing for this phase's loopback setup.
 - **Test review advisories:** the remaining timing bounds are generous
   for the one-second grace. The checks run locally (decision 2).
   Signals and the desktop going at the same moment, and the grace
@@ -774,6 +770,35 @@ Fixed in the audit's commit:
 - **Code quality advisories:** the helpers shared by `smoke.py` and
   `e2e-xrdp-drive.py`, the long script headers, and type hints in the
   test scripts. None of the existing test scripts has type hints.
+
+### Review round 1
+
+The automated review of andris#12 raised no `fix` items: one
+`document`, four `consider` and one informational. Taken:
+
+- **A TLS certificate or key that fails to load exits 2.** The push
+  audit declined this as a follow-up (it loaded in `run()`, so systemd
+  retried a bad certificate for ever). It is now loaded in
+  `Args::validate`, which every file andris reads now goes through.
+  `Config.tls` holds the loaded `TlsOptions`. `tests/cli.rs` checks a
+  certificate that cannot be read exits 2.
+- **A unit test of `lost()`**, which every X11 backend thread uses. It
+  checks the reason's wording, which `scripts/e2e.sh` greps for, and
+  that the first reason is kept. Each thread's call to it is still
+  exercised end to end only for the damage thread, which always
+  notices first.
+- **A missing ticket stops the unit for good.** `docs/xrdp.md` says to
+  make the ticket and any TLS files before enabling the instance, and
+  how to start it again. No `ConditionPathExists`: a failed condition
+  does not retry either, and andris's own error names the file.
+- **The desktop-gone reason was printed twice.** The logged line no
+  longer carries it; the returned error, which main prints, does.
+  `tests/lifetime.rs` requires the error to name the reason, so that
+  is the one kept.
+
+The `document` item, flipping the status tables to Complete with the
+merge commit, is the next phase's close-out commit. The informational
+item is security informational 5, declined above.
 
 ## Back brief
 

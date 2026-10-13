@@ -588,6 +588,23 @@ mod tests {
     }
 
     #[test]
+    fn lost_sets_the_gone_signal_with_the_first_reason() {
+        let (gone, signal) = GoneSignal::new();
+        let why = lost(&gone, "capture", "capture stops", &"broken pipe");
+        // scripts/e2e.sh looks for this wording in andris's log.
+        assert_eq!(
+            why,
+            "the X11 capture thread lost its connection to the X display: broken pipe"
+        );
+        assert_eq!(signal.why().as_deref(), Some(why.as_str()));
+
+        // A second thread losing its connection does not replace it.
+        let later = lost(&gone, "input", "input stops", &"connection reset");
+        assert!(later.contains("X11 input thread"), "{later}");
+        assert_eq!(signal.why().as_deref(), Some(why.as_str()));
+    }
+
+    #[test]
     fn only_the_cookie_wakes_a_thread() {
         let window = 0x0040_0001;
         assert!(is_wake(&ClientMessageEvent::new(

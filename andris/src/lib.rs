@@ -28,9 +28,7 @@ use config::{Config, PlatformConfig};
 use platform::synthetic::SyntheticPlatform;
 use platform::x11::X11Platform;
 use platform::{GoneSignal, Platform};
-use server::{
-    DisplayOptions, HandshakeTimeouts, STOP_GRACE, Server, ServerHandle, ServerOptions, TlsOptions,
-};
+use server::{DisplayOptions, HandshakeTimeouts, STOP_GRACE, Server, ServerHandle, ServerOptions};
 
 /// How long andris waits for connections to close once the desktop has
 /// gone. There is no desktop left to take released keys, so this only
@@ -68,16 +66,9 @@ pub fn run(config: Config) -> Result<()> {
 async fn serve(config: Config, platform: Platform) -> Result<()> {
     let size = platform.geometry.size()?;
     info!("the desktop is {size}");
-    let tls = match &config.tls {
-        Some(tls) => Some(TlsOptions {
-            listen: tls.listen,
-            config: server::tls::load_server_config(&tls.cert, &tls.key)?,
-        }),
-        None => None,
-    };
     let options = ServerOptions {
         listen: config.listen,
-        tls,
+        tls: config.tls,
         ticket: config.ticket,
         display: DisplayOptions {
             frame_interval: config.frame_interval,
@@ -124,7 +115,7 @@ impl Signals {
 /// that and stops the server, waiting up to [`STOP_GRACE`] for the input
 /// that connected clients held to be released, and returns `Ok`.
 ///
-/// When the desktop goes, it logs why and stops the server, waiting only
+/// When the desktop goes, it logs that and stops the server, waiting only
 /// [`GONE_GRACE`]: nothing held can be released into a desktop that has
 /// gone, but each client still sees its connection close. It then fails,
 /// naming why, so that the process exits with an error.
@@ -151,7 +142,8 @@ pub async fn serve_until(
         }
         why = gone.wait() => why,
     };
-    error!("the desktop has gone, so andris is stopping: {why}");
+    // Not why: the error returned below says it, and main prints that.
+    error!("the desktop has gone, so andris is stopping");
     if !handle.stop(GONE_GRACE).await {
         warn!(
             "connections were still closing after {}s; stopping anyway",

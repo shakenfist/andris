@@ -76,6 +76,12 @@ server's cookie is not in `~/.Xauthority`. xrdp's Xorg uses
 unset, so a stock xrdp setup needs no `XAUTHORITY` at all. Leave the
 file out altogether if you need neither.
 
+Make the ticket file, and any TLS certificate and key, before enabling
+the instance. Andris reads them all at startup, and a missing or
+unreadable one is a refused configuration: the instance stops and stays
+stopped (see the exit statuses below) until you fix it and start it
+again with `systemctl --user start andris@10`.
+
 ## Starting it
 
 First find the display number of the xrdp session. The Xorg process
@@ -151,8 +157,8 @@ user.
 
 **Logging out.** When the xrdp session ends, its X server goes away.
 Andris notices, closes the SPICE client's connection, logs
-`the desktop has gone, so andris is stopping` with the reason, and
-exits with status 1. What happens next depends on whether the user's
+`the desktop has gone, so andris is stopping`, and exits with status 1
+and an error naming the reason. What happens next depends on whether the user's
 systemd manager outlives the session:
 
 - **Usually it does not.** Unless lingering is enabled for the user

@@ -104,7 +104,7 @@ pub const STOP_GRACE: Duration = Duration::from_secs(5);
 type TaskMarker = mpsc::Sender<()>;
 
 /// The TLS listener.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TlsOptions {
     pub listen: SocketAddr,
     pub config: Arc<ServerConfig>,

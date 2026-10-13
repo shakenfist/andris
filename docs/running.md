@@ -69,8 +69,8 @@ So andris exits with one of three statuses:
 | Status | Meaning |
 |--------|---------|
 | 0 | Stopped by SIGINT or SIGTERM |
-| 1 | The desktop went away, or another failure after the options were accepted, such as an X server that cannot be reached, a TLS certificate or key that cannot be loaded, or a listener that cannot bind |
-| 2 | The options were refused (a bad combination, or a ticket file that is unreadable, not private, empty or too long), and nothing was started |
+| 1 | The desktop went away, or another failure after the options were accepted, such as an X server that cannot be reached or a listener that cannot bind |
+| 2 | The options were refused (a bad combination, a ticket file that is unreadable, not private, empty or too long, or a TLS certificate or key that cannot be loaded), and nothing was started |
 
 Status 2 means a person has to change something before andris can
 start; the systemd unit in [xrdp.md](xrdp.md) does not restart after

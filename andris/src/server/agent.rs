@@ -646,7 +646,13 @@ impl Agent {
             Ok(text) => Arc::from(text),
             Err(error) => Arc::from(String::from_utf8_lossy(error.as_bytes())),
         };
-        if self.last_crossed.as_deref() == Some(&*text) {
+        // The client converts its text to the desktop's LF line ends, as
+        // GUEST_LINEEND_LF asks, so the text goes on the desktop as it
+        // came. But it is compared, and remembered, with LF line ends, as
+        // the desktop's text is: a client that sent CRLF anyway would
+        // otherwise not recognise its own text coming back, normalised.
+        let crossing = lf_line_ends(text.clone());
+        if self.last_crossed.as_deref() == Some(&*crossing) {
             debug!(
                 session = self.session,
                 bytes = text.len(),
@@ -659,7 +665,7 @@ impl Agent {
             bytes = text.len(),
             "putting the client's clipboard text on the desktop"
         );
-        self.last_crossed = Some(text.clone());
+        self.last_crossed = Some(crossing);
         if let Err(error) = self.clipboard.set(text) {
             warn!(
                 session = self.session,
@@ -669,8 +675,9 @@ impl Agent {
         }
     }
 
-    /// Offer the client the desktop's clipboard `text`, unless it is the
-    /// text that last crossed. `None` withdraws an offer standing.
+    /// Offer the client the desktop's clipboard `text`, with LF line
+    /// ends, unless it is the text that last crossed. `None` withdraws an
+    /// offer standing.
     fn offer(&mut self, text: Option<Arc<str>>) -> Result<()> {
         let Some(has_selection) = self.has_selection() else {
             // Offered once the client announces its capabilities.
@@ -685,6 +692,11 @@ impl Agent {
             }
             return Ok(());
         };
+        // Before the echo comparison, so that text that crossed and came
+        // back with CRLF line ends, as text through RDP does, is the
+        // same text; and before it is offered, since GUEST_LINEEND_LF
+        // promises the client LF.
+        let text = lf_line_ends(text);
         if text.len() > MAX_CLIPBOARD_TEXT {
             warn!(
                 session = self.session,
@@ -726,6 +738,23 @@ impl Agent {
         self.last_crossed = Some(text.clone());
         self.offered = Some(text);
         Ok(())
+    }
+}
+
+/// `text` with each CRLF made LF.
+///
+/// Andris announces `GUEST_LINEEND_LF`, which tells the client that the
+/// desktop's text ends its lines in LF, and the client converts to and
+/// from its own line ends on that understanding. The desktop's text need
+/// not keep that promise: RDP carries text with CRLF line ends, and
+/// xrdp's clipboard bridge puts it on the desktop as it came. Only CRLF
+/// is converted. A lone CR is not a line end on any platform a client
+/// runs on today, so one in the text is meant, and is left alone.
+fn lf_line_ends(text: Arc<str>) -> Arc<str> {
+    if text.contains("\r\n") {
+        Arc::from(text.replace("\r\n", "\n"))
+    } else {
+        text
     }
 }
 
@@ -863,6 +892,19 @@ mod tests {
             requested_size(&config(&[(100_000, 1)])).is_err(),
             "too wide"
         );
+    }
+
+    #[test]
+    fn only_crlf_becomes_lf() {
+        for (from, to) in [
+            ("one line", "one line"),
+            ("a\r\nb\r\n", "a\nb\n"),
+            ("a\nb", "a\nb"),
+            ("a\rb\r", "a\rb\r"),
+            ("a\r\r\nb\n\r", "a\r\nb\n\r"),
+        ] {
+            assert_eq!(&*lf_line_ends(Arc::from(from)), to, "{from:?}");
+        }
     }
 
     #[test]

@@ -680,6 +680,84 @@ async fn an_echo_is_dropped_both_ways() {
     agent.expect(VD_AGENT_CLIPBOARD_GRAB).await;
 }
 
+/// GUEST_LINEEND_LF promises the client LF line ends, and text through
+/// RDP reaches the desktop with CRLF.
+#[tokio::test]
+async fn desktop_text_is_offered_with_lf_line_ends() {
+    let server = TestServer::start().await;
+    let mut agent = AgentClient::ready(&server).await;
+    server
+        .platform
+        .copy_text(Some("first line\r\nsecond line\r\nlone \r stays\n"));
+    agent.expect(VD_AGENT_CLIPBOARD_GRAB).await;
+    let request = ClipboardRequest {
+        selection: VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD,
+        clipboard_type: VD_AGENT_CLIPBOARD_UTF8_TEXT,
+    };
+    agent
+        .send_agent(VD_AGENT_CLIPBOARD_REQUEST, &clip(&request))
+        .await;
+    let data = Clipboard::decode_with(&agent.expect(VD_AGENT_CLIPBOARD).await, true).unwrap();
+    assert_eq!(data.data, b"first line\nsecond line\nlone \r stays\n");
+}
+
+/// Text that crossed and comes back differing only in CRLF line ends is
+/// still an echo, whichever side added them.
+#[tokio::test]
+async fn an_echo_with_crlf_line_ends_is_dropped() {
+    let server = TestServer::start().await;
+    let mut agent = AgentClient::ready(&server).await;
+    let grab = ClipboardGrab {
+        selection: VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD,
+        types: vec![VD_AGENT_CLIPBOARD_UTF8_TEXT],
+    };
+    let platform = server.platform.clone();
+    for (n, (sent, back)) in [
+        // The client's LF text comes back through RDP with CRLF.
+        ("one\ntwo\n", "one\r\ntwo\r\n"),
+        // A client that sends CRLF anyway sees it back as LF.
+        ("three\r\nfour", "three\r\nfour"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        agent
+            .send_agent(VD_AGENT_CLIPBOARD_GRAB, &clip(&grab))
+            .await;
+        agent.expect(VD_AGENT_CLIPBOARD_REQUEST).await;
+        let data = Clipboard {
+            selection: VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD,
+            clipboard_type: VD_AGENT_CLIPBOARD_UTF8_TEXT,
+            data: sent.into(),
+        };
+        agent.send_agent(VD_AGENT_CLIPBOARD, &clip(&data)).await;
+        wait_until("the text reaches the desktop", || {
+            platform.clipboard_sets().unwrap() == n as u64 + 1
+        })
+        .await;
+        assert_eq!(platform.clipboard_set().unwrap().as_deref(), Some(sent));
+        server.platform.copy_text(Some(back));
+        agent.expect_quiet().await;
+    }
+
+    // Desktop text with CRLF, then the client's LF copy of it back: not
+    // set on the desktop again.
+    server.platform.copy_text(Some("five\r\nsix\r\n"));
+    agent.expect(VD_AGENT_CLIPBOARD_GRAB).await;
+    agent
+        .send_agent(VD_AGENT_CLIPBOARD_GRAB, &clip(&grab))
+        .await;
+    agent.expect(VD_AGENT_CLIPBOARD_REQUEST).await;
+    let data = Clipboard {
+        selection: VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD,
+        clipboard_type: VD_AGENT_CLIPBOARD_UTF8_TEXT,
+        data: "five\nsix\n".into(),
+    };
+    agent.send_agent(VD_AGENT_CLIPBOARD, &clip(&data)).await;
+    agent.sync(&server).await;
+    assert_eq!(platform.clipboard_sets().unwrap(), 2);
+}
+
 #[tokio::test]
 async fn other_selections_and_types_get_an_empty_clipboard() {
     let server = TestServer::start().await;

@@ -1,7 +1,7 @@
 //! The X11 backend against a real X server: damage from a drawing, the
 //! drawing captured through MIT-SHM and through `GetImage`, capture
-//! carrying on after another client detaches andris's MIT-SHM segment, and
-//! resizes through RandR.
+//! carrying on after another client detaches andris's MIT-SHM segment,
+//! resizes through RandR, and the clipboard both ways.
 //!
 //! The X server is named by `ANDRIS_TEST_DISPLAY`. `make e2e` sets it to
 //! its Xvfb, before any window is mapped; with it unset, as under
@@ -14,23 +14,32 @@
 //! The resize test needs an X server that resizes up to its starting size
 //! and no further, as Xvfb does: its `-screen` size is the largest RandR
 //! allows. It leaves the display at that size.
+//!
+//! The clipboard tests copy and paste with `xclip`, which must be on the
+//! `PATH`, and leave `CLIPBOARD` with no owner. One waits out andris's
+//! 10-second conversion timeout.
 
 // Test helpers, where a failed unwrap is a failed test. clippy's
 // allow-unwrap-in-tests covers only #[test] functions themselves.
 #![allow(clippy::unwrap_used)]
 
 use std::io::Write as _;
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use andris::platform::x11::{CaptureMethod, X11Options, X11Platform};
 use andris::platform::{
-    Capture, DamageSubscription, DisplayControl, DisplayGeometry, Frame, Rectangle, Region, Resize,
-    ScreenSource, Size, TILE, is_gone,
+    Capture, Clipboard, ClipboardReceiver, DamageSubscription, DisplayControl, DisplayGeometry,
+    Frame, Rectangle, Region, Resize, ScreenSource, Size, TILE, is_gone,
 };
 use x11rb::connection::Connection;
+use x11rb::protocol::Event;
 use x11rb::protocol::randr::ConnectionExt as _;
-use x11rb::protocol::xproto::{self, ConnectionExt as _, CreateGCAux, SubwindowMode, Window};
+use x11rb::protocol::xproto::{
+    self, AtomEnum, ConnectionExt as _, CreateGCAux, CreateWindowAux, SubwindowMode, Window,
+    WindowClass,
+};
 use x11rb::protocol::{res, shm as xshm};
 use x11rb::rust_connection::RustConnection;
 
@@ -532,4 +541,355 @@ async fn randr_resizes_up_to_the_start_size_and_cleans_up_its_modes() {
     assert_eq!(platform.size().unwrap(), start);
     assert_eq!(andris_modes(&other, root), (vec![], vec![]));
     eprintln!("RandR resized X display {display} within its size range, and refused beyond it");
+}
+
+/// How long the clipboard may take to report a copy, or to serve a paste.
+const CLIPBOARD_BOUND: Duration = Duration::from_secs(5);
+
+/// How long andris gives an owner to answer a conversion.
+const CONVERSION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A program that copied text to `CLIPBOARD` with `xclip`, offering it
+/// as `target` if given and as `UTF8_STRING` if not. It serves the text
+/// until another program takes the selection, or it is dropped.
+struct Copier(Child);
+
+impl Copier {
+    fn new(display: &str, target: Option<&str>, bytes: &[u8]) -> Self {
+        let mut command = Command::new("xclip");
+        // -quiet keeps xclip in the foreground, where it can be killed.
+        command.args([
+            "-display",
+            display,
+            "-selection",
+            "clipboard",
+            "-i",
+            "-quiet",
+        ]);
+        if let Some(target) = target {
+            command.args(["-t", target]);
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        // Dropping stdin closes it, and xclip then takes the selection.
+        child.stdin.take().unwrap().write_all(bytes).unwrap();
+        Self(child)
+    }
+}
+
+impl Drop for Copier {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Paste `CLIPBOARD` from `display` as `target` with `xclip`, or `None`
+/// if the owner refuses, or there is none.
+fn paste(display: &str, target: &str) -> Option<Vec<u8>> {
+    let output = Command::new("timeout")
+        .args(["5", "xclip", "-display", display, "-selection", "clipboard"])
+        .args(["-o", "-t", target])
+        .stderr(Stdio::null())
+        .output()
+        .unwrap();
+    output.status.success().then_some(output.stdout)
+}
+
+/// Paste until `CLIPBOARD`, as `UTF8_STRING`, is `text`, which text andris
+/// was just given takes a moment to become. Panics after
+/// [`CLIPBOARD_BOUND`].
+fn pasted_eventually(display: &str, text: &str) {
+    let start = Instant::now();
+    loop {
+        let pasted = paste(display, "UTF8_STRING");
+        if pasted.as_deref() == Some(text.as_bytes()) {
+            return;
+        }
+        assert!(
+            start.elapsed() < CLIPBOARD_BOUND,
+            "pasting {} bytes: got {:?} bytes",
+            text.len(),
+            pasted.map(|bytes| bytes.len())
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The target names `CLIPBOARD`'s owner offers, sorted.
+fn targets(display: &str) -> Vec<String> {
+    let mut names: Vec<String> = String::from_utf8(paste(display, "TARGETS").unwrap())
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    names.sort();
+    names
+}
+
+/// The next text the clipboard reports. Panics after [`CLIPBOARD_BOUND`].
+async fn reported(changes: &mut ClipboardReceiver) -> Option<Arc<str>> {
+    tokio::time::timeout(CLIPBOARD_BOUND, changes.changed())
+        .await
+        .expect("no clipboard change within the bound")
+        .unwrap();
+    changes.borrow_and_update().clone()
+}
+
+/// Text of about `bytes` bytes, many characters of them two bytes long,
+/// and different on every line.
+fn big_text(bytes: usize) -> String {
+    let mut text = String::with_capacity(bytes + 64);
+    let mut line = 0;
+    while text.len() < bytes {
+        text.push_str(&format!("line {line}: ünïcödé ‘text’ — {}\n", line * 7));
+        line += 1;
+    }
+    text
+}
+
+/// A connection, a window on it, and an atom, for a test client.
+fn client(display: &str, atom: &str) -> (x11rb::rust_connection::RustConnection, Window, u32) {
+    let (conn, screen) = x11rb::connect(Some(display)).unwrap();
+    let root = conn.setup().roots[screen].root;
+    let window = conn.generate_id().unwrap();
+    conn.create_window(
+        x11rb::COPY_DEPTH_FROM_PARENT,
+        window,
+        root,
+        0,
+        0,
+        1,
+        1,
+        0,
+        WindowClass::INPUT_ONLY,
+        x11rb::COPY_FROM_PARENT,
+        &CreateWindowAux::new(),
+    )
+    .unwrap();
+    let atom = conn
+        .intern_atom(false, atom.as_bytes())
+        .unwrap()
+        .reply()
+        .unwrap()
+        .atom;
+    (conn, window, atom)
+}
+
+/// Take `CLIPBOARD` from a client that never reads its events, so never
+/// answers a request for the text. It owns the selection until dropped.
+fn squat(display: &str) -> x11rb::rust_connection::RustConnection {
+    let (conn, window, clipboard) = client(display, "CLIPBOARD");
+    conn.set_selection_owner(window, clipboard, x11rb::CURRENT_TIME)
+        .unwrap();
+    let owner = conn
+        .get_selection_owner(clipboard)
+        .unwrap()
+        .reply()
+        .unwrap()
+        .owner;
+    assert_eq!(owner, window);
+    conn
+}
+
+/// Ask for `CLIPBOARD` as `UTF8_STRING` from a client that never takes
+/// more than the first answer, and return that answer's type's name with
+/// the client, which leaves an INCR transfer stalled while it lives.
+fn stall_a_transfer(display: &str) -> (x11rb::rust_connection::RustConnection, String) {
+    let (conn, window, clipboard) = client(display, "CLIPBOARD");
+    let utf8 = conn
+        .intern_atom(false, b"UTF8_STRING")
+        .unwrap()
+        .reply()
+        .unwrap()
+        .atom;
+    let property = conn
+        .intern_atom(false, b"STALLED")
+        .unwrap()
+        .reply()
+        .unwrap()
+        .atom;
+    conn.convert_selection(window, clipboard, utf8, property, x11rb::CURRENT_TIME)
+        .unwrap();
+    conn.flush().unwrap();
+    let start = Instant::now();
+    loop {
+        if let Some(Event::SelectionNotify(event)) = conn.poll_for_event().unwrap() {
+            assert_eq!(event.property, property, "the conversion was refused");
+            break;
+        }
+        assert!(
+            start.elapsed() < CLIPBOARD_BOUND,
+            "no answer to a conversion"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let answer = conn
+        .get_property(false, window, property, AtomEnum::ANY, 0, 1)
+        .unwrap()
+        .reply()
+        .unwrap();
+    let name = conn
+        .get_atom_name(answer.type_)
+        .unwrap()
+        .reply()
+        .unwrap()
+        .name;
+    (conn, String::from_utf8(name).unwrap())
+}
+
+#[tokio::test]
+async fn copies_on_the_display_are_reported() {
+    let Some(display) = display() else {
+        return;
+    };
+    let _turn = DISPLAY_TURN.lock().await;
+    let platform = X11Platform::connect(&display).unwrap();
+    let mut changes = platform.changes();
+
+    let _first = Copier::new(&display, None, b"first copy");
+    assert_eq!(reported(&mut changes).await.as_deref(), Some("first copy"));
+    let _again = Copier::new(&display, None, b"first copy");
+    assert_eq!(
+        reported(&mut changes).await.as_deref(),
+        Some("first copy"),
+        "a copy of the same text is reported again"
+    );
+
+    let wide = "héllo wörld — 世界 🎉";
+    let _wide = Copier::new(&display, None, wide.as_bytes());
+    assert_eq!(reported(&mut changes).await.as_deref(), Some(wide));
+
+    // xclip sends anything over a megabyte by INCR.
+    let big = big_text(3 * 1024 * 1024);
+    let _big = Copier::new(&display, None, big.as_bytes());
+    let got = reported(&mut changes).await.unwrap();
+    assert_eq!(got.len(), big.len());
+    assert!(*got == *big, "the INCR transfer's text differs");
+
+    // An owner offering only Latin-1.
+    let latin1 = Copier::new(&display, Some("STRING"), b"caf\xe9 cr\xe8me");
+    assert_eq!(reported(&mut changes).await.as_deref(), Some("café crème"));
+
+    // The owner goes, and the clipboard is empty.
+    drop(latin1);
+    assert_eq!(reported(&mut changes).await, None);
+    eprintln!("copies on X display {display}, large and Latin-1 among them, reached andris");
+}
+
+#[tokio::test]
+async fn text_set_through_the_seam_is_pasted() {
+    let Some(display) = display() else {
+        return;
+    };
+    let _turn = DISPLAY_TURN.lock().await;
+    let platform = X11Platform::connect(&display).unwrap();
+    let changes = platform.changes();
+
+    platform.set(Arc::from("café")).unwrap();
+    pasted_eventually(&display, "café");
+    assert_eq!(paste(&display, "STRING").unwrap(), b"caf\xe9");
+    assert_eq!(
+        paste(&display, "text/plain;charset=utf-8").unwrap(),
+        "café".as_bytes()
+    );
+    assert_eq!(
+        targets(&display),
+        [
+            "STRING",
+            "TARGETS",
+            "TIMESTAMP",
+            "UTF8_STRING",
+            "text/plain;charset=utf-8"
+        ]
+    );
+    assert_eq!(paste(&display, "MULTIPLE"), None);
+    assert_eq!(paste(&display, "image/png"), None);
+
+    // Text Latin-1 cannot carry is not offered as STRING.
+    let wide = "世界 🎉 — wide";
+    platform.set(Arc::from(wide)).unwrap();
+    pasted_eventually(&display, wide);
+    assert!(!targets(&display).contains(&"STRING".to_string()));
+    assert_eq!(paste(&display, "STRING"), None);
+
+    // Over a megabyte goes by INCR, and a requestor that stops taking
+    // pieces does not hold up the next paste.
+    let big = big_text(3 * 1024 * 1024);
+    platform.set(Arc::from(big.as_str())).unwrap();
+    pasted_eventually(&display, &big);
+    let (_stalled, kind) = stall_a_transfer(&display);
+    assert_eq!(kind, "INCR");
+    assert!(paste(&display, "UTF8_STRING").unwrap() == big.as_bytes());
+
+    assert!(
+        !changes.has_changed().unwrap(),
+        "text andris sets is not reported back"
+    );
+    eprintln!("text set through andris pasted on X display {display}, large and wide among it");
+}
+
+#[tokio::test]
+async fn another_owner_takes_the_clipboard_from_andris() {
+    let Some(display) = display() else {
+        return;
+    };
+    let _turn = DISPLAY_TURN.lock().await;
+    let platform = X11Platform::connect(&display).unwrap();
+    let mut changes = platform.changes();
+
+    platform.set(Arc::from("andris's text")).unwrap();
+    pasted_eventually(&display, "andris's text");
+    let theirs = Copier::new(&display, None, b"their text");
+    assert_eq!(reported(&mut changes).await.as_deref(), Some("their text"));
+    assert_eq!(paste(&display, "UTF8_STRING").unwrap(), b"their text");
+
+    // Once they go, nobody serves the clipboard: andris stopped.
+    drop(theirs);
+    assert_eq!(reported(&mut changes).await, None);
+    assert_eq!(paste(&display, "UTF8_STRING"), None);
+    eprintln!("andris gave X display {display}'s clipboard up to another program");
+}
+
+#[tokio::test]
+async fn an_owner_that_never_answers_times_out_and_stalls_nothing() {
+    let Some(display) = display() else {
+        return;
+    };
+    let _turn = DISPLAY_TURN.lock().await;
+    let platform = X11Platform::connect(&display).unwrap();
+    let mut changes = platform.changes();
+    let copier = Copier::new(&display, None, b"before");
+    assert_eq!(reported(&mut changes).await.as_deref(), Some("before"));
+
+    // While andris waits for the squatter's text, it still takes text to
+    // set, and serves it.
+    let first = squat(&display);
+    drop(copier);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let start = Instant::now();
+    platform.set(Arc::from("meanwhile")).unwrap();
+    pasted_eventually(&display, "meanwhile");
+    assert!(start.elapsed() < CLIPBOARD_BOUND);
+    assert!(!changes.has_changed().unwrap());
+
+    // Once andris has given up on a squatter's text, the earlier text is
+    // gone: nothing is offered.
+    let second = squat(&display);
+    let asked = Instant::now();
+    tokio::time::timeout(CONVERSION_TIMEOUT + CLIPBOARD_BOUND, changes.changed())
+        .await
+        .expect("the conversion did not time out")
+        .unwrap();
+    let waited = asked.elapsed();
+    assert!(
+        waited >= CONVERSION_TIMEOUT - Duration::from_millis(500),
+        "gave up after {waited:?}"
+    );
+    assert_eq!(*changes.borrow_and_update(), None);
+    drop((first, second));
+    eprintln!("andris gave up on an owner that never answered after {waited:?}");
 }

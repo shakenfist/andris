@@ -19,6 +19,9 @@ RUN apt-get update && apt-get install -y \
 #   - x11-utils: xdpyinfo, which scripts/e2e.sh polls until Xvfb answers
 #   - python3-xlib: scripts/e2e-keylogger.py's window (pulls in python3,
 #     which scripts/e2e-drive.py also runs on)
+#   - xclip: copies to and pastes from the X clipboard, for the clipboard
+#     tests in andris/tests/x11.rs
+#   - x11-xserver-utils: xrandr, to look at and change the screen size
 # Ryll's slim headless build (`make ryll-headless`) needs nothing beyond
 # the build tools above: cmake already serves aws-lc-sys, and its opus
 # and openh264 crates build from bundled source.
@@ -27,6 +30,8 @@ RUN apt-get update && apt-get install -y \
     xauth \
     x11-utils \
     python3-xlib \
+    xclip \
+    x11-xserver-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Create a shared build directory that any user can use

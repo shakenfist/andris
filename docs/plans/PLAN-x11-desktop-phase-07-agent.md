@@ -275,7 +275,7 @@ its conventions in its `AGENTS.md`.
 | 3 | medium | sonnet | none | Complete | Andris: bump the ryll pin to step 2's merge. See brief 3. |
 | 4 | high | opus | none | Complete | The agent protocol on the main channel, the two seams, and the synthetic platform's side. See brief 4. |
 | 5 | high | opus | none | Complete | X11 display control through RandR. See brief 5. |
-| 6 | high | opus | none | In progress | The X11 clipboard thread. See brief 6. |
+| 6 | high | opus | none | Complete | The X11 clipboard thread. See brief 6. |
 | 7 | high | opus | none | Not started | End-to-end checks: `make e2e` and `make e2e-xrdp`. See brief 7. |
 | 8 | medium | sonnet | none | Not started | Documentation, and the xorgxrdp feature request drafted. See brief 8. |
 | 9 | medium | management | none | Not started | Operator acceptance on `:10`, by hand. See brief 9. |
@@ -620,6 +620,17 @@ andris's channel reader now reads into a 16 KiB chunk and appends it,
 since `ReceiveBuffer` cannot take tokio's `read_buf`. Behaviour is
 unchanged, and framing many queued messages is now linear rather than
 quadratic. `make lint test e2e e2e-xrdp` passed.
+
+**Step 6: the clipboard thread.** A fifth connection, with a timer
+thread to wake it, since x11rb has no wait with a timeout and `poll(2)`
+would need `unsafe`. A conversion that times out publishes no text: the
+owner has changed, so the old text is known to be gone, and keeping it
+would let the client be offered stale text. Text above 1 MiB is served
+by INCR, not only above the extended maximum request size: with
+BIG-REQUESTS that is about 16 MiB, the clipboard cap, so INCR would
+otherwise almost never run or be tested. Four rotating property slots
+keep a late answer from an abandoned owner from landing on the current
+fetch. Both images gained `xclip` and `x11-xserver-utils`.
 
 **Step 5: RandR.** A request outside the server's size range is
 clamped: if the desktop then changes, the answer is `Applied`, and the

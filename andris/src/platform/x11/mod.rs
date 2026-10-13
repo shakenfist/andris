@@ -1,9 +1,9 @@
 //! The X11 backend: captures an existing X display, injects input into
-//! it, and follows its cursor, through x11rb.
+//! it, and follows its cursor and clipboard, through x11rb.
 //!
 //! # Threads
 //!
-//! x11rb's `RustConnection` is synchronous, so the backend opens four
+//! x11rb's `RustConnection` is synchronous, so the backend opens five
 //! connections to the display, each owned by its own thread:
 //!
 //! - **capture** answers size and capture requests with `GetGeometry` on
@@ -22,13 +22,20 @@
 //!   object on the root window, and on the root window's
 //!   `ConfigureNotify`, and reports them to the platform's
 //!   [`DamageHub`]: damage as damage, a new size as a resize (see
-//!   [`damage`]).
+//!   [`damage`]);
+//! - **clipboard** follows the `CLIPBOARD` selection's owner with XFixes,
+//!   fetches each new owner's text and publishes it through a `watch`
+//!   channel, and takes the selection to serve the text andris is given.
+//!   It blocks on events and keeps a deadline on every transfer, so a
+//!   program that never answers cannot stall it; a small timer thread
+//!   wakes it when a deadline passes (see [`clipboard`]).
 //!
 //! Separate connections keep a key press from queueing behind a
-//! multi-megabyte capture, and let the cursor and damage threads block
-//! on events while the capture thread serves round trips. The threads talk to the rest of andris
-//! through `std::sync::mpsc` queues, so [`InputSink::inject`] only
-//! enqueues and never blocks.
+//! multi-megabyte capture, and let the cursor, damage and clipboard
+//! threads block on events while the capture thread serves round trips.
+//! The threads talk to the rest of andris through `std::sync::mpsc`
+//! queues, so [`InputSink::inject`] only enqueues and never blocks, as
+//! [`Clipboard::set`] does.
 //!
 //! The input queue is bounded, so a client flooding keys cannot grow it
 //! without limit: [`InputSink::inject`] fails once [`INPUT_QUEUE_LIMIT`]
@@ -49,12 +56,13 @@
 //!
 //! Dropping the platform closes the capture and input queues, and those
 //! threads exit; the capture thread detaches its MIT-SHM segment as it
-//! goes. The cursor and damage threads are blocked waiting for X events,
-//! so the drop also sends each a `ClientMessage` to an unmapped window
-//! of its own, which wakes it to exit. Any client of the display can find
-//! those windows with `QueryTree` and send them a `ClientMessage` too, so
-//! the drop's carries a random cookie, chosen once per process, and a
-//! thread stops only for a message that carries it (see [`is_wake`]).
+//! goes. The cursor, damage and clipboard threads are blocked waiting for
+//! X events, so the drop also sends each a `ClientMessage` to an unmapped
+//! window of its own, which wakes it to exit; the clipboard's timer
+//! thread follows it. Any client of the display can find those windows
+//! with `QueryTree` and send them a `ClientMessage` too, so the drop's
+//! carries a random cookie, chosen once per process, and a thread stops
+//! only for a message that carries it (see [`is_wake`]).
 //!
 //! # Keys
 //!
@@ -64,6 +72,7 @@
 
 mod capture;
 mod checks;
+mod clipboard;
 mod cursor;
 mod damage;
 mod evdev_names;
@@ -101,6 +110,7 @@ use super::{
 };
 use capture::{CaptureRequest, Capturer, serve_capture};
 use checks::ServerFacts;
+use clipboard::{ClipboardHandle, serve_clipboard, serve_timer, start_clipboard};
 use cursor::{serve_cursor, start_cursor};
 use damage::{DamageThread, serve_damage, start_damage};
 use input::{Injector, InputQueue, InputRequest, serve_input};
@@ -182,6 +192,8 @@ pub struct X11Platform {
     cursor_waker: Waker,
     /// Wakes the damage thread on drop.
     damage_waker: Waker,
+    /// Wakes the clipboard thread on drop.
+    clipboard_waker: Waker,
     /// The desktop's damage, for every subscriber; the damage thread
     /// reports to it.
     damage: Arc<DamageHub>,
@@ -190,9 +202,9 @@ pub struct X11Platform {
     /// Set by whichever backend thread first finds its connection dead;
     /// each holds a sender.
     gone: GoneSignal,
-    /// The desktop's clipboard text, which nothing yet reports: always
-    /// `None`. See the [`Clipboard`] implementation.
-    clipboard: watch::Sender<Option<Arc<str>>>,
+    /// Queues text for the clipboard thread, and holds the desktop's text
+    /// as it reports it.
+    clipboard: ClipboardHandle,
 }
 
 impl X11Platform {
@@ -266,6 +278,11 @@ impl X11Platform {
         let (shapes, cursor) = watch::channel(first_shape.map(Arc::new));
         let (gone_sender, gone) = GoneSignal::new();
 
+        let (clipboard_conn, _) = open(name, "the clipboard")?;
+        let clipboard_conn = Arc::new(clipboard_conn);
+        let started = start_clipboard(clipboard_conn.clone(), root, gone_sender.clone())
+            .with_context(|| format!("following the clipboard on X display {name}"))?;
+
         let (capture, capture_queue) = mpsc::channel();
         let thread_gone = gone_sender.clone();
         spawn("andris-x11-capture", move || {
@@ -291,6 +308,12 @@ impl X11Platform {
             gone: gone_sender,
         };
         spawn("andris-x11-damage", move || serve_damage(thread))?;
+        let clipboard_thread = started.thread;
+        spawn("andris-x11-clipboard", move || {
+            serve_clipboard(clipboard_thread)
+        })?;
+        let timer = started.timer;
+        spawn("andris-x11-clipboard-timer", move || serve_timer(timer))?;
 
         Ok(Arc::new(Self {
             capture,
@@ -304,10 +327,14 @@ impl X11Platform {
                 conn: damage_conn,
                 window: damage_window,
             },
+            clipboard_waker: Waker {
+                conn: clipboard_conn,
+                window: started.handle.window,
+            },
             damage,
             using_shm,
             gone,
-            clipboard: watch::Sender::new(None),
+            clipboard: started.handle,
         }))
     }
 
@@ -339,10 +366,11 @@ impl X11Platform {
 impl Drop for X11Platform {
     fn drop(&mut self) {
         // The capture and input threads stop when their queues close,
-        // which happens as the fields drop. Wake the cursor and damage
-        // threads, which are waiting for X events.
+        // which happens as the fields drop. Wake the cursor, damage and
+        // clipboard threads, which are waiting for X events.
         self.cursor_waker.wake();
         self.damage_waker.wake();
+        self.clipboard_waker.wake();
     }
 }
 
@@ -402,17 +430,20 @@ impl DisplayControl for X11Platform {
     }
 }
 
-// A placeholder: the X11 backend cannot yet reach the desktop's
-// clipboard, so it reports an empty clipboard that never changes and drops
-// the text it is given.
 impl Clipboard for X11Platform {
+    /// The text the clipboard thread fetched from the program that last
+    /// took `CLIPBOARD`; see [`clipboard`].
     fn changes(&self) -> ClipboardReceiver {
-        self.clipboard.subscribe()
+        self.clipboard.changes()
     }
 
-    /// Drops the text: nothing yet owns the X selection for andris.
-    fn set(&self, _text: Arc<str>) -> Result<()> {
-        Ok(())
+    /// Queues the text for the clipboard thread, which takes `CLIPBOARD`
+    /// and serves it. Text over [`MAX_CLIPBOARD_TEXT`] is dropped, with a
+    /// warning.
+    ///
+    /// [`MAX_CLIPBOARD_TEXT`]: super::MAX_CLIPBOARD_TEXT
+    fn set(&self, text: Arc<str>) -> Result<()> {
+        self.clipboard.set(text)
     }
 }
 

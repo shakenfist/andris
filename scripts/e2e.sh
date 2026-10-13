@@ -8,8 +8,9 @@
 # It starts Xvfb and first runs the X11 backend's own tests against its bare
 # root window (andris/tests/x11.rs, through cargo test, which the Makefile
 # has already built): damage from a drawing, the drawing captured through
-# MIT-SHM and through GetImage, and resizes through RandR, which leave the
-# display at its starting size.
+# MIT-SHM and through GetImage, resizes through RandR, which leave the
+# display at its starting size, and the clipboard both ways, with xclip,
+# which leaves CLIPBOARD with no owner.
 #
 # It then starts, in order: scripts/e2e-keylogger.py, a full-screen window
 # of a known colour that prints each key's keysym name; andris against that

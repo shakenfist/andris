@@ -56,8 +56,16 @@ the display through andris's RandR display control: smaller, wider
 than Xvfb allows (clamped to its widest), narrower and taller, and back
 to the start, each reaching damage subscribers as a resize; then larger
 than Xvfb allows, which is refused. It checks that andris leaves none
-of the modes it creates behind. The two tests take turns with the
-display. They read the display from `ANDRIS_TEST_DISPLAY`. When the variable is unset, as
+of the modes it creates behind. Four more check the clipboard with
+`xclip`: copies on the display reach andris, including a copy of the
+same text again, text over a megabyte (which arrives in pieces, by
+INCR), and text an owner offers only as Latin-1; text andris is given
+pastes on the display, as UTF-8, Latin-1 where it can be, and in pieces
+when large, while a requestor that stops taking pieces holds up no
+other paste; another program that takes the clipboard from andris is
+followed, and andris stops serving; and an owner that never answers is
+given up on after andris's 10-second timeout, while andris still takes
+and serves text meanwhile. The tests take turns with the display. They read the display from `ANDRIS_TEST_DISPLAY`. When the variable is unset, as
 under `make test`, it prints that it is skipping and passes. The script then starts a full-screen
 window that logs the keys it receives, starts the debug andris against
 that display, and connects ryll's headless client through a `.vv`

@@ -153,9 +153,11 @@ Each has the default this plan takes if nobody answers.
    dependencies.
 5. **Crate layout in andris.** *Default:* one binary crate with
    modules per backend, split only when a second backend exists.
-6. **Packaging.** *Default:* Linux only. A `.deb` via `cargo deb`
-   and a systemd *user* unit, built inside Docker like ryll. No
-   macOS, Windows or Homebrew builds.
+6. **Packaging.** *Decided by the operator on 2026-10-13:* Linux
+   only, published to PyPI as manylinux wheels, the way ryll is
+   published, because most people will install a wheel. A `.deb` may
+   be built as well, but is not the primary channel. No macOS,
+   Windows or Homebrew builds.
 
 ## Execution
 
@@ -172,7 +174,7 @@ written with `/next-phase` as each phase comes up.
 | 3. Image encoders (ryll) | PLAN-x11-desktop-phase-03-encoders.md | Complete | ryll `cd2fe41` (#487); andris `591e062` (#6) |
 | 4. Server skeleton | PLAN-x11-desktop-phase-04-server-skeleton.md | Complete | andris `1950cdb` (#7) |
 | 5. Damage and flow control | PLAN-x11-desktop-phase-05-damage.md | Complete | andris `68b1058` (#8); andris `43bfe88` (#11) |
-| 6. Sharing the xrdp session | PLAN-x11-desktop-phase-06-sharing.md | In progress | |
+| 6. Sharing the xrdp session | PLAN-x11-desktop-phase-06-sharing.md | Complete | andris `498a72c` (#12) |
 | 7. In-process agent: resize and clipboard | Not yet written | Not started | |
 | 8. Video streams | Not yet written | Not started | |
 | 9. Audio | Not yet written | Not started | |
@@ -430,8 +432,31 @@ kHz and honours the client's volume and mute messages.
 
 ### Phase 10: Packaging and dogfood soak
 
-Ship a `.deb` carrying phase 6's systemd user unit, and write the kerbside
-static-source configuration into `docs/`. Automate phase 4's
+Publish andris to PyPI as manylinux wheels, reusing ryll's release
+tooling: maturin with `bindings = "bin"`, a manylinux_2_28 build per
+architecture (ryll's `.devcontainer/wheel/Dockerfile` and
+`tools/build-ryll-wheel.sh`), and trusted publishing from a release
+workflow. Andris's X11 code is pure-Rust `x11rb`, linking no X
+library, so the manylinux tag holds without vendoring anything. A
+`.deb` is optional.
+
+A wheel cannot install a systemd unit, and phase 6's
+`andris@.service` names a bare `andris`, which systemd resolves only
+in `/usr/local/bin` and `/usr/bin`; a wheel puts the binary in
+`~/.local/bin` or a virtual environment. So andris gains an
+`andris install-unit` subcommand. It writes the unit, compiled into
+the binary, to `~/.config/systemd/user/` with `ExecStart=` naming the
+running binary's absolute path. It also creates `~/.config/andris/`
+with mode 0700 and a fresh 0600 ticket when none exists, so that
+`docs/xrdp.md`'s install section becomes one command and an
+`enable`. Reinstalling the wheel elsewhere means running it again,
+which the documentation says.
+
+Phase 6 declined `SystemCallFilter=@system-service` until a soak
+shows MIT-SHM and the memfd survive it; this phase's soak is that
+test.
+
+Write the kerbside static-source configuration into `docs/`. Automate phase 4's
 kerbside smoke test, either here or as a "custom backend" lane in
 kerbside's own CI. Then the operator uses
 ryll → kerbside → andris as the daily connection for a week, with

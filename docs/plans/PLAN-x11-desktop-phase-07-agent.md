@@ -269,9 +269,9 @@ its conventions in its `AGENTS.md`.
 
 | Step | Effort | Model | Isolation | Status | Brief for sub-agent |
 |------|--------|-------|-----------|--------|---------------------|
-| 0 | low | management | none | In progress | Commit the phase 6 close-out and this plan; create the ryll worktree. See brief 0. |
-| 1 | high | opus | none | Not started | Spike: xorgxrdp's refusal, Xvfb's RandR, and chansrv's clipboard, on the test bed. Gated. See brief 1. |
-| 2 | high | opus | none | Not started | Ryll: headless clipboard, and control verbs for the clipboard and resize. Ryll PR. See brief 2. |
+| 0 | low | management | none | Complete | Commit the phase 6 close-out and this plan; create the ryll worktree. See brief 0. |
+| 1 | high | opus | none | Complete | Spike: xorgxrdp's refusal, Xvfb's RandR, and chansrv's clipboard, on the test bed. Gated. See brief 1. |
+| 2 | high | opus | none | In progress | Ryll: headless clipboard, and control verbs for the clipboard and resize. Ryll PR. See brief 2. |
 | 3 | medium | sonnet | none | Not started | Andris: bump the ryll pin to step 2's merge. See brief 3. |
 | 4 | high | opus | none | Not started | The agent protocol on the main channel, the two seams, and the synthetic platform's side. See brief 4. |
 | 5 | high | opus | none | Not started | X11 display control through RandR. See brief 5. |
@@ -447,15 +447,21 @@ two new platform seams, with the synthetic platform implementing both.
   - when growing, set the screen size and then the CRTC; when
     shrinking, the CRTC and then the screen size, so the CRTC always
     fits; physical size in millimetres at 96 DPI;
-  - an X error at any point is `Refused`, with the X error named; a
-    CRTC change that reports success but leaves the CRTC unchanged, as
-    xorgxrdp's does, is also `Refused`; restore what was changed
-    before the failure, as far as RandR allows;
-  - remove modes andris added that are no longer in use.
+  - an X error at any point is `Refused`, with the X error named.
+    Never trust `RRSetCrtcConfig`'s Success: on xorgxrdp it changes
+    nothing, so a shrink done CRTC-first would look applied. Read the
+    screen and CRTC geometry back, and treat a size that did not
+    change as `Refused`. Restore what was changed before the failure,
+    as far as RandR allows;
+  - on a refusal, delete from the output and destroy every mode the
+    attempt created; step 1 saw each refused attempt otherwise leave
+    a mode on `rdp0` for the operator to find. Remove modes andris
+    added that are no longer in use after an applied resize too.
 - The resize then reaches the client through the existing
   `ConfigureNotify` path (survey finding 10); add nothing there.
-- Tests: what step 1 found can resize, exercised from an in-process
-  test or `make e2e`; the refusal path against Xvfb if Xvfb refuses.
+- Tests: Xvfb resizes within its `-screen` size and refuses above it
+  (step 1), so both paths can be exercised against it: shrink and grow
+  back for `Applied`, and a size above the start for `Refused`.
 
 ### Brief 6: the X11 clipboard thread
 
@@ -478,8 +484,14 @@ per decisions 4, 5 and 6.
   `MULTIPLE`. On `SelectionClear`, stop serving.
 - A requestor that never finishes an INCR transfer must not stall the
   thread: per-transfer state with a timeout.
-- Tests against Xvfb in `make e2e`, with `xclip` (add it to the dev
-  image if it is not there): set on X and read through andris's seam,
+- **Every conversion andris asks for has a timeout too** (10 s), and a
+  conversion that times out publishes no text. Step 1 found that
+  chansrv keeps CLIPBOARD after the RDP client disconnects, and that
+  requests to it then hang for ever; andris will meet that owner at
+  startup and on every eager fetch while RDP is away.
+- Tests against Xvfb in `make e2e`, with `xclip`, which neither the
+  dev image nor the test bed has: add `xclip` and `x11-xserver-utils`
+  (for `xrandr`) to both Dockerfiles: set on X and read through andris's seam,
   set through the seam and read with `xclip`, a text over the INCR
   threshold each way.
 
@@ -490,22 +502,32 @@ per decisions 4, 5 and 6.
 - `make e2e` (Xvfb): `clipboard_set` in ryll reaches `xclip -o` on the
   display; `xclip -i` on the display reaches ryll's `clipboard_get`
   (wait for `clipboard_changed`); a text over one agent chunk, and one
-  over the INCR threshold, both ways. `resize` per step 1's Xvfb
-  result: the surface reaches ryll at the new size, or andris logs the
-  refusal and the surface is unchanged.
+  over the INCR threshold, both ways. `resize`: a shrink and a grow
+  back within Xvfb's `-screen` size reach ryll as new surfaces; a size
+  above it is refused, logged once, and leaves the surface unchanged.
 - `make e2e-xrdp`, new interleaving checks:
   - **X8**, RDP to SPICE: text copied on FreeRDP's display arrives in
     ryll's clipboard;
   - **X9**, SPICE to RDP: `clipboard_set` in ryll arrives on FreeRDP's
     display;
-  - **X10**, no loop: after X8 and X9, count the grabs andris logs (or
-    the `clipboard_changed` events) over 5 s, and require none. Model
-    the shared Mac clipboard by a helper that copies FreeRDP's
-    clipboard into ryll's and back, if step 1 shows that is feasible;
-    otherwise record that the loop is checked only in step 9;
+  - **X10**, no loop: a helper on FreeRDP's display stands in for the
+    Mac's shared pasteboard. It watches FreeRDP's CLIPBOARD with
+    XFixes, feeds new text to ryll's `clipboard_set`, and owns
+    FreeRDP's CLIPBOARD with the text of each `clipboard_changed`,
+    ignoring its own ownership. After one copy each way, count the
+    grabs andris logs over 5 s and require none beyond the first.
+    Step 1's model of this loop ran at about 750 bridges a second
+    without content comparison, so a regression cannot hide;
   - **X11**, resize from SPICE: ryll's `resize` is refused, andris
     logs it once, ryll's surface stays at the RDP size, and an RDP
     resize afterwards still reaches ryll.
+- chansrv fetches only when the RDP side pastes, and FreeRDP caches
+  what it fetched, so a second read on FreeRDP's display proves
+  nothing new; each check copies fresh text.
+- Step 1's spike scripts, in the management session's scratchpad
+  (`spike/loop.py`, `owner.py`, `setup.sh`), are a starting point; the
+  management session copies them in. python-xlib copies its event
+  classes, so compare `type(event).__name__`, not `isinstance`.
 - Record each result, as phase 6 did for X1 to X7.
 
 ### Brief 8: documentation
@@ -584,6 +606,37 @@ open the pull request when the operator asks.
 ## Result
 
 Filled in as the steps complete.
+
+**Step 1: the spike** (2026-10-14, about 12 minutes, all in the test-bed
+container; nothing touched `:10`). It confirmed survey findings 1 and 8
+and reopened no decision. A throwaway image, `andris-xrdp-spike`, added
+`xclip` and `x11-xserver-utils`, which neither image has.
+
+- **xorgxrdp refuses every resize.** RandR 1.6, one output `rdp0` on
+  one CRTC, size range 256x256 to 16384x16384. With FreeRDP connected
+  or killed, `xrandr --fb` and `--output rdp0 --mode` fail with
+  `BadMatch` from `RRSetScreenSize`; `--newmode` and `--addmode`
+  succeed and leave the mode on `rdp0`; a raw `RRSetCrtcConfig`
+  replies Success and changes nothing; no `ConfigureNotify` arrives.
+  Brief 5 now reads geometry back and cleans up its modes.
+- **Xvfb resizes, up to its start size.** Xvfb 21.1.16 started as
+  `make e2e` starts it: RandR 1.6, one output `screen`, size range
+  1x1 to the `-screen` size. Shrinking and growing back apply,
+  arbitrary created modes included, each with a root
+  `ConfigureNotify`; above the start size, `RRSetScreenSize` fails
+  with `BadValue`. Brief 7 tests both paths against it.
+- **chansrv:** xfreerdp3 redirects the clipboard by default. chansrv
+  offers `TARGETS TIMESTAMP MULTIPLE STRING UTF8_STRING`, asks a new
+  owner for `TARGETS` at once and for `UTF8_STRING` only when the RDP
+  side pastes, and never timed out on an owner that delayed its
+  replies by up to 100 s. **New:** after the RDP client disconnects,
+  chansrv keeps CLIPBOARD, and requests to it hang until reconnect.
+  Brief 6 now bounds every conversion.
+- **The loop is real, and content comparison stops it.** A model of
+  the Mac's shared pasteboard, bridging FreeRDP's display and `:50`
+  directly, made 4513 bridges in 6 s from one copy without
+  comparison, and exactly one per copy with it, in both directions.
+  Brief 7's X10 is built on that model.
 
 ## Back brief
 

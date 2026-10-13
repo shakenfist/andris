@@ -51,8 +51,13 @@ rectangle, waits for the damage, and captures it through both MIT-SHM
 and `GetImage`. It then detaches andris's shared segment from a second
 connection, finding it through X-Resource 1.2 as another client
 could, and checks that capture recovers: first with a fresh segment,
-then, after a second detach, through `GetImage`. That test reads the
-display from `ANDRIS_TEST_DISPLAY`. When the variable is unset, as
+then, after a second detach, through `GetImage`. A second test resizes
+the display through andris's RandR display control: smaller, wider
+than Xvfb allows (clamped to its widest), narrower and taller, and back
+to the start, each reaching damage subscribers as a resize; then larger
+than Xvfb allows, which is refused. It checks that andris leaves none
+of the modes it creates behind. The two tests take turns with the
+display. They read the display from `ANDRIS_TEST_DISPLAY`. When the variable is unset, as
 under `make test`, it prints that it is skipping and passes. The script then starts a full-screen
 window that logs the keys it receives, starts the debug andris against
 that display, and connects ryll's headless client through a `.vv`

@@ -1,5 +1,6 @@
-//! The capture thread: the desktop's size, read with `GetGeometry`, and
-//! its pixels, one image per rectangle asked for.
+//! The capture thread: the desktop's size, read with `GetGeometry`; its
+//! pixels, one image per rectangle asked for; and resizes, through RandR
+//! (see [`super::randr`]).
 //!
 //! Each rectangle is read with MIT-SHM's `ShmGetImage` where that works
 //! (see [`super::shm`]), and with `GetImage` otherwise. Which is used is
@@ -31,9 +32,10 @@ use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{self, ImageFormat, Window};
 use x11rb::rust_connection::RustConnection;
 
+use super::randr::Randr;
 use super::shm::{Segment, image_bytes};
 use super::{Fault, answer, lost};
-use crate::platform::{Capture, Frame, GoneSender, Patch, Rectangle, Size};
+use crate::platform::{Capture, Frame, GoneSender, Patch, Rectangle, Resize, Size};
 
 /// A request to the capture thread, with where to send its answer.
 pub(super) enum CaptureRequest {
@@ -41,6 +43,8 @@ pub(super) enum CaptureRequest {
     Size(SyncSender<Result<Size>>),
     /// Capture these rectangles, or the whole desktop for `None`.
     Capture(Option<Vec<Rectangle>>, SyncSender<Result<Capture>>),
+    /// Make the desktop this size.
+    SetSize(Size, SyncSender<Result<Resize>>),
 }
 
 /// How many MIT-SHM captures in a row may fail before the capture thread
@@ -102,6 +106,8 @@ pub(super) struct Capturer {
     using_shm: Arc<AtomicBool>,
     /// Failed MIT-SHM captures, while `shm` is in use.
     shm_failures: ShmFailures,
+    /// RandR on this connection, or why the desktop cannot be resized.
+    randr: Result<Randr, String>,
     /// Whether a capture has found the connection gone. Nothing may
     /// capture after that: [`Segment::capture`] can return `Gone` with
     /// `ShmGetImage` requests still in flight.
@@ -112,7 +118,8 @@ impl Capturer {
     /// Set up capture of `root` on `conn`, a desktop of `size` for now.
     /// MIT-SHM is tried unless `refusal` says why not, and `GetImage` is
     /// used if it is refused or its segment cannot be attached. Logs
-    /// which is used, and why, at info. Fails only if the connection
+    /// which is used, and why, at info. Resizes go through `randr`, or
+    /// are refused for the reason it gives. Fails only if the connection
     /// fails.
     pub(super) fn new(
         conn: RustConnection,
@@ -120,6 +127,7 @@ impl Capturer {
         size: Size,
         refusal: Option<&str>,
         using_shm: Arc<AtomicBool>,
+        randr: Result<Randr, String>,
     ) -> Result<Self> {
         let shm = match refusal {
             Some(why) => {
@@ -152,8 +160,22 @@ impl Capturer {
             shm,
             using_shm,
             shm_failures: ShmFailures::default(),
+            randr,
             gone: false,
         })
+    }
+
+    /// Make the desktop `size` through RandR, or refuse to. Every X error
+    /// is a refusal; only a failed connection is a fault.
+    fn set_size(&mut self, size: Size) -> Result<Resize, Fault> {
+        let resized = match &self.randr {
+            Err(why) => return Ok(Resize::Refused(why.clone())),
+            Ok(randr) => randr.set_size(&self.conn, self.root, size),
+        };
+        if let Err(Fault::Gone(_)) = resized {
+            self.gone = true;
+        }
+        resized
     }
 
     /// Capture `rects`, each clipped to the desktop's size now, or the
@@ -340,6 +362,7 @@ pub(super) fn serve_capture(
             CaptureRequest::Capture(rects, reply) => {
                 answer(reply, capturer.capture(rects.as_deref()))
             }
+            CaptureRequest::SetSize(size, reply) => answer(reply, capturer.set_size(size)),
         };
         if let Some(e) = failed {
             // Stopping here is what makes Segment::capture's early return
@@ -354,7 +377,7 @@ pub(super) fn serve_capture(
 }
 
 /// The root window's size now.
-fn root_size(conn: &RustConnection, root: Window) -> Result<Size, Fault> {
+pub(super) fn root_size(conn: &RustConnection, root: Window) -> Result<Size, Fault> {
     let geometry = xproto::get_geometry(conn, root)?.reply()?;
     let size = Size {
         width: geometry.width.into(),

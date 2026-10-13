@@ -274,8 +274,8 @@ its conventions in its `AGENTS.md`.
 | 2 | high | opus | none | In progress | Ryll: headless clipboard, and control verbs for the clipboard and resize. Ryll PR. See brief 2. |
 | 3 | medium | sonnet | none | Complete | Andris: bump the ryll pin to step 2's merge. See brief 3. |
 | 4 | high | opus | none | Complete | The agent protocol on the main channel, the two seams, and the synthetic platform's side. See brief 4. |
-| 5 | high | opus | none | In progress | X11 display control through RandR. See brief 5. |
-| 6 | high | opus | none | Not started | The X11 clipboard thread. See brief 6. |
+| 5 | high | opus | none | Complete | X11 display control through RandR. See brief 5. |
+| 6 | high | opus | none | In progress | The X11 clipboard thread. See brief 6. |
 | 7 | high | opus | none | Not started | End-to-end checks: `make e2e` and `make e2e-xrdp`. See brief 7. |
 | 8 | medium | sonnet | none | Not started | Documentation, and the xorgxrdp feature request drafted. See brief 8. |
 | 9 | medium | management | none | Not started | Operator acceptance on `:10`, by hand. See brief 9. |
@@ -620,6 +620,21 @@ andris's channel reader now reads into a 16 KiB chunk and appends it,
 since `ReceiveBuffer` cannot take tokio's `read_buf`. Behaviour is
 unchanged, and framing many queued messages is now linear rather than
 quadratic. `make lint test e2e e2e-xrdp` passed.
+
+**Step 5: RandR.** A request outside the server's size range is
+clamped: if the desktop then changes, the answer is `Applied`, and the
+client sees the real size as its new surface; if the clamped size is
+the one the desktop already has, the answer is `Refused`, so the client
+is not told it got a size it did not. Brief 7's "above Xvfb's size is
+refused" holds, because that check starts at the maximum. The read-back
+catches xorgxrdp's no-op CRTC change; refusals undo their steps and
+remove their modes. Undoing restores the physical size at 96 DPI rather
+than the original value, which RandR 1.2 cannot cheaply read. Rotated
+CRTCs are handled. `tests/x11.rs` gained the Xvfb checks and keeps one
+connection open for the whole process, because Xvfb resets when its
+last client leaves. A one-off run against xorgxrdp on `:50`, connected
+and disconnected, was refused with `BadMatch` every time and left no
+modes.
 
 **Step 4: the agent protocol.** Departures from brief 4, each taken in
 review:

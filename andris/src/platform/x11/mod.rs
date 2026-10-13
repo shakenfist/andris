@@ -10,7 +10,9 @@
 //!   the root window, and one image per rectangle asked for: with
 //!   MIT-SHM's `ShmGetImage` into a memfd shared with the server where
 //!   that works, and with `GetImage` otherwise (see [`capture`] and
-//!   [`shm`]). Which is used, and why, is logged once at startup;
+//!   [`shm`]). Which is used, and why, is logged once at startup. It
+//!   also makes the resizes a client asks for, with RandR (see
+//!   [`randr`]), which are rare and answer in round trips;
 //! - **input** injects events with XTest and reads the lock state from
 //!   XKB's indicators. Both go through one queue, so a lock-state read
 //!   sees every event queued before it;
@@ -67,6 +69,7 @@ mod damage;
 mod evdev_names;
 mod input;
 mod keymap;
+mod randr;
 // The crate's only unsafe code: the shared memory mapping. See the
 // module's documentation for why it is sound.
 #[allow(unsafe_code)]
@@ -101,6 +104,7 @@ use checks::ServerFacts;
 use cursor::{serve_cursor, start_cursor};
 use damage::{DamageThread, serve_damage, start_damage};
 use input::{Injector, InputQueue, InputRequest, serve_input};
+use randr::Randr;
 
 /// How many events [`InputSink::inject`] lets wait for the input thread.
 pub const INPUT_QUEUE_LIMIT: usize = 8192;
@@ -198,14 +202,17 @@ impl X11Platform {
     ///
     /// Fails, saying why, if the display cannot be reached, if its root
     /// window is not 32-bit BGRX, or if it lacks XTEST, XFIXES, XKEYBOARD
-    /// or DAMAGE.
+    /// or DAMAGE. Without RandR 1.2 it still connects, and refuses every
+    /// resize.
     pub fn connect(name: &str) -> Result<Arc<Self>> {
         Self::connect_with(name, X11Options::default())
     }
 
     /// [`X11Platform::connect`], set up as `options` says.
     pub fn connect_with(name: &str, options: X11Options) -> Result<Arc<Self>> {
-        // The input connection first: the checks need its XKB handshake.
+        // The input and capture connections first: the checks need the
+        // input connection's XKB handshake, and the capture connection's
+        // RandR handshake.
         let (input_conn, screen) = open(name, "input")?;
         let screen = input_conn
             .setup()
@@ -213,9 +220,18 @@ impl X11Platform {
             .get(screen)
             .cloned()
             .with_context(|| format!("X display {name} has no screen {screen}"))?;
-        let facts = server_facts(&input_conn, &screen)
+        let (capture_conn, _) = open(name, "capture")?;
+        let facts = server_facts(&input_conn, &capture_conn, &screen)
             .with_context(|| format!("asking X display {name} what it supports"))?;
         checks::check(name, &facts)?;
+        let randr = match (checks::resize_refusal(&facts), facts.randr) {
+            (None, Some(version)) => Ok(Randr::new(version)),
+            (refusal, _) => {
+                let why = refusal.unwrap_or_else(|| "the X server has no RandR".to_string());
+                info!("andris will refuse to resize X display {name}, because {why}");
+                Err(why)
+            }
+        };
         let root = screen.root;
         info!(
             depth = screen.root_depth,
@@ -231,7 +247,6 @@ impl X11Platform {
             .with_context(|| format!("following damage on X display {name}"))?;
         let damage = Arc::new(DamageHub::new(size));
 
-        let (capture_conn, _) = open(name, "capture")?;
         let unix = shm::is_unix_socket(capture_conn.stream().as_fd());
         let using_shm = Arc::new(AtomicBool::new(false));
         let capturer = Capturer::new(
@@ -240,6 +255,7 @@ impl X11Platform {
             size,
             shm::refusal(options.shm, facts.shm_fd, unix),
             using_shm.clone(),
+            randr,
         )
         .with_context(|| format!("setting up capture of X display {name}"))?;
 
@@ -376,18 +392,19 @@ impl CursorSource for X11Platform {
     }
 }
 
-// Placeholders: the X11 backend cannot yet resize the desktop or reach its
-// clipboard, so it refuses every resize and reports an empty clipboard
-// that never changes. Steps 5 (RandR) and 6 (a clipboard thread) of
-// docs/plans/PLAN-x11-desktop-phase-07-agent.md replace both.
 impl DisplayControl for X11Platform {
-    fn set_size(&self, _size: Size) -> Result<Resize> {
-        Ok(Resize::Refused(
-            "andris cannot yet resize an X display".to_string(),
-        ))
+    /// Resizes through RandR, on the capture thread; see [`randr`]. Every
+    /// X error is a refusal, naming the error.
+    fn set_size(&self, size: Size) -> Result<Resize> {
+        round_trip(&self.capture, "capture", |reply| {
+            CaptureRequest::SetSize(size, reply)
+        })
     }
 }
 
+// A placeholder: the X11 backend cannot yet reach the desktop's
+// clipboard, so it reports an empty clipboard that never changes and drops
+// the text it is given.
 impl Clipboard for X11Platform {
     fn changes(&self) -> ClipboardReceiver {
         self.clipboard.subscribe()
@@ -542,8 +559,13 @@ fn answer<T>(reply: SyncSender<Result<T>>, result: Result<T, Fault>) -> Option<a
 
 /// What the display's setup and extensions say, for [`checks::check`].
 /// Makes the XKB `UseExtension` handshake on `conn`, which is the input
-/// connection's first XKB request.
-fn server_facts(conn: &RustConnection, screen: &xproto::Screen) -> Result<ServerFacts> {
+/// connection's first XKB request, and the RandR `QueryVersion` handshake
+/// on `capture`, the connection that resizes.
+fn server_facts(
+    conn: &RustConnection,
+    capture: &RustConnection,
+    screen: &xproto::Screen,
+) -> Result<ServerFacts> {
     let setup = conn.setup();
     let bits_per_pixel = setup
         .pixmap_formats
@@ -582,6 +604,7 @@ fn server_facts(conn: &RustConnection, screen: &xproto::Screen) -> Result<Server
         xkb,
         damage: present(xdamage::X11_EXTENSION_NAME)?,
         shm_fd,
+        randr: randr::handshake(capture)?,
     })
 }
 

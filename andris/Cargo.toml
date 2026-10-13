@@ -31,7 +31,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-x11rb = { version = "0.14", features = ["damage", "shm", "xfixes", "xkb", "xtest"] }
+x11rb = { version = "0.14", features = ["damage", "randr", "shm", "xfixes", "xkb", "xtest"] }
 
 # ryll's shared crates, pinned to ryll's develop at 7e3705e.
 # Both crates come from one ryll workspace, so they must always carry the

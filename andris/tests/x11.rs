@@ -1,32 +1,48 @@
 //! The X11 backend against a real X server: damage from a drawing, the
-//! drawing captured through MIT-SHM and through `GetImage`, and capture
-//! carrying on after another client detaches andris's MIT-SHM segment.
+//! drawing captured through MIT-SHM and through `GetImage`, capture
+//! carrying on after another client detaches andris's MIT-SHM segment, and
+//! resizes through RandR.
 //!
 //! The X server is named by `ANDRIS_TEST_DISPLAY`. `make e2e` sets it to
 //! its Xvfb, before any window is mapped; with it unset, as under
 //! `make test`, the test says on stderr that it is skipping, and passes
 //! without doing anything. The display must be one nothing else draws on
 //! or attaches MIT-SHM segments to while the test runs, and needs the
-//! X-Resource extension, 1.2 or later. The test leaves a filled rectangle
-//! on its root window.
+//! X-Resource extension, 1.2 or later. The tests take turns with the
+//! display, and leave a filled rectangle on its root window.
+//!
+//! The resize test needs an X server that resizes up to its starting size
+//! and no further, as Xvfb does: its `-screen` size is the largest RandR
+//! allows. It leaves the display at that size.
 
 // Test helpers, where a failed unwrap is a failed test. clippy's
 // allow-unwrap-in-tests covers only #[test] functions themselves.
 #![allow(clippy::unwrap_used)]
 
 use std::io::Write as _;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use andris::platform::x11::{CaptureMethod, X11Options, X11Platform};
 use andris::platform::{
-    Capture, DamageSubscription, DisplayGeometry, Frame, Rectangle, Region, ScreenSource, TILE,
-    is_gone,
+    Capture, DamageSubscription, DisplayControl, DisplayGeometry, Frame, Rectangle, Region, Resize,
+    ScreenSource, Size, TILE, is_gone,
 };
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{self, ConnectionExt as _, CreateGCAux, SubwindowMode};
+use x11rb::protocol::randr::ConnectionExt as _;
+use x11rb::protocol::xproto::{self, ConnectionExt as _, CreateGCAux, SubwindowMode, Window};
 use x11rb::protocol::{res, shm as xshm};
 use x11rb::rust_connection::RustConnection;
+
+/// Held by each test while it uses the display, which they cannot share:
+/// one resizes it under the other's captures.
+static DISPLAY_TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// A connection to the display that the tests keep open until the process
+/// exits. An X server resets itself when its last client disconnects, and
+/// refuses connections while it does; without this, the second test to
+/// run can connect just as the first one's last connection closes.
+static KEEP_OPEN: OnceLock<RustConnection> = OnceLock::new();
 
 /// Where the test draws. It straddles a tile corner, at (128, 64), so
 /// its damage spans four tiles.
@@ -45,11 +61,22 @@ const DAMAGE_BOUND: Duration = Duration::from_secs(5);
 /// How long with no damage counts as the display having settled.
 const SETTLED: Duration = Duration::from_millis(200);
 
-/// The display to test against, or `None` to skip.
+/// The display to test against, or `None` to skip, saying so.
 fn display() -> Option<String> {
-    std::env::var("ANDRIS_TEST_DISPLAY")
+    let display = std::env::var("ANDRIS_TEST_DISPLAY")
         .ok()
-        .filter(|name| !name.is_empty())
+        .filter(|name| !name.is_empty());
+    if let Some(name) = &display {
+        KEEP_OPEN.get_or_init(|| x11rb::connect(Some(name)).unwrap().0);
+    } else {
+        // Straight to stderr: libtest captures eprintln!, which would
+        // hide that this passed without testing anything.
+        let _ = writeln!(
+            std::io::stderr(),
+            "ANDRIS_TEST_DISPLAY is unset; SKIPPING the X11 backend test, which `make e2e` runs"
+        );
+    }
+    display
 }
 
 /// Fill `rect` of `display`'s root window with `pixel`, through a
@@ -226,14 +253,9 @@ fn failures_before_recovery(platform: &Arc<X11Platform>, expected: &Capture) -> 
 #[tokio::test]
 async fn damage_and_both_capture_paths_see_a_drawing() {
     let Some(display) = display() else {
-        // Straight to stderr: libtest captures eprintln!, which would
-        // hide that this passed without testing anything.
-        let _ = writeln!(
-            std::io::stderr(),
-            "ANDRIS_TEST_DISPLAY is unset; SKIPPING the X11 backend test, which `make e2e` runs"
-        );
         return;
     };
+    let _turn = DISPLAY_TURN.lock().await;
     let shm = X11Platform::connect(&display).unwrap();
     assert_eq!(
         shm.capture_method(),
@@ -330,4 +352,184 @@ async fn damage_and_both_capture_paths_see_a_drawing() {
         "damage, MIT-SHM and GetImage agree on X display {display}, and capture survives a \
          detached segment"
     );
+}
+
+/// Take damage from `subscription` until it reports a desktop of `size`,
+/// as a resize does. Panics after [`DAMAGE_BOUND`].
+async fn resized_to(subscription: &DamageSubscription, size: Size) {
+    let wait = async {
+        loop {
+            subscription.changed().await;
+            if subscription.take().unwrap().size() == size {
+                return;
+            }
+        }
+    };
+    tokio::time::timeout(DAMAGE_BOUND, wait)
+        .await
+        .unwrap_or_else(|_| panic!("no resize to {size} reported within {DAMAGE_BOUND:?}"));
+}
+
+/// The names of andris's modes on the display: every one the server has,
+/// and every one an output lists, each sorted.
+fn andris_modes(conn: &RustConnection, root: Window) -> (Vec<String>, Vec<String>) {
+    let resources = conn
+        .randr_get_screen_resources_current(root)
+        .unwrap()
+        .reply()
+        .unwrap();
+    let mut names = resources.names.as_slice();
+    let mut all = Vec::new();
+    for mode in &resources.modes {
+        let (name, rest) = names.split_at(mode.name_len.into());
+        names = rest;
+        all.push((mode.id, String::from_utf8_lossy(name).into_owned()));
+    }
+    let ours = |ids: &mut dyn Iterator<Item = u32>| -> Vec<String> {
+        let mut found: Vec<String> = ids
+            .filter_map(|id| all.iter().find(|(mode, _)| *mode == id))
+            .map(|(_, name)| name.clone())
+            .filter(|name| name.starts_with("andris-"))
+            .collect();
+        found.sort();
+        found
+    };
+    let on_server = ours(&mut all.iter().map(|(id, _)| *id));
+    let mut listed = Vec::new();
+    for &output in &resources.outputs {
+        let info = conn
+            .randr_get_output_info(output, resources.config_timestamp)
+            .unwrap()
+            .reply()
+            .unwrap();
+        listed.extend(info.modes);
+    }
+    (on_server, ours(&mut listed.into_iter()))
+}
+
+/// Resize `platform` to `size`, expecting it to apply, and check that the
+/// desktop and a capture are then that size, that damage subscribers hear
+/// of it, and that the only andris modes are `modes`.
+async fn applied(
+    platform: &Arc<X11Platform>,
+    subscription: &DamageSubscription,
+    conn: &RustConnection,
+    root: Window,
+    asked: Size,
+    size: Size,
+    modes: &[&str],
+) {
+    assert_eq!(
+        platform.set_size(asked).unwrap(),
+        Resize::Applied,
+        "resizing to {asked}"
+    );
+    assert_eq!(platform.size().unwrap(), size, "resizing to {asked}");
+    resized_to(subscription, size).await;
+    assert_eq!(platform.capture_all().unwrap().size(), size);
+    let modes: Vec<String> = modes.iter().map(|mode| mode.to_string()).collect();
+    assert_eq!(
+        andris_modes(conn, root),
+        (modes.clone(), modes),
+        "andris's modes after resizing to {asked}"
+    );
+}
+
+#[tokio::test]
+async fn randr_resizes_up_to_the_start_size_and_cleans_up_its_modes() {
+    let Some(display) = display() else {
+        return;
+    };
+    let _turn = DISPLAY_TURN.lock().await;
+    let platform = X11Platform::connect(&display).unwrap();
+    let start = platform.size().unwrap();
+    let (other, screen) = x11rb::connect(Some(display.as_str())).unwrap();
+    let root = other.setup().roots[screen].root;
+    other.randr_query_version(1, 3).unwrap().reply().unwrap();
+    let range = other
+        .randr_get_screen_size_range(root)
+        .unwrap()
+        .reply()
+        .unwrap();
+    assert_eq!(
+        Size {
+            width: range.max_width.into(),
+            height: range.max_height.into()
+        },
+        start,
+        "the X server's largest screen is its starting size, as Xvfb's is"
+    );
+    assert_eq!(andris_modes(&other, root), (vec![], vec![]));
+    let subscription = platform.subscribe_damage().unwrap();
+    settle(&subscription).await;
+
+    // Shrinking: a mode is created for the size, and stays while in use.
+    let small = Size {
+        width: 640,
+        height: 480,
+    };
+    applied(
+        &platform,
+        &subscription,
+        &other,
+        root,
+        small,
+        small,
+        &["andris-640x480"],
+    )
+    .await;
+    assert_eq!(platform.set_size(small).unwrap(), Resize::Unchanged);
+
+    // Wider than the server allows: clamped to its widest, and applied.
+    // The mode no longer in use goes.
+    let wide = Size {
+        width: start.width,
+        height: 600,
+    };
+    applied(
+        &platform,
+        &subscription,
+        &other,
+        root,
+        Size {
+            width: start.width + 1000,
+            height: 600,
+        },
+        wide,
+        &[&format!("andris-{wide}")],
+    )
+    .await;
+
+    // Narrower but taller: the screen grows to hold both CRTCs first.
+    let tall = Size {
+        width: 800,
+        height: start.height,
+    };
+    applied(
+        &platform,
+        &subscription,
+        &other,
+        root,
+        tall,
+        tall,
+        &[&format!("andris-{tall}")],
+    )
+    .await;
+
+    // Back to the start, whose mode is the server's own, so andris's go.
+    applied(&platform, &subscription, &other, root, start, start, &[]).await;
+
+    // Larger than the server allows, at its largest already: nothing can
+    // change, and the client did not get what it asked for.
+    let large = Size {
+        width: start.width + 256,
+        height: start.height + 256,
+    };
+    let Resize::Refused(why) = platform.set_size(large).unwrap() else {
+        panic!("a resize beyond the server's largest, at its largest, is refused");
+    };
+    assert!(why.contains(&start.to_string()), "{why}");
+    assert_eq!(platform.size().unwrap(), start);
+    assert_eq!(andris_modes(&other, root), (vec![], vec![]));
+    eprintln!("RandR resized X display {display} within its size range, and refused beyond it");
 }

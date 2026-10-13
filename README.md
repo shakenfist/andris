@@ -18,8 +18,9 @@ message types that kerbside's allowlist accepts.
 
 Andris is pre-alpha. It exports an X display to one client at a
 time, with the main, display, inputs and cursor channels: you get the
-desktop, a keyboard, a mouse and a pointer shape. There is no
-clipboard, resizing, video or audio yet. Build it with `make release`
+desktop, a keyboard, a mouse, a pointer shape, text clipboard and
+resizing where the X server allows it. There is no video or audio
+yet. Build it with `make release`
 and run it against a display:
 
 ```bash

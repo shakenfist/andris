@@ -276,8 +276,8 @@ its conventions in its `AGENTS.md`.
 | 4 | high | opus | none | Complete | The agent protocol on the main channel, the two seams, and the synthetic platform's side. See brief 4. |
 | 5 | high | opus | none | Complete | X11 display control through RandR. See brief 5. |
 | 6 | high | opus | none | Complete | The X11 clipboard thread. See brief 6. |
-| 7 | high | opus | none | Not started | End-to-end checks: `make e2e` and `make e2e-xrdp`. See brief 7. |
-| 8 | medium | sonnet | none | Not started | Documentation, and the xorgxrdp feature request drafted. See brief 8. |
+| 7 | high | opus | none | In progress | End-to-end checks: `make e2e` and `make e2e-xrdp`. See brief 7. |
+| 8 | medium | sonnet | none | Complete | Documentation, and the xorgxrdp feature request drafted. See brief 8. |
 | 9 | medium | management | none | Not started | Operator acceptance on `:10`, by hand. See brief 9. |
 | 10 | medium | management | none | Not started | Push audit, pull request, queue. See brief 10. |
 
@@ -695,6 +695,39 @@ and reopened no decision. A throwaway image, `andris-xrdp-spike`, added
   directly, made 4513 bridges in 6 s from one copy without
   comparison, and exactly one per copy with it, in both directions.
   Brief 7's X10 is built on that model.
+
+**The xorgxrdp feature request (draft).** Not filed; the operator
+decides whether to file it at neutrinolabs/xorgxrdp.
+
+> **Title:** Let an X client resize the screen through RandR when no RDP
+> client is connected, or forward the size to xrdp
+>
+> xorgxrdp refuses every RandR screen-size change from an ordinary X
+> client. On v0.10.2 (RandR 1.6, one output `rdp0`, size range 256x256
+> to 16384x16384), `xrandr --fb`, `xrandr --output rdp0 --mode` and a
+> raw `RRSetScreenSize` fail with `BadMatch`, with an RDP client
+> connected and after it has gone. `RRCreateMode` and `RRAddOutputMode`
+> succeed and leave the mode on the output, and a raw `RRSetCrtcConfig`
+> replies Success but changes nothing, so a client cannot even tell
+> reliably that it was refused.
+>
+> The cause appears to be the `allow_screen_resize` check in
+> `module/rdpRandR.c` (lines 130-139 in v0.10.2): a screen resize is
+> accepted only while xrdp is driving one, as the RDP client's own
+> resize, and refused otherwise.
+>
+> Use case: a SPICE server (andris) shares the session's X display with
+> SPICE clients, alongside xrdp. A SPICE client asks for its window's
+> size and the server has no way to give it: the desktop stays at the
+> RDP client's size, or at the last size it had if the RDP client has
+> gone. The same applies to any X client that manages display size, such
+> as a remote-desktop or screen-sharing helper.
+>
+> Either of these would help: (1) when no RDP client is connected, allow
+> an X client's RandR resize, applying it to the screen so that the next
+> RDP client starts from it; or (2) when one is connected, forward a size
+> an X client asks for to xrdp, which can decide whether to renegotiate
+> with the RDP client. We would be glad to test a patch.
 
 ## Back brief
 

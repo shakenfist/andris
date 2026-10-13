@@ -10,6 +10,9 @@ Documentation=https://github.com/shakenfist/andris/blob/develop/docs/xrdp.md
 StartLimitIntervalSec=0
 
 [Service]
+# An empty default, which andris.env overrides, so that an unset
+# ANDRIS_ARGS draws no warning from systemd.
+Environment=ANDRIS_ARGS=
 # Optional. Sets ANDRIS_ARGS (listen address, TLS options) and, if the
 # session's cookie is not in ~/.Xauthority, XAUTHORITY.
 EnvironmentFile=-%h/.config/andris/andris.env

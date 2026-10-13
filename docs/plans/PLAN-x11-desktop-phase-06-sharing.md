@@ -257,7 +257,7 @@ diff.
 | 3 | high | opus | none | Complete | Process lifetime: SIGTERM, and exiting when the desktop goes. See brief 3. |
 | 4 | high | opus | none | Skipped | Fixes that step 2 calls for, if any. Gated. See brief 4. |
 | 5 | medium | sonnet | none | Complete | The systemd user unit and the documentation. See brief 5. |
-| 6 | medium | management | none | Not started | Operator acceptance on `:10`, by hand. See brief 6. |
+| 6 | medium | management | none | Complete | Operator acceptance on `:10`, by hand. See brief 6. |
 | 7 | medium | management | none | In progress | Push audit, pull request, queue. See brief 7. |
 
 Steps 1 and 3 touch different files and may run in parallel. Step 2
@@ -675,6 +675,34 @@ Only the damage thread's path to the gone signal is exercised end to
 end, because it is always the first to see the connection close. The
 capture, input and cursor threads reach the same `lost()` helper, and
 that is a known gap rather than a tested property.
+
+**Step 6: acceptance on `:10`** (2026-10-13), with the operator.
+
+- **The unit, live.** The operator installed the release binary to
+  `/usr/local/bin/andris`, and the unit and a 0600 ticket under
+  `~/.config`. `systemd-analyze --user verify` was clean once installed.
+  `systemctl --user enable --now andris@10` started it with the
+  hardening directives in force. It captured with MIT-SHM at 2212x1308,
+  and listened on `127.0.0.1:5900`. `systemctl --user stop` logged
+  `SIGTERM: shutting down` and exited 0, and systemd did not restart it.
+  The desktop-gone restart was not tried on `:10`, by design; the test
+  bed's X7 and `make e2e` cover it.
+- **The first connection painted nothing.** The operator's ryll was
+  built from a branch that predates ryll#475's LZ4 decoder fix, which no
+  ryll release carries yet. The pointer moved, but every draw failed
+  with `LZ4 unsupported spice format`. `docs/running.md` now says which
+  ryll andris needs, and what an older one looks like.
+- **With ryll from `develop`, it works.** Over an SSH tunnel from the
+  Mac, the operator typed in the SPICE session and the text appeared in
+  the RDP session, which stayed connected throughout. The operator
+  found the SPICE picture crisper than RDP's.
+- **Fixed after the run:**
+  - systemd warned that `ANDRIS_ARGS` was unset when there was no
+    `andris.env`, so the unit gives it an empty default;
+  - the journal showed colour escape codes, so andris now colours its
+    logs only when stderr is a terminal.
+- **Step 6 touched `:10` only as above.** No step before it did, and no
+  capture of `:10` was kept.
 
 **The push audit** (step 7) audited `origin/develop...HEAD`.
 

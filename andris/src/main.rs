@@ -1,6 +1,7 @@
 //! The andris binary: parse the command line, set up logging, and hand
 //! over to the library.
 
+use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use anyhow::Result;
@@ -20,11 +21,13 @@ fn main() -> Result<ExitCode> {
     let args = Args::parse();
 
     // RUST_LOG picks what is logged, and info is the default. Logs go to
-    // stderr.
+    // stderr, in colour only when that is a terminal: under systemd it is
+    // the journal, where escape codes are noise.
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
         .init();
 
     info!("{}", andris::banner());

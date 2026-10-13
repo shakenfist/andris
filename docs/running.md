@@ -375,6 +375,13 @@ line and the startup log:
 
 ## Connecting with ryll
 
+Use a ryll built from its `develop` branch, at or after the revision
+andris's `Cargo.lock` pins, until a ryll release after 0.1.7 carries
+the same changes. Ryll 0.1.7 and earlier decode LZ4 images differently
+from how spice-server and andris send them (shakenfist/ryll#475): the
+pointer moves, but the display never paints, and ryll logs
+`LZ4 unsupported spice format` for every draw.
+
 Ryll's `--direct` option has no password, so a ticket needs a
 virt-viewer `.vv` file. Write one:
 

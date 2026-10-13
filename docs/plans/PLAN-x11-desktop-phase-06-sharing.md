@@ -696,6 +696,12 @@ that is a known gap rather than a tested property.
   Mac, the operator typed in the SPICE session and the text appeared in
   the RDP session, which stayed connected throughout. The operator
   found the SPICE picture crisper than RDP's.
+- **Two cursors on the Mac.** The operator saw the Mac's cursor and
+  ryll's overlay of the desktop's cursor together. The test bed showed
+  that andris's captured pixels hold no cursor, and that ryll receives a
+  cursor shape. The fault is ryll's: since ryll v0.1.6 its egui panel
+  migration has stopped it hiding the host cursor over the surface
+  (shakenfist/ryll#526). Nothing changes in andris.
 - **Fixed after the run:**
   - systemd warned that `ANDRIS_ARGS` was unset when there was no
     `andris.env`, so the unit gives it an empty default;

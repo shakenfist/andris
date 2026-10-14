@@ -217,7 +217,7 @@ A connection opens four channels, and ryll opens all four:
 
 | Channel | What andris sends or does |
 |---------|---------------------------|
-| main | Opens the session, lists the other channels, applies the client's mouse mode request, and pings every 30 seconds |
+| main | Opens the session, lists the other channels, applies the client's mouse mode request, pings every 30 seconds, and plays the guest agent (below), which carries the clipboard and desktop resizing |
 | display | The desktop as images (below) |
 | inputs | Applies the client's keys and pointer events to the desktop, and reports the desktop's lock-key state |
 | cursor | The pointer's shape as it changes, as an alpha cursor |
@@ -291,10 +291,62 @@ cursor shape carries position (0, 0). A client in server mode that
 draws the pointer from the server's reports, as spice-gtk does, draws
 it in the wrong place. Use client mode, which ryll uses.
 
+**The agent.** A SPICE server usually relays the main channel's agent
+messages to a helper program running in the guest. Andris runs inside
+the desktop it exports, so it plays that agent itself: the agent is
+connected from the moment the main channel opens, and stays connected
+until the channel closes. There is nothing to install or start in the
+desktop. The agent carries the clipboard and desktop resizing, and is
+what makes a client's "share clipboard" and "resize guest to window"
+options work. A client must reassemble agent messages that span several
+chunks, which ryll does only from a revision with agent reassembly, so
+use ryll from `develop` as described in
+[Connecting with ryll](#connecting-with-ryll).
+
+**Copy and paste.** The desktop's `CLIPBOARD` selection and the
+client's clipboard are shared in both directions, as UTF-8 text. When
+the client copies, andris fetches the text at once and puts it on the
+desktop's clipboard; when text is copied on the desktop, andris offers
+it to the client, and sends it when the client asks. Text over 16 MiB
+is dropped, with a warning in the log, and the clipboard keeps what it
+held. Only text on `CLIPBOARD` crosses: the `PRIMARY` selection (select
+to copy, middle-click to paste) and images are not carried, and a
+client's request for anything else is answered with an empty clipboard.
+Text identical to the text that last crossed, in either direction, is
+not sent again; this stops two clipboard bridges on one machine
+passing a copy back and forth for ever (see
+[xrdp.md](xrdp.md#clipboard-with-rdp-and-spice-together)). If the
+desktop's clipboard owner does not answer a request for its text within
+10 seconds, andris gives up on that fetch and offers the client
+nothing.
+
+**What the clipboard shares.** Because andris offers each copy as it
+is made, and ryll fetches what it is offered at once, every text copied
+on the desktop reaches the connected SPICE client whether or not anyone
+pastes it there: text copied from a password manager included. A
+password manager that clears the clipboard later withdraws the offer,
+but the client already has the text. Connect only clients you would
+trust with the session's clipboard. Andris offers nothing to a client
+that does not announce clipboard sharing.
+
+**Resizing.** When the client asks for a desktop size, as ryll does
+when its window is resized, andris changes the X server's size through
+RandR, and the display surface follows (see Display above). A size
+outside what the X server allows is clamped to its range: the client
+is told the size it actually got, or, if the desktop already has the
+clamped size, that the request was refused. The resize needs an X
+server whose RandR allows a client to change the screen size. Xvfb
+does, up to the size it started with. xorgxrdp does not (see
+[xrdp.md](xrdp.md#resizing)). Where it is refused, the client gets an
+error reply, the desktop keeps its size, and andris logs one warning
+for the connection, not one for each request. RandR is optional:
+without it, or without RandR 1.2, andris still serves the desktop and
+refuses every resize in the same way.
+
 ### Not supported
 
-- No guest agent, so no clipboard sharing and no resizing the
-  desktop from the client.
+- Clipboard images and the `PRIMARY` selection, and any resize the X
+  server refuses.
 - No video streams: the desktop is always sent as images.
 - No audio.
 - One client at a time.

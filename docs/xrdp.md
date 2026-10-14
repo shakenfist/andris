@@ -115,9 +115,11 @@ journalctl --user -u andris@10 -f     # follow it
 
 Andris logs to stderr, which the journal captures. Set `RUST_LOG` in
 `andris.env` to change the log level. At `debug` and `trace` andris
-may log details of the client's input, such as the keys it sends, to
-the journal, which members of the `adm` and `systemd-journal` groups
-can read; use those levels only while troubleshooting.
+may log details of the client's input, such as the keys it sends, and
+an eight-digit hash of each clipboard text, from which a short text
+such as a password can be found by guessing, to the journal, which
+members of the `adm` and `systemd-journal` groups can read; use those
+levels only while troubleshooting.
 
 Andris's exit status says why it stopped:
 
@@ -233,6 +235,46 @@ visible to the other. This is what to expect.
   resizes the session, or reconnects with another size, the X server
   changes size and andris tells the SPICE client about a new surface of
   that size. A client that handles a resize, as ryll does, follows it.
+
+## Resizing
+
+On xrdp the desktop follows the RDP client's size, and a resize asked
+for over SPICE is refused. xorgxrdp does not let an X client change the
+screen size: its RandR code accepts a size change only when it comes
+from xrdp, as the RDP client's own, and answers anything else with
+`BadMatch`, even when no RDP client is connected. Andris reads the size
+back after asking, finds that nothing changed, and tells the SPICE
+client so with an error reply; the desktop keeps the size it has, and
+the log gets one warning per connection (see
+[running.md](running.md#what-a-client-gets)). To change the desktop's
+size, resize the RDP client's window or reconnect it with another size,
+and the SPICE client follows as described above.
+
+## Clipboard with RDP and SPICE together
+
+The clipboard works with an RDP client connected. For RDP, xrdp's
+`xrdp-chansrv` bridges the session's X clipboard to the client; for
+SPICE, andris does. Both are ordinary X clipboard clients of the same
+server, so text copied on either side reaches the desktop, and the
+other bridge then offers it to its own client. Text only: UTF-8 on
+`CLIPBOARD`, as in [running.md](running.md#what-a-client-gets).
+
+- **Each copy crosses once.** With an RDP client and a SPICE client on
+  one machine sharing one clipboard, as when both run on a Mac, a copy
+  made in one reaches the other once rather than bouncing between the
+  bridges. Andris drops an echo of the text that last crossed, in either
+  direction, so copying the same text again sends nothing: the other
+  side already has it.
+- **The SPICE client gets every copy.** chansrv sends text to the RDP
+  client only when it pastes; andris offers the SPICE client each copy
+  as it is made, and ryll fetches it at once, so text copied in the
+  session, passwords included, reaches the SPICE client unpasted (see
+  [running.md](running.md#what-a-client-gets)).
+- **After the RDP client disconnects**, chansrv may keep owning the
+  clipboard and not answer requests for its text until the RDP client
+  reconnects. Andris gives up on a fetch after 10 seconds, so the SPICE
+  client's clipboard is never stuck, but text copied just before the
+  disconnect may not reach it.
 
 ## Trying it without a live session
 

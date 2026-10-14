@@ -58,8 +58,10 @@ async fn init_comes_first_with_the_documented_values() {
         MOUSE_MODE_SERVER | MOUSE_MODE_CLIENT
     );
     assert_eq!(init.current_mouse_mode, MOUSE_MODE_CLIENT);
-    assert_eq!(init.agent_connected, 0);
-    assert_eq!(init.agent_tokens, 0);
+    // Andris plays the guest agent itself, so one is always connected,
+    // with spice-server's window of tokens.
+    assert_eq!(init.agent_connected, 1);
+    assert_eq!(init.agent_tokens, 10);
     assert_eq!(init.ram_hint, 0);
     // Milliseconds since the session began: a fresh session is young.
     assert!(init.multi_media_time < 20_000, "{}", init.multi_media_time);
@@ -147,7 +149,7 @@ async fn unknown_opcode_does_not_close_the_channel() {
     skip_opening(&mut client).await;
 
     client.send(60000, &[1, 2, 3]).await;
-    client.send(main_client::AGENT_START, &[0; 4]).await;
+    client.send(main_client::CLIENT_INFO, &[0; 8]).await;
     // The channel still answers.
     client.send(main_client::ATTACH_CHANNELS, &[]).await;
     let message = client.recv().await;

@@ -258,7 +258,7 @@ diff.
 | 4 | high | opus | none | Skipped | Fixes that step 2 calls for, if any. Gated. See brief 4. |
 | 5 | medium | sonnet | none | Complete | The systemd user unit and the documentation. See brief 5. |
 | 6 | medium | management | none | Complete | Operator acceptance on `:10`, by hand. See brief 6. |
-| 7 | medium | management | none | In progress | Push audit, pull request, queue. See brief 7. |
+| 7 | medium | management | none | Complete | Push audit, pull request, queue. See brief 7. |
 
 Steps 1 and 3 touch different files and may run in parallel. Step 2
 needs step 1, step 4 needs step 2, and step 5 needs steps 3 and 4.
@@ -707,6 +707,10 @@ that is a known gap rather than a tested property.
     `andris.env`, so the unit gives it an empty default;
   - the journal showed colour escape codes, so andris now colours its
     logs only when stderr is a terminal.
+- **A twitchy scroll wheel**, reported by the operator after the run,
+  happens against ordinary X11 sessions too. Ryll sends one wheel
+  click per frame of egui's smoothed scroll, so one notch becomes a
+  burst (shakenfist/ryll#527). Nothing changes in andris.
 - **Step 6 touched `:10` only as above.** No step before it did, and no
   capture of `:10` was kept.
 

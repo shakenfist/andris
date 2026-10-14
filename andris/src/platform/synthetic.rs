@@ -1,6 +1,7 @@
 //! A synthetic platform: a deterministic test pattern, an input sink
 //! that records the most recent [`RECORDED_EVENTS`] events it is given,
-//! and one cursor shape.
+//! one cursor shape, display control that resizes the pattern, and a
+//! clipboard held in memory.
 //!
 //! It backs `--platform synthetic`, for load testing, and the in-process
 //! tests, which drive it through [`SyntheticPlatform`]'s own methods and
@@ -47,6 +48,18 @@
 //! [`SyntheticPlatform::vanish`] makes the desktop go for good, as an X
 //! server that exits does.
 //!
+//! # Display control and the clipboard
+//!
+//! [`DisplayControl::set_size`] resizes the pattern as
+//! [`SyntheticPlatform::set_size`] does, unless
+//! [`SyntheticPlatform::refuse_resizes`] has made it refuse, as an X
+//! server that does not let clients resize it does.
+//! [`SyntheticPlatform::copy_text`] puts text on the clipboard as if
+//! another program had copied it, and reports it; text the server sets
+//! through [`Clipboard::set`] is kept for
+//! [`SyntheticPlatform::clipboard_set`] and is not reported back; it
+//! replaces what was copied, so `None` is reported in its place.
+//!
 //! Every change is reported while the state lock is still held, so
 //! damage and resizes reach the hub in the order the changes were made:
 //! two racing [`SyntheticPlatform::set_size`] calls cannot leave the hub
@@ -62,9 +75,9 @@ use anyhow::{Result, anyhow, bail};
 use tokio::sync::watch;
 
 use super::{
-    Capture, CursorReceiver, CursorShape, CursorSource, DamageHub, DamageSubscription,
-    DisplayGeometry, EvdevCode, Frame, GoneSender, GoneSignal, InputEvent, InputSink, LockState,
-    Patch, Platform, Rectangle, ScreenSource, Size,
+    Capture, Clipboard, ClipboardReceiver, CursorReceiver, CursorShape, CursorSource, DamageHub,
+    DamageSubscription, DisplayControl, DisplayGeometry, EvdevCode, Frame, GoneSender, GoneSignal,
+    InputEvent, InputSink, LockState, Patch, Platform, Rectangle, Resize, ScreenSource, Size,
 };
 
 /// The side of the moving square, in pixels.
@@ -120,6 +133,12 @@ struct State {
     failing_captures: u32,
     /// How many of the next size reads fail.
     failing_size_reads: u32,
+    /// Whether [`DisplayControl::set_size`] refuses.
+    refusing_resizes: bool,
+    /// The text the server last set on the clipboard, and how many times
+    /// it has set any.
+    clipboard_set: Option<Arc<str>>,
+    clipboard_sets: u64,
 }
 
 /// The synthetic platform. Create it with [`SyntheticPlatform::new`] and
@@ -130,6 +149,8 @@ pub struct SyntheticPlatform {
     state: Mutex<State>,
     events: Mutex<VecDeque<InputEvent>>,
     cursor: watch::Sender<Option<Arc<CursorShape>>>,
+    /// The text other programs put on the clipboard.
+    clipboard: watch::Sender<Option<Arc<str>>>,
     damage: DamageHub,
     /// Set by [`SyntheticPlatform::vanish`].
     gone: GoneSender,
@@ -160,22 +181,28 @@ impl SyntheticPlatform {
                 locks: LockState::default(),
                 failing_captures: 0,
                 failing_size_reads: 0,
+                refusing_resizes: false,
+                clipboard_set: None,
+                clipboard_sets: 0,
             }),
             events: Mutex::new(VecDeque::new()),
             cursor: watch::Sender::new(Some(Arc::new(default_cursor()))),
+            clipboard: watch::Sender::new(None),
             damage: DamageHub::new(size),
             gone,
             gone_signal,
         }))
     }
 
-    /// This platform as all four seams, and its gone signal.
+    /// This platform as all six seams, and its gone signal.
     pub fn platform(self: &Arc<Self>) -> Platform {
         Platform {
             geometry: self.clone(),
             screen: self.clone(),
             input: self.clone(),
             cursor: self.clone(),
+            display_control: self.clone(),
+            clipboard: self.clone(),
             gone: self.gone_signal.clone(),
         }
     }
@@ -275,11 +302,33 @@ impl SyntheticPlatform {
     fn resize_scene(&self, size: Size) -> Result<MutexGuard<'_, State>> {
         size.check()?;
         let mut state = self.state()?;
-        state.size = size;
-        if state.square_x + SQUARE_SIZE > size.width {
-            state.square_x = 0;
-        }
+        resize_state(&mut state, size);
         Ok(state)
+    }
+
+    /// Make [`DisplayControl::set_size`] refuse every resize, or stop it
+    /// refusing, as an X server that does not let clients resize it.
+    pub fn refuse_resizes(&self, refuse: bool) -> Result<()> {
+        self.state()?.refusing_resizes = refuse;
+        Ok(())
+    }
+
+    /// Put `text` on the clipboard, or empty it with `None`, as another
+    /// program on the desktop would, and report it to
+    /// [`Clipboard::changes`]. The same text again is reported again.
+    pub fn copy_text(&self, text: Option<&str>) {
+        self.clipboard.send_replace(text.map(Arc::from));
+    }
+
+    /// The text the server last put on the clipboard with
+    /// [`Clipboard::set`], if any.
+    pub fn clipboard_set(&self) -> Result<Option<Arc<str>>> {
+        Ok(self.state()?.clipboard_set.clone())
+    }
+
+    /// How many times the server has put text on the clipboard.
+    pub fn clipboard_sets(&self) -> Result<u64> {
+        Ok(self.state()?.clipboard_sets)
     }
 
     /// The events injected so far, oldest first: at most the last
@@ -426,6 +475,57 @@ impl InputSink for SyntheticPlatform {
 impl CursorSource for SyntheticPlatform {
     fn subscribe(&self) -> CursorReceiver {
         self.cursor.subscribe()
+    }
+}
+
+impl DisplayControl for SyntheticPlatform {
+    /// Resizes the pattern, reporting the resize, unless
+    /// [`SyntheticPlatform::refuse_resizes`] says to refuse. A size
+    /// [`Size::check`] refuses is refused too.
+    fn set_size(&self, size: Size) -> Result<Resize> {
+        // Reported under the lock, as every change is: see the module.
+        let mut state = self.state()?;
+        if state.refusing_resizes {
+            return Ok(Resize::Refused(
+                "the synthetic desktop is set to refuse resizes".to_string(),
+            ));
+        }
+        if state.size == size {
+            return Ok(Resize::Unchanged);
+        }
+        if let Err(error) = size.check() {
+            return Ok(Resize::Refused(format!("{error:#}")));
+        }
+        resize_state(&mut state, size);
+        self.damage.resize(size)?;
+        Ok(Resize::Applied)
+    }
+}
+
+impl Clipboard for SyntheticPlatform {
+    fn changes(&self) -> ClipboardReceiver {
+        self.clipboard.subscribe()
+    }
+
+    /// Keeps the text for [`SyntheticPlatform::clipboard_set`], and does
+    /// not report it to [`Clipboard::changes`]; what another program
+    /// copied is gone, so that is reported as `None`.
+    fn set(&self, text: Arc<str>) -> Result<()> {
+        let mut state = self.state()?;
+        state.clipboard_set = Some(text);
+        state.clipboard_sets = state.clipboard_sets.saturating_add(1);
+        self.clipboard
+            .send_if_modified(|held| held.take().is_some());
+        Ok(())
+    }
+}
+
+/// Make `state` a desktop of `size`, keeping the square where it is if it
+/// still fits and moving it to the left edge otherwise.
+fn resize_state(state: &mut State, size: Size) {
+    state.size = size;
+    if state.square_x + SQUARE_SIZE > size.width {
+        state.square_x = 0;
     }
 }
 
@@ -979,6 +1079,77 @@ mod tests {
         assert_eq!(*cursor.borrow_and_update().clone().unwrap(), dot);
         platform.set_cursor(None);
         assert!(cursor.borrow_and_update().is_none());
+    }
+
+    #[test]
+    fn display_control_resizes_unless_refusing() {
+        let platform = SyntheticPlatform::new(SIZE).unwrap();
+        let control = platform.platform().display_control;
+        let subscription = platform.subscribe_damage().unwrap();
+        subscription.take().unwrap();
+        let smaller = Size {
+            width: 640,
+            height: 480,
+        };
+        assert_eq!(control.set_size(smaller).unwrap(), Resize::Applied);
+        assert_eq!(platform.size().unwrap(), smaller);
+        assert_eq!(subscription.take().unwrap(), Region::full(smaller));
+        assert_eq!(control.set_size(smaller).unwrap(), Resize::Unchanged);
+
+        let zero = Size {
+            width: 0,
+            height: 480,
+        };
+        assert!(matches!(
+            control.set_size(zero).unwrap(),
+            Resize::Refused(_)
+        ));
+
+        platform.refuse_resizes(true).unwrap();
+        assert!(matches!(
+            control.set_size(SIZE).unwrap(),
+            Resize::Refused(_)
+        ));
+        assert_eq!(
+            platform.size().unwrap(),
+            smaller,
+            "a refusal changes nothing"
+        );
+        assert!(damaged(&subscription).is_empty());
+        platform.refuse_resizes(false).unwrap();
+        assert_eq!(control.set_size(SIZE).unwrap(), Resize::Applied);
+    }
+
+    #[test]
+    fn the_clipboard_reports_copies_and_keeps_what_is_set() {
+        let platform = SyntheticPlatform::new(SIZE).unwrap();
+        let clipboard = platform.platform().clipboard;
+        let mut changes = clipboard.changes();
+        assert!(changes.borrow_and_update().is_none());
+
+        platform.copy_text(Some("copied"));
+        assert!(changes.has_changed().unwrap());
+        assert_eq!(changes.borrow_and_update().as_deref(), Some("copied"));
+        platform.copy_text(Some("copied"));
+        assert!(
+            changes.has_changed().unwrap(),
+            "the same text again is a change"
+        );
+        changes.mark_unchanged();
+
+        clipboard.set(Arc::from("pasted")).unwrap();
+        assert!(changes.has_changed().unwrap());
+        assert!(
+            changes.borrow_and_update().is_none(),
+            "the copied text is gone, and andris's own is not reported"
+        );
+        assert_eq!(platform.clipboard_set().unwrap().as_deref(), Some("pasted"));
+        assert_eq!(platform.clipboard_sets().unwrap(), 1);
+        clipboard.set(Arc::from("pasted again")).unwrap();
+        assert!(!changes.has_changed().unwrap(), "nothing more has gone");
+
+        platform.copy_text(None);
+        assert!(changes.borrow_and_update().is_none());
     }
 
     #[test]

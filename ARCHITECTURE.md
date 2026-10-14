@@ -21,14 +21,14 @@ SPICE.
 | Listener and link | `server/mod.rs`, `link.rs`, `tls.rs` | One accept task per listener. A connection holds one of 8 handshake permits, and one of 4 slots for its source address, while it links and authenticates with the ticket, with a time limit on every step and a delay before a wrong ticket is refused. With TLS configured the plain listener only redirects clients to the TLS listener, under its own permits |
 | Session registry | `server/session.rs` | Holds the one session served at a time. A main-channel link that authenticates begins a session and cancels the previous one; secondary channels must name the session's id. The session carries the mouse mode and a cancel signal every channel task races against, and holds one channel of each type: a new link of a type replaces the old channel |
 | Channel framing | `server/channel.rs`, `opcodes.rs` | Mini-header message framing, the messages every channel shares, and the ack window. Each channel sends only variants of its own opcode enum |
-| Main channel | `server/main_channel.rs` | `INIT`, the channel list, mouse mode and pings |
+| Main channel | `server/main_channel.rs`, `server/agent.rs` | `INIT`, the channel list, mouse mode and pings. `agent.rs` plays the guest agent on the main channel, since andris runs inside the desktop it exports: agent flow control, the clipboard (`CLIPBOARD` as UTF-8 text, both ways) and monitors config, which becomes a resize request to the platform |
 | Display channel | `server/display.rs`, `stats.rs` | The primary surface; the loop that turns damage into frames under the frame-rate cap and the ack window; the scrub; the lossless refresh of JPEG areas; the client's compression preference; and the per-session metrics |
 | Updates | `server/updates/` | Keeps a shadow of what the client was last sent, compares each capture with it in 64x64 tiles, merges the changed tiles into at most 32 rectangles, splits any over 4 MiB, and encodes each from the shadow as JPEG (photographic areas, when the client leaves the choice to the server), LZ4 or an uncompressed bitmap |
 | Inputs channel | `server/inputs.rs`, `keymap.rs` | Decodes set-1 scancodes to evdev codes, tracks lock keys, applies pointer events according to the mouse mode |
 | Cursor channel | `server/cursor.rs` | Sends each cursor shape the platform reports as an alpha cursor |
-| Platform traits | `platform/mod.rs`, `damage.rs` | `DisplayGeometry`, `ScreenSource`, `InputSink` and `CursorSource`, bundled as a `Platform`. They use no SPICE types, and keys cross them as Linux evdev codes. `ScreenSource` captures rectangles or the whole desktop, and hands each subscriber the damage reported since it last took some, as a region of 64x64 tiles |
-| Synthetic platform | `platform/synthetic.rs` | A deterministic test pattern that reports damage as it moves, an input sink that records events, and one cursor shape; for tests, load testing and `--platform synthetic` |
-| X11 platform | `platform/x11/` | XDamage on the root window, MIT-SHM capture through a shared memfd with `GetImage` as the fallback, XTEST input, XFIXES cursor and XKB key names, each on its own connection and thread; the MIT-SHM mapping is andris's only `unsafe` code (`platform/x11/shm.rs`; the rest of the crate denies it), because mapping memory that other processes write into cannot be expressed in safe Rust; it is kept sound by never making a Rust reference into the mapping and copying pixels out through raw pointers, so a concurrent writer can only tear pixels; the input queue is bounded, with room kept for releases; refuses an X server it cannot read as BGRX |
+| Platform traits | `platform/mod.rs`, `damage.rs` | `DisplayGeometry`, `ScreenSource`, `InputSink`, `CursorSource`, `DisplayControl` (resize the desktop, or refuse) and `Clipboard` (the desktop's clipboard text), bundled as a `Platform`. They use no SPICE types, and keys cross them as Linux evdev codes. `ScreenSource` captures rectangles or the whole desktop, and hands each subscriber the damage reported since it last took some, as a region of 64x64 tiles |
+| Synthetic platform | `platform/synthetic.rs` | A deterministic test pattern that reports damage as it moves, an input sink that records events, one cursor shape, a resizable pattern that can be made to refuse resizes, and an in-memory clipboard; for tests, load testing and `--platform synthetic` |
+| X11 platform | `platform/x11/` | XDamage on the root window, MIT-SHM capture through a shared memfd with `GetImage` as the fallback, XTEST input, XFIXES cursor and XKB key names, each on its own connection and thread (five connections: capture, which also makes the RandR resizes, input, cursor, damage, and the clipboard, whose thread has a small timer thread that wakes it at its deadlines); the MIT-SHM mapping is andris's only `unsafe` code (`platform/x11/shm.rs`; the rest of the crate denies it), because mapping memory that other processes write into cannot be expressed in safe Rust; it is kept sound by never making a Rust reference into the mapping and copying pixels out through raw pointers, so a concurrent writer can only tear pixels; the input queue is bounded, with room kept for releases; refuses an X server it cannot read as BGRX |
 
 Around the code: `Makefile` and `.devcontainer/` run cargo in a
 container; `scripts/e2e.sh` drives the end-to-end test;
@@ -137,10 +137,10 @@ built.
   `DRAW_COPY` images, with no QXL draw-op emulation. Damage says
   where to look, and comparing with what the client was last sent
   says what to send. Video streams are yet to come.
-- **Platform seams.** Capture, input injection and the cursor sit
-  behind traits, with an X11 implementation and a synthetic one, so
-  that a Wayland backend can be added later without restructuring.
-  Display control, clipboard and audio are yet to be added.
+- **Platform seams.** Capture, input injection, the cursor, display
+  control and the clipboard sit behind traits, with an X11
+  implementation and a synthetic one, so that a Wayland backend can be
+  added later without restructuring. Audio is yet to be added.
 - **Ryll is the reference client.** Images are LZ4 or uncompressed;
   other SPICE clients work only where they support those encodings.
 - **One client at a time.** A new connection replaces the old one.

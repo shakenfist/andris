@@ -10,8 +10,9 @@ or through the [kerbside](https://github.com/shakenfist/kerbside)
 SPICE proxy.
 
 Andris serves the main, display, inputs and cursor channels to one
-client at a time. It does not yet support clipboard sharing,
-resizing, video streams or audio. This documentation covers how to
+client at a time, and shares text clipboards and resizes the desktop
+through the main channel. It does not yet support video streams or
+audio. This documentation covers how to
 run andris, how to build and test it, and the plans that describe
 what it is meant to become.
 
@@ -20,7 +21,8 @@ what it is meant to become.
 - [Running andris](running.md) - Building, options, the ticket file,
   TLS, connecting with ryll and fronting andris with kerbside
 - [Running andris alongside xrdp](xrdp.md) - The systemd user unit, what
-  happens when the session ends, and how RDP and SPICE input interleave
+  happens when the session ends, and how RDP and SPICE input,
+  clipboard and resizing interact
 - [Development](development.md) - Building, testing, pre-commit, CI
   and the merge queue
 - [Plans index](plans/index.md) - Every planning document, with its

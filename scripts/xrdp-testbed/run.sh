@@ -25,10 +25,12 @@
 #   channels  ryll's log shows the main, display, inputs and cursor
 #             channels connected.
 #
-# If they pass, the interleaving checks X1 to X7 follow
+# If they pass, the interleaving checks X1 to X11 follow
 # (scripts/e2e-xrdp-drive.py): keys from RDP and SPICE in turn, held
 # modifiers, lock keys, an RDP resize, an RDP reconnect with the same and
-# with another layout, and last, the session ending. Andris must handle
+# with another layout, clipboard text each way, no clipboard loop through
+# a stand-in for a shared pasteboard, a SPICE resize refused, and last,
+# the session ending. Andris must handle
 # that by exiting by itself, promptly and with status 1, the status it
 # gives when the desktop goes, rather than hanging, crashing or exiting
 # 0.
@@ -278,7 +280,10 @@ ticket=$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')
     "$SPICE_PORT" "$ticket" >"$work/andris.vv")
 chown "$TESTER:" "$work/ticket" "$work/andris.vv"
 
-start andris "${as_tester[@]}" RUST_LOG=info "$ANDRIS" --platform x11 --display "$session" \
+# Debug for the clipboard, whose lines carry a hash of each text, so that a
+# failure of X8 to X10 shows which text went where.
+andris_log=info,andris::server::agent=debug,andris::platform::x11::clipboard=debug
+start andris "${as_tester[@]}" RUST_LOG="$andris_log" "$ANDRIS" --platform x11 --display "$session" \
     --listen "127.0.0.1:$SPICE_PORT" --ticket-file "$work/ticket"
 wait_until "$ANDRIS_BOUND" andris "andris listening on $SPICE_PORT" \
     grep -q "plain listener ready" "$work/andris.log"
@@ -327,7 +332,7 @@ if [ "$failures" -ne 0 ]; then
     exit 1
 fi
 
-# The interleaving checks, X1 to X7 (scripts/e2e-xrdp-drive.py). They
+# The interleaving checks, X1 to X11 (scripts/e2e-xrdp-drive.py). They
 # restart ryll and FreeRDP with the commands above, and end the session
 # last, in X7. Andris is this script's child, so X7's last part, andris's
 # exit status, is checked here once the drive has seen it exit.

@@ -6,7 +6,8 @@
 //!   and keeps the ack window;
 //! - [`opcodes`] lists what each channel may send;
 //! - [`main_channel`], [`display`], [`inputs`] and [`cursor`] serve the
-//!   four channels;
+//!   four channels, and [`agent`] plays the guest agent on the main
+//!   channel;
 //! - [`updates`] compares captures with what the display channel last
 //!   sent, and encodes what changed as `DRAW_COPY`s;
 //! - [`keymap`] decodes the inputs channel's set-1 scancodes to evdev
@@ -34,6 +35,7 @@
 //! time limit than the rest; see [`HandshakeTimeouts`]. At most
 //! [`MAX_KEY_GENERATIONS`] RSA keys are generated at once.
 
+pub mod agent;
 pub mod channel;
 pub mod cursor;
 pub mod display;

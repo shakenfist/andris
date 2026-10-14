@@ -51,12 +51,27 @@ rectangle, waits for the damage, and captures it through both MIT-SHM
 and `GetImage`. It then detaches andris's shared segment from a second
 connection, finding it through X-Resource 1.2 as another client
 could, and checks that capture recovers: first with a fresh segment,
-then, after a second detach, through `GetImage`. That test reads the
-display from `ANDRIS_TEST_DISPLAY`. When the variable is unset, as
-under `make test`, it prints that it is skipping and passes. The script then starts a full-screen
-window that logs the keys it receives, starts the debug andris against
-that display, and connects ryll's headless client through a `.vv`
-file. Last, it asserts, over ryll's control socket:
+then, after a second detach, through `GetImage`. A second test resizes
+the display through andris's RandR display control: smaller, wider
+than Xvfb allows (clamped to its widest), narrower and taller, and back
+to the start, each reaching damage subscribers as a resize; then larger
+than Xvfb allows, which is refused. It checks that andris leaves none
+of the modes it creates behind. Four more check the clipboard with
+`xclip`: copies on the display reach andris, including a copy of the
+same text again, text over a megabyte (which arrives in pieces, by
+INCR), and text an owner offers only as Latin-1; text andris is given
+pastes on the display, as UTF-8, Latin-1 where it can be, and in pieces
+when large, while a requestor that stops taking pieces holds up no
+other paste; another program that takes the clipboard from andris is
+followed, and andris stops serving; and an owner that never answers is
+given up on after andris's 10-second timeout, while andris still takes
+and serves text meanwhile. The tests take turns with the display, which
+they read from `ANDRIS_TEST_DISPLAY`. When the variable is unset, as
+under `make test`, each prints that it is skipping and passes. The
+script then starts a full-screen window that logs the keys it
+receives, starts the debug andris against that display, and connects
+ryll's headless client through a `.vv` file. Last, it asserts, over
+ryll's control socket:
 
 - **frames**: a frame of the window arrived;
 - **keys**: two keys reached the window;
@@ -64,7 +79,18 @@ file. Last, it asserts, over ryll's control socket:
   driver waits for quiet first), no draw arrives for two seconds, since andris sends frames only on damage;
 - **a small change**: a key makes the window repaint a 64x64 square,
   which must reach the client in fewer draws than there are 64-row
-  bands in the screen.
+  bands in the screen;
+- **the clipboard**: text set with ryll's `clipboard_set` pastes on the
+  display with `xclip`, and text copied there with `xclip` reaches
+  ryll's `clipboard_get`, each way at three sizes: within one 2048-byte
+  agent chunk, over it, and over the megabyte above which X clients
+  send text in pieces, by INCR. A paste of the largest by hand checks
+  that andris served it by INCR;
+- **resizes**: ryll's `resize` to a smaller size and back each reach
+  ryll as a new surface; two sizes larger than Xvfb's `-screen` size
+  are refused, andris logs the refusal once, and the surface keeps its
+  size. The resize checks read andris's log, and ryll's, whose debug
+  lines record each agent reply.
 
 It also checks ryll's log for all four channels, and stops ryll with
 SIGINT and andris with SIGTERM; both must exit 0. Last, it starts a
@@ -101,7 +127,27 @@ checks, after a smoke test, that:
 - an RDP resize reaches ryll as a new surface;
 - an RDP disconnect and reconnect leave andris and ryll connected;
 - an RDP reconnect with another layout changes what SPICE keys type;
+- two lines copied on FreeRDP's display reach ryll with the LF line
+  ends they started with, though RDP carries them as CRLF, and two
+  lines set in ryll paste on FreeRDP's display;
+- the clipboard does not loop when the RDP client and ryll share one
+  clipboard, as they do on a Mac. A stand-in for that shared clipboard,
+  [`scripts/e2e-pasteboard.py`](https://github.com/shakenfist/andris/blob/develop/scripts/e2e-pasteboard.py),
+  joins FreeRDP's display and ryll, so each copy can come back into the
+  session through the other client; after a copy of two lines in the
+  session and one on FreeRDP's display, andris must log one crossing
+  for each, and none in the five seconds after, though RDP brings each
+  back with CRLF line ends;
+- a resize from ryll is refused, since xorgxrdp does not let clients
+  resize it: andris logs it once, ryll keeps the session's size, and an
+  RDP resize afterwards still reaches ryll;
 - ending the session makes andris exit with status 1.
+
+Every clipboard check copies text not used before, because FreeRDP
+and xrdp keep what they last fetched. Andris runs there with debug
+logging for the clipboard, and both its log and the stand-in's carry a
+hash of each text that passes, so a failed check shows which text went
+where without the text itself.
 
 The container has no network, and its own `/tmp`, so no X server or
 xrdp session on the host can be reached from it. Never aim a test that
@@ -113,7 +159,7 @@ and install its packages; the image is rebuilt only when its inputs
 change. It is not part of CI: what it guards is xrdp's behaviour, and
 a remote-desktop client driven through `xdotool` on a shared runner is
 the sort of check that flakes. A warm run, with the image and binaries
-current, takes about 27 seconds.
+current, takes about 45 seconds.
 
 ### The JPEG corpus measurement
 

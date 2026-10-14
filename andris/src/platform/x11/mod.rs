@@ -1,16 +1,18 @@
 //! The X11 backend: captures an existing X display, injects input into
-//! it, and follows its cursor, through x11rb.
+//! it, and follows its cursor and clipboard, through x11rb.
 //!
 //! # Threads
 //!
-//! x11rb's `RustConnection` is synchronous, so the backend opens four
+//! x11rb's `RustConnection` is synchronous, so the backend opens five
 //! connections to the display, each owned by its own thread:
 //!
 //! - **capture** answers size and capture requests with `GetGeometry` on
 //!   the root window, and one image per rectangle asked for: with
 //!   MIT-SHM's `ShmGetImage` into a memfd shared with the server where
 //!   that works, and with `GetImage` otherwise (see [`capture`] and
-//!   [`shm`]). Which is used, and why, is logged once at startup;
+//!   [`shm`]). Which is used, and why, is logged once at startup. It
+//!   also makes the resizes a client asks for, with RandR (see
+//!   [`randr`]), which are rare and answer in round trips;
 //! - **input** injects events with XTest and reads the lock state from
 //!   XKB's indicators. Both go through one queue, so a lock-state read
 //!   sees every event queued before it;
@@ -20,13 +22,20 @@
 //!   object on the root window, and on the root window's
 //!   `ConfigureNotify`, and reports them to the platform's
 //!   [`DamageHub`]: damage as damage, a new size as a resize (see
-//!   [`damage`]).
+//!   [`damage`]);
+//! - **clipboard** follows the `CLIPBOARD` selection's owner with XFixes,
+//!   fetches each new owner's text and publishes it through a `watch`
+//!   channel, and takes the selection to serve the text andris is given.
+//!   It blocks on events and keeps a deadline on every transfer, so a
+//!   program that never answers cannot stall it; a small timer thread
+//!   wakes it when a deadline passes (see [`clipboard`]).
 //!
 //! Separate connections keep a key press from queueing behind a
-//! multi-megabyte capture, and let the cursor and damage threads block
-//! on events while the capture thread serves round trips. The threads talk to the rest of andris
-//! through `std::sync::mpsc` queues, so [`InputSink::inject`] only
-//! enqueues and never blocks.
+//! multi-megabyte capture, and let the cursor, damage and clipboard
+//! threads block on events while the capture thread serves round trips.
+//! The threads talk to the rest of andris through `std::sync::mpsc`
+//! queues, so [`InputSink::inject`] only enqueues and never blocks, as
+//! [`Clipboard::set`] does.
 //!
 //! The input queue is bounded, so a client flooding keys cannot grow it
 //! without limit: [`InputSink::inject`] fails once [`INPUT_QUEUE_LIMIT`]
@@ -47,12 +56,13 @@
 //!
 //! Dropping the platform closes the capture and input queues, and those
 //! threads exit; the capture thread detaches its MIT-SHM segment as it
-//! goes. The cursor and damage threads are blocked waiting for X events,
-//! so the drop also sends each a `ClientMessage` to an unmapped window
-//! of its own, which wakes it to exit. Any client of the display can find
-//! those windows with `QueryTree` and send them a `ClientMessage` too, so
-//! the drop's carries a random cookie, chosen once per process, and a
-//! thread stops only for a message that carries it (see [`is_wake`]).
+//! goes. The cursor, damage and clipboard threads are blocked waiting for
+//! X events, so the drop also sends each a `ClientMessage` to an unmapped
+//! window of its own, which wakes it to exit; the clipboard's timer
+//! thread follows it. Any client of the display can find those windows
+//! with `QueryTree` and send them a `ClientMessage` too, so the drop's
+//! carries a random cookie, chosen once per process, and a thread stops
+//! only for a message that carries it (see [`is_wake`]).
 //!
 //! # Keys
 //!
@@ -62,11 +72,13 @@
 
 mod capture;
 mod checks;
+mod clipboard;
 mod cursor;
 mod damage;
 mod evdev_names;
 mod input;
 mod keymap;
+mod randr;
 // The crate's only unsafe code: the shared memory mapping. See the
 // module's documentation for why it is sound.
 #[allow(unsafe_code)]
@@ -92,15 +104,17 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::x11_utils::X11Error;
 
 use super::{
-    Capture, CursorReceiver, CursorSource, DamageHub, DamageSubscription, DisplayGeometry, Gone,
-    GoneSender, GoneSignal, InputEvent, InputSink, LockState, Platform, Rectangle, ScreenSource,
-    Size,
+    Capture, Clipboard, ClipboardReceiver, CursorReceiver, CursorSource, DamageHub,
+    DamageSubscription, DisplayControl, DisplayGeometry, Gone, GoneSender, GoneSignal, InputEvent,
+    InputSink, LockState, Platform, Rectangle, Resize, ScreenSource, Size,
 };
 use capture::{CaptureRequest, Capturer, serve_capture};
 use checks::ServerFacts;
+use clipboard::{ClipboardHandle, serve_clipboard, serve_timer, start_clipboard};
 use cursor::{serve_cursor, start_cursor};
 use damage::{DamageThread, serve_damage, start_damage};
 use input::{Injector, InputQueue, InputRequest, serve_input};
+use randr::Randr;
 
 /// How many events [`InputSink::inject`] lets wait for the input thread.
 pub const INPUT_QUEUE_LIMIT: usize = 8192;
@@ -178,6 +192,8 @@ pub struct X11Platform {
     cursor_waker: Waker,
     /// Wakes the damage thread on drop.
     damage_waker: Waker,
+    /// Wakes the clipboard thread on drop.
+    clipboard_waker: Waker,
     /// The desktop's damage, for every subscriber; the damage thread
     /// reports to it.
     damage: Arc<DamageHub>,
@@ -186,6 +202,9 @@ pub struct X11Platform {
     /// Set by whichever backend thread first finds its connection dead;
     /// each holds a sender.
     gone: GoneSignal,
+    /// Queues text for the clipboard thread, and holds the desktop's text
+    /// as it reports it.
+    clipboard: ClipboardHandle,
 }
 
 impl X11Platform {
@@ -195,14 +214,17 @@ impl X11Platform {
     ///
     /// Fails, saying why, if the display cannot be reached, if its root
     /// window is not 32-bit BGRX, or if it lacks XTEST, XFIXES, XKEYBOARD
-    /// or DAMAGE.
+    /// or DAMAGE. Without RandR 1.2 it still connects, and refuses every
+    /// resize.
     pub fn connect(name: &str) -> Result<Arc<Self>> {
         Self::connect_with(name, X11Options::default())
     }
 
     /// [`X11Platform::connect`], set up as `options` says.
     pub fn connect_with(name: &str, options: X11Options) -> Result<Arc<Self>> {
-        // The input connection first: the checks need its XKB handshake.
+        // The input and capture connections first: the checks need the
+        // input connection's XKB handshake, and the capture connection's
+        // RandR handshake.
         let (input_conn, screen) = open(name, "input")?;
         let screen = input_conn
             .setup()
@@ -210,9 +232,18 @@ impl X11Platform {
             .get(screen)
             .cloned()
             .with_context(|| format!("X display {name} has no screen {screen}"))?;
-        let facts = server_facts(&input_conn, &screen)
+        let (capture_conn, _) = open(name, "capture")?;
+        let facts = server_facts(&input_conn, &capture_conn, &screen)
             .with_context(|| format!("asking X display {name} what it supports"))?;
         checks::check(name, &facts)?;
+        let randr = match (checks::resize_refusal(&facts), facts.randr) {
+            (None, Some(version)) => Ok(Randr::new(version)),
+            (refusal, _) => {
+                let why = refusal.unwrap_or_else(|| "the X server has no RandR".to_string());
+                info!("andris will refuse to resize X display {name}, because {why}");
+                Err(why)
+            }
+        };
         let root = screen.root;
         info!(
             depth = screen.root_depth,
@@ -228,7 +259,6 @@ impl X11Platform {
             .with_context(|| format!("following damage on X display {name}"))?;
         let damage = Arc::new(DamageHub::new(size));
 
-        let (capture_conn, _) = open(name, "capture")?;
         let unix = shm::is_unix_socket(capture_conn.stream().as_fd());
         let using_shm = Arc::new(AtomicBool::new(false));
         let capturer = Capturer::new(
@@ -237,6 +267,7 @@ impl X11Platform {
             size,
             shm::refusal(options.shm, facts.shm_fd, unix),
             using_shm.clone(),
+            randr,
         )
         .with_context(|| format!("setting up capture of X display {name}"))?;
 
@@ -246,6 +277,11 @@ impl X11Platform {
             .with_context(|| format!("following the cursor on X display {name}"))?;
         let (shapes, cursor) = watch::channel(first_shape.map(Arc::new));
         let (gone_sender, gone) = GoneSignal::new();
+
+        let (clipboard_conn, _) = open(name, "the clipboard")?;
+        let clipboard_conn = Arc::new(clipboard_conn);
+        let started = start_clipboard(clipboard_conn.clone(), root, gone_sender.clone())
+            .with_context(|| format!("following the clipboard on X display {name}"))?;
 
         let (capture, capture_queue) = mpsc::channel();
         let thread_gone = gone_sender.clone();
@@ -272,6 +308,12 @@ impl X11Platform {
             gone: gone_sender,
         };
         spawn("andris-x11-damage", move || serve_damage(thread))?;
+        let clipboard_thread = started.thread;
+        spawn("andris-x11-clipboard", move || {
+            serve_clipboard(clipboard_thread)
+        })?;
+        let timer = started.timer;
+        spawn("andris-x11-clipboard-timer", move || serve_timer(timer))?;
 
         Ok(Arc::new(Self {
             capture,
@@ -285,9 +327,14 @@ impl X11Platform {
                 conn: damage_conn,
                 window: damage_window,
             },
+            clipboard_waker: Waker {
+                conn: clipboard_conn,
+                window: started.handle.window,
+            },
             damage,
             using_shm,
             gone,
+            clipboard: started.handle,
         }))
     }
 
@@ -302,13 +349,15 @@ impl X11Platform {
         }
     }
 
-    /// This platform as all four seams, and its gone signal.
+    /// This platform as all six seams, and its gone signal.
     pub fn platform(self: &Arc<Self>) -> Platform {
         Platform {
             geometry: self.clone(),
             screen: self.clone(),
             input: self.clone(),
             cursor: self.clone(),
+            display_control: self.clone(),
+            clipboard: self.clone(),
             gone: self.gone.clone(),
         }
     }
@@ -317,10 +366,11 @@ impl X11Platform {
 impl Drop for X11Platform {
     fn drop(&mut self) {
         // The capture and input threads stop when their queues close,
-        // which happens as the fields drop. Wake the cursor and damage
-        // threads, which are waiting for X events.
+        // which happens as the fields drop. Wake the cursor, damage and
+        // clipboard threads, which are waiting for X events.
         self.cursor_waker.wake();
         self.damage_waker.wake();
+        self.clipboard_waker.wake();
     }
 }
 
@@ -367,6 +417,33 @@ impl CursorSource for X11Platform {
         let mut receiver = self.cursor.clone();
         receiver.mark_unchanged();
         receiver
+    }
+}
+
+impl DisplayControl for X11Platform {
+    /// Resizes through RandR, on the capture thread; see [`randr`]. Every
+    /// X error is a refusal, naming the error.
+    fn set_size(&self, size: Size) -> Result<Resize> {
+        round_trip(&self.capture, "capture", |reply| {
+            CaptureRequest::SetSize(size, reply)
+        })
+    }
+}
+
+impl Clipboard for X11Platform {
+    /// The text the clipboard thread fetched from the program that last
+    /// took `CLIPBOARD`; see [`clipboard`].
+    fn changes(&self) -> ClipboardReceiver {
+        self.clipboard.changes()
+    }
+
+    /// Queues the text for the clipboard thread, which takes `CLIPBOARD`
+    /// and serves it. Text over [`MAX_CLIPBOARD_TEXT`] is dropped, with a
+    /// warning.
+    ///
+    /// [`MAX_CLIPBOARD_TEXT`]: super::MAX_CLIPBOARD_TEXT
+    fn set(&self, text: Arc<str>) -> Result<()> {
+        self.clipboard.set(text)
     }
 }
 
@@ -513,8 +590,13 @@ fn answer<T>(reply: SyncSender<Result<T>>, result: Result<T, Fault>) -> Option<a
 
 /// What the display's setup and extensions say, for [`checks::check`].
 /// Makes the XKB `UseExtension` handshake on `conn`, which is the input
-/// connection's first XKB request.
-fn server_facts(conn: &RustConnection, screen: &xproto::Screen) -> Result<ServerFacts> {
+/// connection's first XKB request, and the RandR `QueryVersion` handshake
+/// on `capture`, the connection that resizes.
+fn server_facts(
+    conn: &RustConnection,
+    capture: &RustConnection,
+    screen: &xproto::Screen,
+) -> Result<ServerFacts> {
     let setup = conn.setup();
     let bits_per_pixel = setup
         .pixmap_formats
@@ -553,6 +635,7 @@ fn server_facts(conn: &RustConnection, screen: &xproto::Screen) -> Result<Server
         xkb,
         damage: present(xdamage::X11_EXTENSION_NAME)?,
         shm_fd,
+        randr: randr::handshake(capture)?,
     })
 }
 

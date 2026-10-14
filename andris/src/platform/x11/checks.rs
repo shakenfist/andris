@@ -29,6 +29,10 @@ pub struct ServerFacts {
     /// a segment passed as a file descriptor. Optional; without it andris
     /// captures with `GetImage`.
     pub shm_fd: bool,
+    /// The RandR version the server agreed to, `None` without RandR or
+    /// when the server refused the handshake. Optional; see
+    /// [`resize_refusal`].
+    pub randr: Option<(u32, u32)>,
 }
 
 /// The masks that make a 32 bit pixel B, G, R, X in memory on an
@@ -38,7 +42,8 @@ pub const BGRX_MASKS: (u32, u32, u32) = (0x00ff_0000, 0x0000_ff00, 0x0000_00ff);
 /// Fails, naming every problem, unless `facts` describe a server whose
 /// root window `GetImage` returns as BGRX at 32 bits a pixel, and which
 /// has the extensions andris uses for input, the cursor and damage.
-/// MIT-SHM is not required, so [`ServerFacts::shm_fd`] is not checked.
+/// MIT-SHM and RandR are not required, so [`ServerFacts::shm_fd`] and
+/// [`ServerFacts::randr`] are not checked.
 pub fn check(display: &str, facts: &ServerFacts) -> Result<()> {
     let mut problems = Vec::new();
     if facts.root_depth != 24 && facts.root_depth != 32 {
@@ -89,6 +94,21 @@ pub fn check(display: &str, facts: &ServerFacts) -> Result<()> {
     Ok(())
 }
 
+/// Why andris cannot resize a desktop on a server described by `facts`,
+/// or `None` if it can try: resizing needs RandR 1.2 or later. A server
+/// without it is still exported, and every resize is refused with this
+/// reason.
+pub fn resize_refusal(facts: &ServerFacts) -> Option<String> {
+    match facts.randr {
+        None => Some("the X server has no usable RandR extension".to_string()),
+        Some(version) if version < (1, 2) => Some(format!(
+            "the X server has RandR {}.{}, and resizing needs 1.2",
+            version.0, version.1
+        )),
+        Some(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,6 +125,7 @@ mod tests {
             xkb: true,
             damage: true,
             shm_fd: true,
+            randr: Some((1, 3)),
         }
     }
 
@@ -123,6 +144,14 @@ mod tests {
             },
         )
         .expect("MIT-SHM is optional");
+        check(
+            ":99",
+            &ServerFacts {
+                randr: None,
+                ..xvfb()
+            },
+        )
+        .expect("RandR is optional");
         check(
             ":99",
             &ServerFacts {
@@ -234,5 +263,29 @@ mod tests {
         assert!(message.contains("XTEST"), "{message}");
         assert!(message.contains("XKEYBOARD"), "{message}");
         assert!(!message.contains("XFIXES"), "{message}");
+    }
+
+    #[test]
+    fn resizing_needs_randr_1_2() {
+        assert_eq!(resize_refusal(&xvfb()), None);
+        for version in [(1, 2), (1, 6), (2, 0)] {
+            let facts = ServerFacts {
+                randr: Some(version),
+                ..xvfb()
+            };
+            assert_eq!(resize_refusal(&facts), None, "{version:?}");
+        }
+        let without = resize_refusal(&ServerFacts {
+            randr: None,
+            ..xvfb()
+        })
+        .unwrap();
+        assert!(without.contains("no usable RandR"), "{without}");
+        let old = resize_refusal(&ServerFacts {
+            randr: Some((1, 1)),
+            ..xvfb()
+        })
+        .unwrap();
+        assert!(old.contains("RandR 1.1"), "{old}");
     }
 }

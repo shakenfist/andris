@@ -4,7 +4,12 @@
 //! before it asks for the channel list), answers `ATTACH_CHANNELS` with
 //! the channels andris serves, applies the client's mouse mode request,
 //! and pings every [`PING_INTERVAL`] to keep the connection measured.
+//! `INIT` says a guest agent is connected: andris plays the agent itself,
+//! and hands `AGENT_START`, `AGENT_DATA` and `AGENT_TOKEN` to an
+//! [`Agent`], which also follows the desktop's clipboard (see [`agent`]).
 //! Everything else the client sends is read and ignored.
+//!
+//! [`agent`]: super::agent
 //!
 //! # Metrics
 //!
@@ -29,6 +34,7 @@ use shakenfist_spice_protocol::{ChannelType, MOUSE_MODE_CLIENT, MOUSE_MODE_SERVE
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, info};
 
+use super::agent::{AGENT_WINDOW, Agent};
 use super::channel::{ChannelConn, ChannelContext};
 use super::opcodes::MainOpcode;
 use super::session::{MouseMode, Session};
@@ -94,14 +100,15 @@ pub async fn serve_reporting(
 ) -> Result<()> {
     let session = ctx.session.clone();
     let _summary = SessionSummary(session.clone());
+    let mut agent = Agent::new(session.id(), &ctx.platform);
 
     let init = MainInit {
         session_id: session.id(),
         display_channels_hint: 1,
         supported_mouse_modes: u32::from(SUPPORTED_MOUSE_MODES),
         current_mouse_mode: session.mouse_mode().borrow().to_wire(),
-        agent_connected: 0,
-        agent_tokens: 0,
+        agent_connected: 1,
+        agent_tokens: AGENT_WINDOW,
         // Milliseconds, wrapping: the field is a u32.
         multi_media_time: session.elapsed().as_millis() as u32,
         ram_hint: 0,
@@ -157,8 +164,19 @@ pub async fn serve_reporting(
                         };
                         conn.send_msg(MainOpcode::MouseMode, &mode).await?;
                     }
+                    main_client::AGENT_START => agent.start(&mut conn, message.payload()).await?,
+                    main_client::AGENT_DATA => agent.data(&mut conn, message.payload()).await?,
+                    main_client::AGENT_TOKEN => agent.token(&mut conn, message.payload()).await?,
                     _ => conn.ignore(&message),
                 }
+            }
+            // Agent tokens go back only once andris has handled all it has
+            // read, so a client that sends past its window is found out.
+            () = std::future::ready(()), if agent.owes_tokens() && !conn.has_unread() => {
+                agent.return_tokens(&mut conn).await?;
+            }
+            () = agent.desktop_clipboard_changed() => {
+                agent.desktop_clipboard(&mut conn).await?;
             }
             _ = reports.tick() => {
                 let now = Instant::now();
@@ -192,7 +210,7 @@ async fn send_ping(
 
 #[cfg(test)]
 mod tests {
-    use shakenfist_spice_protocol::messages::take_message;
+    use shakenfist_spice_protocol::messages::ReceiveBuffer;
     use tokio::io::AsyncReadExt;
 
     use super::*;
@@ -224,12 +242,12 @@ mod tests {
         let conn = ChannelConn::<MainOpcode>::new(server_end, session);
         let task = tokio::spawn(serve(ctx, conn, Duration::from_millis(20)));
 
-        let mut buf = Vec::new();
+        let mut buf = ReceiveBuffer::new();
         let mut ping_ids = Vec::new();
         let mut last_timestamp = 0;
         while ping_ids.len() < 4 {
             let message = loop {
-                if let Some(message) = take_message(&mut buf, 1 << 20).unwrap() {
+                if let Some(message) = buf.take_message(1 << 20).unwrap() {
                     break message;
                 }
                 let mut chunk = [0u8; 4096];

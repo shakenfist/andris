@@ -132,15 +132,16 @@ repository (see Future work for the trigger).
 Each has the default this plan takes if nobody answers.
 
 1. **Who owns the desktop size when RDP and SPICE share `:10`?**
-   xorgxrdp resizes the screen through RandR when the RDP client
-   resizes. Unknown: whether it tolerates another X client
-   changing RandR state while RDP is connected. *Default:* the
-   most recent client to ask wins; phase 7 opens with a spike that
-   settles whether that is safe.
-2. **HiDPI.** Does ryll on a Retina Mac request its window size in
-   physical or logical pixels through `VD_AGENT_MONITORS_CONFIG`?
-   *Default:* physical pixels, with desktop scaling left to the
-   session's own DPI settings. Settled in phase 7.
+   *Answered by phase 7's survey:* RDP does. xorgxrdp 0.10.2 refuses
+   every RandR screen-size change an X client asks for, whether or
+   not RDP is connected; only its own resizes, made when the RDP
+   client resizes, are allowed. *Decided by the operator on
+   2026-10-14:* andris resizes through RandR where the X server
+   allows it, and on xorgxrdp says no and leaves the size alone.
+2. **HiDPI.** *Answered by phase 7's survey:* ryll asks in egui
+   points, about half the window's pixel size on a Retina Mac
+   (ryll#485). That is ryll's to change, and it does not matter on
+   xrdp, where no SPICE resize applies.
 3. **Exposure.** *Default:* andris binds to a configured address,
    loopback unless told otherwise. It reads its ticket from a
    `0600` file and refuses to listen on a non-loopback address
@@ -153,9 +154,11 @@ Each has the default this plan takes if nobody answers.
    dependencies.
 5. **Crate layout in andris.** *Default:* one binary crate with
    modules per backend, split only when a second backend exists.
-6. **Packaging.** *Default:* Linux only. A `.deb` via `cargo deb`
-   and a systemd *user* unit, built inside Docker like ryll. No
-   macOS, Windows or Homebrew builds.
+6. **Packaging.** *Decided by the operator on 2026-10-13:* Linux
+   only, published to PyPI as manylinux wheels, the way ryll is
+   published, because most people will install a wheel. A `.deb` may
+   be built as well, but is not the primary channel. No macOS,
+   Windows or Homebrew builds.
 
 ## Execution
 
@@ -172,12 +175,13 @@ written with `/next-phase` as each phase comes up.
 | 3. Image encoders (ryll) | PLAN-x11-desktop-phase-03-encoders.md | Complete | ryll `cd2fe41` (#487); andris `591e062` (#6) |
 | 4. Server skeleton | PLAN-x11-desktop-phase-04-server-skeleton.md | Complete | andris `1950cdb` (#7) |
 | 5. Damage and flow control | PLAN-x11-desktop-phase-05-damage.md | Complete | andris `68b1058` (#8); andris `43bfe88` (#11) |
-| 6. Sharing the xrdp session | PLAN-x11-desktop-phase-06-sharing.md | In progress | |
-| 7. In-process agent: resize and clipboard | Not yet written | Not started | |
+| 6. Sharing the xrdp session | PLAN-x11-desktop-phase-06-sharing.md | Complete | andris `498a72c` (#12) |
+| 7. In-process agent: resize and clipboard | PLAN-x11-desktop-phase-07-agent.md | In progress | |
 | 8. Video streams | Not yet written | Not started | |
 | 9. Audio | Not yet written | Not started | |
 | 10. Packaging and dogfood soak | Not yet written | Not started | |
-| 11. Push audit | This file, below | Not started | |
+| 11. Human review | Not yet written | Not started | |
+| 12. Push audit | This file, below | Not started | |
 
 Rough sizing, as judgement rather than measurement: phases 0–5
 reach a usable LAN desktop in about three to four weeks; phases 6–9
@@ -204,7 +208,7 @@ In outline:
   review-scope-completeness checks apply only to a repository that
   carries `.vscode/review-scope.toml`. Andris does not get the
   review-tracking tooling, so they report not applicable and
-  development needs no override.
+  development needs no override. Phase 11 brings it in.
 
 Some checks cannot pass until there is code and CI: CodeQL, the CI
 review automation, and the merge queue, whose required status
@@ -393,26 +397,34 @@ time:
 
 ### Phase 7: In-process agent: resize and clipboard
 
-SPICE clients send resize requests and clipboard traffic through
-the vdagent protocol on the main channel. Andris is already inside
-the session, so it plays the agent itself, with no separate
+Detail is in
+[PLAN-x11-desktop-phase-07-agent.md](PLAN-x11-desktop-phase-07-agent.md).
+SPICE clients send resize requests and clipboard traffic through the
+vdagent protocol on the main channel. Andris is already inside the
+session, so it plays the agent itself, with no separate
 `spice-vdagent` process:
 
-- announce an agent connection;
-- map `VD_AGENT_MONITORS_CONFIG` to RandR;
-- bridge `CLIPBOARD` and `PRIMARY` selections to and from the
-  client, coexisting with `xrdp-chansrv`, which also owns
-  selections.
+- **A ryll pull request first.** Ryll's headless mode gains an
+  in-memory clipboard and control-socket verbs to set and read it and
+  to send a resize, so `make e2e` can drive the agent through real
+  ryll. Andris then bumps its ryll pin, which it needs anyway: agent
+  data spanning several `AGENT_DATA` messages is reassembled only
+  since ryll#474 was fixed, after the current pin.
+- **The agent protocol:** announced in `MAIN_INIT`, with token flow
+  control both ways, chunking, reassembly capped in size, and the
+  token-count validation phase 4 deferred.
+- **Resize through RandR where the X server allows it.** xorgxrdp
+  refuses every client resize, so on the xrdp session andris says no,
+  once, and the desktop keeps following the RDP client's size.
+- **Text on the CLIPBOARD selection, both ways**, coexisting with
+  `xrdp-chansrv`, which bridges CLIPBOARD for RDP. Andris fetches
+  eagerly and drops a text that comes back unchanged, so the two
+  bridges cannot loop through a machine running both clients. Ryll
+  carries only text on CLIPBOARD, so PRIMARY and images are Future
+  work.
 
-The phase opens with the spike from open questions 1 and 2. It
-also depends on ryll reassembling agent data that spans several
-`AGENT_DATA` messages, which ryll does not do today (ryll#474,
-found in phase 2). Without that, clipboard text over about 2 KB from andris
-arrives truncated. Phase 2's `ClipboardGrab` type does not model
-the grab serial, so andris must not announce
-`VD_AGENT_CAP_CLIPBOARD_GRAB_SERIAL` until it does. An agent
-message's declared size is a peer-controlled `u32`, so reassembly on
-either side must cap it, rather than allocate what it says.
+Phase 2's `ClipboardGrab` does not model the grab serial, so andris
+does not announce `VD_AGENT_CAP_CLIPBOARD_GRAB_SERIAL`.
 
 ### Phase 8: Video streams
 
@@ -430,15 +442,59 @@ kHz and honours the client's volume and mute messages.
 
 ### Phase 10: Packaging and dogfood soak
 
-Ship a `.deb` carrying phase 6's systemd user unit, and write the kerbside
-static-source configuration into `docs/`. Automate phase 4's
+Publish andris to PyPI as manylinux wheels, reusing ryll's release
+tooling: maturin with `bindings = "bin"`, a manylinux_2_28 build per
+architecture (ryll's `.devcontainer/wheel/Dockerfile` and
+`tools/build-ryll-wheel.sh`), and trusted publishing from a release
+workflow. Andris's X11 code is pure-Rust `x11rb`, linking no X
+library, so the manylinux tag holds without vendoring anything. A
+`.deb` is optional.
+
+A wheel cannot install a systemd unit, and phase 6's
+`andris@.service` names a bare `andris`, which systemd resolves only
+in `/usr/local/bin` and `/usr/bin`; a wheel puts the binary in
+`~/.local/bin` or a virtual environment. So andris gains an
+`andris install-unit` subcommand. It writes the unit, compiled into
+the binary, to `~/.config/systemd/user/` with `ExecStart=` naming the
+running binary's absolute path. It also creates `~/.config/andris/`
+with mode 0700 and a fresh 0600 ticket when none exists, so that
+`docs/xrdp.md`'s install section becomes one command and an
+`enable`. Reinstalling the wheel elsewhere means running it again,
+which the documentation says.
+
+Phase 6 declined `SystemCallFilter=@system-service` until a soak
+shows MIT-SHM and the memfd survive it; this phase's soak is that
+test.
+
+Write the kerbside static-source configuration into `docs/`. Automate phase 4's
 kerbside smoke test, either here or as a "custom backend" lane in
 kerbside's own CI. Then the operator uses
 ryll → kerbside → andris as the daily connection for a week, with
 RDP as the fallback. Every regression found is filed, and either
 fixed here or recorded under Future work.
 
-### Phase 11: Push audit
+### Phase 11: Human review
+
+Asked for by the operator on 2026-10-14, who wants to read andris and
+learn how it works. Bring andris into shakenfist/development's
+review-tracking tooling, as ryll is:
+
+- `.vscode/review-scope.toml`, modelled on ryll's: the Rust, scripts,
+  documentation, CI workflows, manifests, `deny.toml`, the `Makefile`
+  and the systemd unit are in scope;
+- a generated `REVIEWS.md`, and the `prune-reviews` workflow that keeps
+  it current on `develop`;
+- the audit matrix's review-coverage and review-scope-completeness
+  checks then apply, rather than reporting not applicable.
+
+The phase also writes a reading guide in `docs/`: an order to read the
+code in, from the binary's entry point through the server, the
+channels and the platform backends, saying for each part what it does
+and what to look at. The operator then reviews the files in review
+sessions. Findings land as their own pull requests. The phase is done
+when every in-scope file carries a current review mark.
+
+### Phase 12: Push audit
 
 Run `PUSH-AUDIT.md` over the merge commits recorded in the
 `Merged` column for the andris phases. For phases 2 and 3, cite the
@@ -458,7 +514,7 @@ This master plan was written at high effort. Phases 2, 3, 4, 5, 7
 and 8 turn on protocol semantics, concurrency or heuristics and
 should be planned at high effort; phase 3 joined them when its
 survey found the LZ4 decoder had to be rewritten first. Phases 0, 1,
-6, 9 and 10 follow established patterns and can be planned at
+6, 9, 10 and 11 follow established patterns and can be planned at
 medium effort.
 
 ### Management session review checklist
@@ -486,8 +542,12 @@ because the following statements will be true:
 * Scrolling a full-screen terminal at the session's native size
   sustains at least 30 frames per second on the LAN, as ryll's GUI
   reports it: its FPS is the rate of `MARK` messages.
-* Resizing the ryll window resizes the desktop, and copy and
-  paste work in both directions.
+* Copy and paste of text work in both directions, with RDP
+  connected to the same session. Resizing the ryll window resizes
+  the desktop on an X server that allows it; on xrdp the desktop
+  follows the RDP client's size, and andris says so.
+* Every file in andris's review scope carries a current human
+  review mark.
 * A video played on the desktop arrives as an H.264 stream with
   audio.
 * CI exercises andris end to end against Xvfb with ryll headless,
@@ -529,6 +589,11 @@ file) and keep its status in step with the Execution table.
   keeps it local, because it guards xrdp's behaviour rather than
   andris's, and an RDP client driven through `xdotool` on a shared
   runner is likely to flake.
+- The PRIMARY selection, and images on the clipboard. Ryll carries
+  only text on CLIPBOARD today, and chansrv takes images only as
+  `image/bmp`.
+- Resizing the xrdp desktop from SPICE. xorgxrdp refuses resizes from
+  X clients; phase 7 drafts an upstream feature request.
 - End-to-end coverage of the X11 pointer and lock-state paths (XTEST
   motion and buttons, XKB indicators) against Xvfb. Phase 4's `make
   e2e` drives only frames and keys, because ryll's control socket has

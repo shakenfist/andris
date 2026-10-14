@@ -317,6 +317,29 @@ async fn a_client_announce_is_answered_only_when_it_asks() {
     agent.expect_quiet().await;
 }
 
+/// A second `AGENT_START` neither resets the client's credit nor brings a
+/// second announcement.
+#[tokio::test]
+async fn a_second_agent_start_is_ignored() {
+    let server = TestServer::start().await;
+    let mut agent = AgentClient::start(&server, 1).await;
+    agent.expect(VD_AGENT_ANNOUNCE_CAPABILITIES).await;
+    agent
+        .client
+        .send(
+            main_client::AGENT_START,
+            &body(&AgentTokens {
+                num_tokens: u32::MAX,
+            }),
+        )
+        .await;
+    // Credit reset to u32::MAX would let a second announcement out now;
+    // one queued behind the spent credit would follow this token.
+    agent.expect_quiet().await;
+    agent.grant(1).await;
+    agent.expect_quiet().await;
+}
+
 #[tokio::test]
 async fn andris_sends_one_chunk_per_client_token() {
     let server = TestServer::start().await;

@@ -16,7 +16,11 @@
 //!    physical size set for 96 DPI;
 //! 5. reads the screen and the CRTC back, because a server can answer
 //!    `RRSetCrtcConfig` with Success and change nothing (xorgxrdp does);
-//! 6. removes every `andris-` mode no CRTC uses any longer.
+//! 6. removes every `andris-` mode no CRTC uses any longer. The prefix
+//!    is reserved: andris treats every mode named with it as its own.
+//!    Nothing stops two andris processes exporting one display, and
+//!    then each may remove the other's unused modes, though never one a
+//!    CRTC shows.
 //!
 //! If any request fails, or the read-back finds the desktop is not the
 //! size asked for, the steps already taken are undone in reverse, the
@@ -36,6 +40,7 @@
 use anyhow::anyhow;
 use tracing::{debug, warn};
 use x11rb::connection::RequestConnection;
+use x11rb::errors::ReplyError;
 use x11rb::protocol::randr::{
     self, ConnectionExt as _, Crtc, GetCrtcInfoReply, Mode, ModeFlag, ModeInfo, Output, Rotation,
     SetConfig,
@@ -827,7 +832,10 @@ fn carry_on(result: Result<(), Fault>, what: &str) -> Result<(), Fault> {
 }
 
 /// Make the RandR `QueryVersion` handshake on `conn`, if the server has
-/// RandR, and return the version it grants; `None` without RandR.
+/// RandR, and return the version it grants; `None` without a usable
+/// RandR. RandR is optional, so a server that answers the handshake with
+/// an X error is logged and treated as having none, and every resize is
+/// refused; only a failed connection is an error.
 pub(super) fn handshake(conn: &RustConnection) -> anyhow::Result<Option<(u32, u32)>> {
     if conn
         .extension_information(randr::X11_EXTENSION_NAME)?
@@ -835,11 +843,23 @@ pub(super) fn handshake(conn: &RustConnection) -> anyhow::Result<Option<(u32, u3
     {
         return Ok(None);
     }
-    let reply = conn
+    match conn
         .randr_query_version(RANDR_VERSION.0, RANDR_VERSION.1)?
         .reply()
-        .map_err(|e| anyhow!("the RandR QueryVersion handshake: {e}"))?;
-    Ok(Some((reply.major_version, reply.minor_version)))
+    {
+        Ok(reply) => Ok(Some((reply.major_version, reply.minor_version))),
+        Err(ReplyError::X11Error(e)) => {
+            warn!(
+                "the X server refused the RandR QueryVersion handshake ({:?}); \
+                 resizes will be refused",
+                e.error_kind
+            );
+            Ok(None)
+        }
+        Err(ReplyError::ConnectionError(e)) => {
+            Err(anyhow!("the RandR QueryVersion handshake: {e}"))
+        }
+    }
 }
 
 #[cfg(test)]

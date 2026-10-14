@@ -49,7 +49,11 @@
 //!   changes, andris grabs on the client and answers its request from the
 //!   text it holds. Text identical to the last text that crossed, in
 //!   either direction, is dropped, which breaks the loop two clipboard
-//!   bridges on one machine would otherwise make. Text over
+//!   bridges on one machine would otherwise make. The comparison has
+//!   known gaps: text is recorded as crossed when it is handed to the
+//!   desktop, so if the desktop then loses the race for the selection to
+//!   another program, the same text copied on the client again is taken
+//!   for an echo and does not cross until other text has. Text over
 //!   [`MAX_CLIPBOARD_TEXT`] is dropped with a warning. A request for
 //!   another selection or type is answered with an empty clipboard.
 
@@ -260,6 +264,8 @@ pub struct Agent {
     window: ClientWindow,
     outgoing: Outgoing,
     reassembler: AgentReassembler,
+    /// Whether the client has started the agent.
+    started: bool,
     /// The client's capabilities, once it has announced them.
     client_caps: Option<AnnounceCapabilities>,
     /// Whether a refused resize has been logged on this connection.
@@ -285,6 +291,7 @@ impl Agent {
             window: ClientWindow::new(),
             outgoing: Outgoing::default(),
             reassembler: AgentReassembler::new(MAX_AGENT_MESSAGE),
+            started: false,
             client_caps: None,
             refusal_logged: false,
             drop_logged: false,
@@ -294,9 +301,21 @@ impl Agent {
     }
 
     /// Handle `AGENT_START`: the client's credit, after which andris
-    /// announces its capabilities.
+    /// announces its capabilities. A client starts the agent once per
+    /// connection, since andris's agent never disconnects; a second start
+    /// is ignored, rather than resetting the credit granted so far or
+    /// announcing again.
     pub async fn start(&mut self, conn: &mut ChannelConn<MainOpcode>, body: &[u8]) -> Result<()> {
         let tokens = AgentTokens::decode(body).context("a malformed AGENT_START")?;
+        if self.started {
+            debug!(
+                session = self.session,
+                tokens = tokens.num_tokens,
+                "ignoring a second AGENT_START"
+            );
+            return Ok(());
+        }
+        self.started = true;
         debug!(
             session = self.session,
             tokens = tokens.num_tokens,

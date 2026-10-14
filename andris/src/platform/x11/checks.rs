@@ -29,8 +29,9 @@ pub struct ServerFacts {
     /// a segment passed as a file descriptor. Optional; without it andris
     /// captures with `GetImage`.
     pub shm_fd: bool,
-    /// The RandR version the server agreed to, `None` without RandR.
-    /// Optional; see [`resize_refusal`].
+    /// The RandR version the server agreed to, `None` without RandR or
+    /// when the server refused the handshake. Optional; see
+    /// [`resize_refusal`].
     pub randr: Option<(u32, u32)>,
 }
 
@@ -99,7 +100,7 @@ pub fn check(display: &str, facts: &ServerFacts) -> Result<()> {
 /// reason.
 pub fn resize_refusal(facts: &ServerFacts) -> Option<String> {
     match facts.randr {
-        None => Some("the X server has no RandR extension".to_string()),
+        None => Some("the X server has no usable RandR extension".to_string()),
         Some(version) if version < (1, 2) => Some(format!(
             "the X server has RandR {}.{}, and resizing needs 1.2",
             version.0, version.1
@@ -279,7 +280,7 @@ mod tests {
             ..xvfb()
         })
         .unwrap();
-        assert!(without.contains("no RandR"), "{without}");
+        assert!(without.contains("no usable RandR"), "{without}");
         let old = resize_refusal(&ServerFacts {
             randr: Some((1, 1)),
             ..xvfb()

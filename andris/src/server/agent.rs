@@ -79,6 +79,7 @@ use super::channel::ChannelConn;
 use super::opcodes::MainOpcode;
 use crate::platform::{
     Clipboard, ClipboardReceiver, DisplayControl, MAX_CLIPBOARD_TEXT, Platform, Resize, Size,
+    text_hash,
 };
 
 /// The agent chunks `MAIN_INIT` lets the client send before andris hands
@@ -371,6 +372,12 @@ impl Agent {
     /// Offer the client the desktop's clipboard as it is now.
     pub async fn desktop_clipboard(&mut self, conn: &mut ChannelConn<MainOpcode>) -> Result<()> {
         let text = self.desktop.borrow_and_update().clone();
+        debug!(
+            session = self.session,
+            bytes = text.as_ref().map_or(0, |text| text.len()),
+            hash = text.as_deref().map(text_hash),
+            "the desktop's clipboard changed"
+        );
         self.offer(text)?;
         self.flush(conn).await
     }
@@ -640,6 +647,12 @@ impl Agent {
                     self.dropped(VD_AGENT_CLIPBOARD, body);
                     return Ok(());
                 }
+                debug!(
+                    session = self.session,
+                    bytes = text.as_ref().map_or(0, |text| text.len()),
+                    hash = text.as_deref().map(text_hash),
+                    "answering the client's clipboard request"
+                );
                 let answer = match text {
                     Some(text) => ClipboardData {
                         selection: VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD,
@@ -699,6 +712,7 @@ impl Agent {
             debug!(
                 session = self.session,
                 bytes = text.len(),
+                hash = text_hash(&text),
                 "the client's clipboard text is the text that last crossed; not set again"
             );
             return;
@@ -707,6 +721,13 @@ impl Agent {
             session = self.session,
             bytes = text.len(),
             "putting the client's clipboard text on the desktop"
+        );
+        debug!(
+            session = self.session,
+            hash = text_hash(&text),
+            compared = text_hash(&crossing),
+            last = self.last_crossed.as_deref().map(text_hash),
+            "the client's text, as put and as compared, and the text that last crossed"
         );
         self.last_crossed = Some(crossing);
         if let Err(error) = self.clipboard.set(text) {
@@ -753,6 +774,7 @@ impl Agent {
             debug!(
                 session = self.session,
                 bytes = text.len(),
+                hash = text_hash(&text),
                 "the desktop's clipboard text is the text that last crossed; not offered again"
             );
             return Ok(());
@@ -772,6 +794,12 @@ impl Agent {
             session = self.session,
             bytes = text.len(),
             "offering the desktop's clipboard text to the client"
+        );
+        debug!(
+            session = self.session,
+            hash = text_hash(&text),
+            last = self.last_crossed.as_deref().map(text_hash),
+            "the desktop's text, as offered, and the text that last crossed"
         );
         let grab = ClipboardGrab {
             selection: VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD,

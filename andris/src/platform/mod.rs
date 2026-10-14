@@ -65,6 +65,18 @@ pub use damage::{DamageHub, DamageSubscription, Rectangle, Region, TILE};
 /// Larger text is dropped, with a warning, rather than copied.
 pub const MAX_CLIPBOARD_TEXT: usize = 16 * 1024 * 1024;
 
+/// A short fingerprint of clipboard `text` for debug logs, so that one text
+/// can be followed across andris, its clients and other programs without
+/// logging the text: the 32-bit FNV-1a hash of its UTF-8 bytes, as eight
+/// hex digits. It is not a secret: a short text can be found from it by
+/// trying candidates, which is why only debug logs carry it.
+pub fn text_hash(text: &str) -> String {
+    let hash = text.bytes().fold(0x811c_9dc5_u32, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+    });
+    format!("{hash:08x}")
+}
+
 /// The size of a desktop or frame, in pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Size {
@@ -679,6 +691,15 @@ pub struct Platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_hash_is_fnv1a_32() {
+        // The published FNV-1a test vectors, which the e2e pasteboard's
+        // hash must match too.
+        assert_eq!(text_hash(""), "811c9dc5");
+        assert_eq!(text_hash("a"), "e40c292c");
+        assert_eq!(text_hash("foobar"), "bf9cf968");
+    }
 
     #[test]
     fn gone_is_found_under_context() {

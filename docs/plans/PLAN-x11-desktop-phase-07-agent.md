@@ -763,6 +763,18 @@ Fixed in the audit's commit:
   desktop, passwords included, is sent to it.
 - **Docs:** a reflowed paragraph in `docs/development.md`.
 
+**X10 was intermittent, and the harness was at fault.** After the
+audit's fixes X10 failed once in nine runs. Hashing each text in
+andris's debug log and the stand-in pasteboard's caught it on the
+twentieth run of a loop: the stand-in asked FreeRDP's display for its
+text, took CLIPBOARD itself on a ryll event before the answer came, and
+passed the late answer on. FreeRDP answers a request it held when it
+lost the selection with bytes that are not the text, and andris
+correctly let each new text cross once. The stand-in now abandons its
+fetches when it takes CLIPBOARD; 26 runs then passed, the race having
+happened in five. The debug hashes stay, and `docs/xrdp.md` says that
+debug logs carry them.
+
 Declined, with reasons:
 - **Clearing the last text that crossed when the desktop's text goes.**
   Once andris publishes no text after taking the clipboard, that would

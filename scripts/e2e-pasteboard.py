@@ -17,7 +17,11 @@ own X display and ryll's control socket:
     offers to xrdp.
 
 It ignores its own ownership, and compares no content: whatever stops the
-loop, it must not be this. Ryll's control socket takes one client at a time,
+loop, it must not be this. It does drop the answer to a fetch from an owner
+it has since displaced: FreeRDP answers a request it had when it lost
+CLIPBOARD with bytes that are not the text (seen as 87 bytes unlike the
+copy, then a lone 0x02), and a real pasteboard, holding one text at a time,
+never asks an owner it has replaced. Ryll's control socket takes one client at a time,
 so scripts/e2e-xrdp-drive.py imports this and shares its own connection with
 it, calling step() whenever it would otherwise wait. Nothing here runs
 anything by itself.
@@ -31,6 +35,20 @@ from Xlib import Xatom
 from Xlib import display as xdisplay
 from Xlib.ext import xfixes
 from Xlib.protocol import event as xevent
+
+
+def text_hash(data):
+    """The 32-bit FNV-1a hash of bytes `data`, as eight hex digits: andris's debug logs carry the same, so a text
+    can be followed through both without logging it."""
+    value = 0x811c9dc5
+    for byte in data:
+        value = ((value ^ byte) * 0x01000193) & 0xffffffff
+    return f'{value:08x}'
+
+
+def describe(data):
+    """`data`'s length and hash, for a log line."""
+    return f'{len(data)} bytes, hash {text_hash(data)}'
 
 
 class Pasteboard:
@@ -55,6 +73,9 @@ class Pasteboard:
                                              xfixes.XFixesSetSelectionOwnerNotifyMask)
         self.d.flush()
         self.text = b''
+        # Fetches from other owners still to be answered. Taking CLIPBOARD
+        # abandons them.
+        self.fetching = 0
         # Ryll's events before this one are not the pasteboard's business.
         self.seen = len(control.events)
 
@@ -67,6 +88,7 @@ class Pasteboard:
     def own(self, text):
         """Take CLIPBOARD on FreeRDP's display with `text`."""
         self.text = text
+        self.fetching = 0
         self.window.set_selection_owner(self.clipboard, X.CurrentTime)
         self.d.flush()
 
@@ -76,9 +98,19 @@ class Pasteboard:
             # python-xlib makes a class per extension event, so compare by name.
             if type(e).__name__ == 'SetSelectionOwnerNotify':
                 if e.owner and e.owner.id != self.window.id:
+                    self.log(f'window 0x{e.owner.id:x} took CLIPBOARD on FreeRDP\'s display; asking for its text')
+                    self.fetching += 1
                     self.window.convert_selection(self.clipboard, self.utf8, self.prop, X.CurrentTime)
                     self.d.flush()
             elif e.type == X.SelectionNotify and e.requestor.id == self.window.id:
+                if not self.fetching:
+                    value = self.window.get_full_property(self.prop, X.AnyPropertyType)
+                    self.window.delete_property(self.prop)
+                    self.d.flush()
+                    late = bytes(value.value) if value else b''
+                    self.log(f'dropped {describe(late)}: the answer of an owner the pasteboard has since replaced')
+                    continue
+                self.fetching -= 1
                 if e.property == X.NONE:
                     self.log('the new owner of CLIPBOARD refused a paste')
                     continue
@@ -88,13 +120,15 @@ class Pasteboard:
                 text = bytes(value.value) if value else b''
                 if text:
                     self.to_ryll += 1
-                    self.log(f'{len(text)} bytes on FreeRDP\'s display; giving them to ryll')
+                    self.log(f'{describe(text)} on FreeRDP\'s display; giving them to ryll')
                     self.control.call('clipboard_set', {'text': text.decode('utf-8', 'replace')})
             elif e.type == X.SelectionRequest:
                 self.serve(e)
 
     def serve(self, e):
         requestor, prop = e.requestor, e.property or e.target
+        if e.target != self.targets:
+            self.log(f'window 0x{requestor.id:x} asked for target {e.target}; serving {describe(self.text)}')
         if e.target == self.targets:
             requestor.change_property(prop, Xatom.ATOM, 32, [self.targets, self.utf8, Xatom.STRING])
         elif e.target in (self.utf8, Xatom.STRING):
@@ -114,7 +148,8 @@ class Pasteboard:
                 continue
             text = self.control.call('clipboard_get').get('text') or ''
             self.to_rdp += 1
-            self.log(f'ryll has {data.get("bytes")} bytes; taking CLIPBOARD on FreeRDP\'s display with them')
+            self.log(f'ryll has {data.get("bytes")} bytes, and gave {describe(text.encode("utf-8"))}; taking '
+                     'CLIPBOARD on FreeRDP\'s display with them')
             self.own(text.encode('utf-8'))
 
     def step(self, seconds):

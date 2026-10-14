@@ -781,6 +781,7 @@ def crossing(bed, text, display, pasteboard):
     times the pasteboard passed text on."""
     mark = len(crossings(bed))
     passes = pasteboard.passes()
+    pasteboard.log(f'copying {pasteboard_module.describe(text.encode("utf-8"))} on {display}')
     copier = drive.xclip_copy(display, text.encode('utf-8'))
     try:
         start = time.monotonic()

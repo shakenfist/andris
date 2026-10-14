@@ -69,7 +69,7 @@ use x11rb::wrapper::ConnectionExt as _;
 use x11rb::{CURRENT_TIME, NONE};
 
 use super::{Fault, connection_failed, create_wake_window, is_wake, lost, stopped, x_error};
-use crate::platform::{ClipboardReceiver, GoneSender, MAX_CLIPBOARD_TEXT};
+use crate::platform::{ClipboardReceiver, GoneSender, MAX_CLIPBOARD_TEXT, text_hash};
 
 /// How long an owner has to answer each conversion the thread asks for,
 /// and each piece of an INCR transfer to it.
@@ -678,7 +678,11 @@ impl ClipboardThread {
     fn publish(&self, text: Option<Arc<str>>) {
         match text {
             Some(text) => {
-                debug!(bytes = text.len(), "the X clipboard has new text");
+                debug!(
+                    bytes = text.len(),
+                    hash = text_hash(&text),
+                    "the X clipboard has new text"
+                );
                 self.published.send_replace(Some(text));
             }
             None => {
@@ -949,7 +953,11 @@ impl ClipboardThread {
             return Ok(());
         }
         self.fetch = None;
-        debug!(bytes = text.len(), "andris owns the X clipboard");
+        debug!(
+            bytes = text.len(),
+            hash = text_hash(&text),
+            "andris owns the X clipboard"
+        );
         self.owned = Some(Owned::new(&text, time));
         // The text another program put there is gone. Left published, a
         // client connecting later would be offered it as the desktop's.

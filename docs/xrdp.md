@@ -115,9 +115,11 @@ journalctl --user -u andris@10 -f     # follow it
 
 Andris logs to stderr, which the journal captures. Set `RUST_LOG` in
 `andris.env` to change the log level. At `debug` and `trace` andris
-may log details of the client's input, such as the keys it sends, to
-the journal, which members of the `adm` and `systemd-journal` groups
-can read; use those levels only while troubleshooting.
+may log details of the client's input, such as the keys it sends, and
+an eight-digit hash of each clipboard text, from which a short text
+such as a password can be found by guessing, to the journal, which
+members of the `adm` and `systemd-journal` groups can read; use those
+levels only while troubleshooting.
 
 Andris's exit status says why it stopped:
 

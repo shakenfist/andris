@@ -144,7 +144,10 @@ checks, after a smoke test, that:
 - ending the session makes andris exit with status 1.
 
 Every clipboard check copies text not used before, because FreeRDP
-and xrdp keep what they last fetched.
+and xrdp keep what they last fetched. Andris runs there with debug
+logging for the clipboard, and both its log and the stand-in's carry a
+hash of each text that passes, so a failed check shows which text went
+where without the text itself.
 
 The container has no network, and its own `/tmp`, so no X server or
 xrdp session on the host can be reached from it. Never aim a test that

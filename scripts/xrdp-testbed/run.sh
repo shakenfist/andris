@@ -280,7 +280,10 @@ ticket=$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')
     "$SPICE_PORT" "$ticket" >"$work/andris.vv")
 chown "$TESTER:" "$work/ticket" "$work/andris.vv"
 
-start andris "${as_tester[@]}" RUST_LOG=info "$ANDRIS" --platform x11 --display "$session" \
+# Debug for the clipboard, whose lines carry a hash of each text, so that a
+# failure of X8 to X10 shows which text went where.
+andris_log=info,andris::server::agent=debug,andris::platform::x11::clipboard=debug
+start andris "${as_tester[@]}" RUST_LOG="$andris_log" "$ANDRIS" --platform x11 --display "$session" \
     --listen "127.0.0.1:$SPICE_PORT" --ticket-file "$work/ticket"
 wait_until "$ANDRIS_BOUND" andris "andris listening on $SPICE_PORT" \
     grep -q "plain listener ready" "$work/andris.log"

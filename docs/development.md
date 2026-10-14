@@ -65,11 +65,13 @@ when large, while a requestor that stops taking pieces holds up no
 other paste; another program that takes the clipboard from andris is
 followed, and andris stops serving; and an owner that never answers is
 given up on after andris's 10-second timeout, while andris still takes
-and serves text meanwhile. The tests take turns with the display. They read the display from `ANDRIS_TEST_DISPLAY`. When the variable is unset, as
-under `make test`, it prints that it is skipping and passes. The script then starts a full-screen
-window that logs the keys it receives, starts the debug andris against
-that display, and connects ryll's headless client through a `.vv`
-file. Last, it asserts, over ryll's control socket:
+and serves text meanwhile. The tests take turns with the display, which
+they read from `ANDRIS_TEST_DISPLAY`. When the variable is unset, as
+under `make test`, each prints that it is skipping and passes. The
+script then starts a full-screen window that logs the keys it
+receives, starts the debug andris against that display, and connects
+ryll's headless client through a `.vv` file. Last, it asserts, over
+ryll's control socket:
 
 - **frames**: a frame of the window arrived;
 - **keys**: two keys reached the window;

@@ -279,7 +279,7 @@ its conventions in its `AGENTS.md`.
 | 7 | high | opus | none | Complete | End-to-end checks: `make e2e` and `make e2e-xrdp`. See brief 7. |
 | 8 | medium | sonnet | none | Complete | Documentation, and the xorgxrdp feature request drafted. See brief 8. |
 | 9 | medium | management | none | Not started | Operator acceptance on `:10`, by hand. See brief 9. |
-| 10 | medium | management | none | Not started | Push audit, pull request, queue. See brief 10. |
+| 10 | medium | management | none | In progress | Push audit, pull request, queue. See brief 10. |
 
 Steps 1 and 2 may run in parallel. Step 3 needs step 2's ryll pull
 request merged. Step 4 needs step 3. Steps 5 and 6 both touch
@@ -634,9 +634,8 @@ since `ReceiveBuffer` cannot take tokio's `read_buf`. Behaviour is
 unchanged, and framing many queued messages is now linear rather than
 quadratic. `make lint test e2e e2e-xrdp` passed.
 
-**Step 7: the end-to-end checks**, against a temporary pin to
-ryll#534's head (`1858569`), which must move to its merge commit before
-step 10. ryll's control socket takes one client, so the stand-in for the
+**Step 7: the end-to-end checks**, written against a temporary pin to
+ryll#534's head (`1858569`), since moved to its merge commit `b298b39`. ryll's control socket takes one client, so the stand-in for the
 Mac's shared pasteboard is a class inside the drive script, sharing its
 connection. Two consecutive runs of each target gave identical results:
 
@@ -733,6 +732,52 @@ and reopened no decision. A throwaway image, `andris-xrdp-spike`, added
   directly, made 4513 bridges in 6 s from one copy without
   comparison, and exactly one per copy with it, in both directions.
   Brief 7's X10 is built on that model.
+
+**Step 10: the push audit** (2026-10-14, over `origin/develop...HEAD`,
+`498a72c` the merge base). Wave 1 passed: pre-commit, `make lint`,
+`make test` (377 tests), `make e2e` and `make e2e-xrdp` with X1 to X11.
+Wave 2's five reviewers raised nothing blocking; the security review
+found no critical, high or medium issue.
+
+Fixed in the audit's commit:
+- **Stale desktop text after andris took the clipboard** (upgraded to
+  blocking by the auditor). The clipboard watch kept the previous
+  owner's text once andris owned the selection, so a reconnecting
+  client was offered it, and ryll's eager fetch then overwrote the
+  client's own clipboard. Taking the selection now publishes no text,
+  on X11 and the synthetic platform; a new test fails without it. The
+  echo comparison of decision 5 is unchanged, and X10 still passes.
+- **Security low 2:** an X client could name andris's own window as a
+  paste's requestor and leave andris's event mask cleared, killing
+  SPICE-to-desktop paste until restart. Such requests are refused.
+- **Security low 3:** the 16 MiB cap on client text now applies after
+  UTF-8 conversion, which can grow it.
+- **Security low 1 and code quality 3:** queue room is checked before a
+  clipboard reply is built, the dropped-message warning is rate
+  limited, and a grab that could not be queued records no state.
+- **Tests:** oversized client clipboard data is dropped with the channel
+  left open; a truncated monitors config closes it, and one with no
+  monitors gets an error reply.
+- **Security informational 1:** `docs/running.md` states the cost of
+  decision 5: while a client is connected, every text copied on the
+  desktop, passwords included, is sent to it.
+- **Docs:** a reflowed paragraph in `docs/development.md`.
+
+Declined, with reasons:
+- **Clearing the last text that crossed when the desktop's text goes.**
+  Once andris publishes no text after taking the clipboard, that would
+  let the echo coming back over RDP cross again, and X10 fails. What it
+  misses is narrow: the same text copied again after a copy that was
+  not text.
+- **A session cap, and resize churn.** Andris serves one session at a
+  time with bounded queues, and resizing needs an authenticated client,
+  as decision 1 accepts.
+- **Splitting `clipboard.rs`**, about 1100 lines outside its tests:
+  andris#15.
+- **More adversarial agent tests** beyond the two taken: andris#13.
+- **Honouring password managers' clipboard hints:** andris#14.
+- **The long `ARCHITECTURE.md` row and the README rewrite**, which the
+  docs reviewer judged legitimate.
 
 **The xorgxrdp feature request (draft).** Not filed; the operator
 decides whether to file it at neutrinolabs/xorgxrdp.

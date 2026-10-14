@@ -645,7 +645,9 @@ pub type ClipboardReceiver = watch::Receiver<Option<Arc<str>>>;
 /// The desktop's clipboard, as text.
 ///
 /// Only text that other programs on the desktop put there is reported:
-/// text andris sets with [`Clipboard::set`] is not reported back to it.
+/// text andris sets with [`Clipboard::set`] is not reported back to it,
+/// and once it is on the clipboard the receiver holds `None`, as the
+/// text another program put there has gone.
 /// A program that copies the same text again is reported again, as a
 /// change to the same value.
 pub trait Clipboard: Send + Sync {

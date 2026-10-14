@@ -57,7 +57,8 @@
 //! [`SyntheticPlatform::copy_text`] puts text on the clipboard as if
 //! another program had copied it, and reports it; text the server sets
 //! through [`Clipboard::set`] is kept for
-//! [`SyntheticPlatform::clipboard_set`] and is not reported back.
+//! [`SyntheticPlatform::clipboard_set`] and is not reported back; it
+//! replaces what was copied, so `None` is reported in its place.
 //!
 //! Every change is reported while the state lock is still held, so
 //! damage and resizes reach the hub in the order the changes were made:
@@ -507,11 +508,14 @@ impl Clipboard for SyntheticPlatform {
     }
 
     /// Keeps the text for [`SyntheticPlatform::clipboard_set`], and does
-    /// not report it to [`Clipboard::changes`].
+    /// not report it to [`Clipboard::changes`]; what another program
+    /// copied is gone, so that is reported as `None`.
     fn set(&self, text: Arc<str>) -> Result<()> {
         let mut state = self.state()?;
         state.clipboard_set = Some(text);
         state.clipboard_sets = state.clipboard_sets.saturating_add(1);
+        self.clipboard
+            .send_if_modified(|held| held.take().is_some());
         Ok(())
     }
 }
@@ -1134,12 +1138,15 @@ mod tests {
         changes.mark_unchanged();
 
         clipboard.set(Arc::from("pasted")).unwrap();
+        assert!(changes.has_changed().unwrap());
         assert!(
-            !changes.has_changed().unwrap(),
-            "andris's own text is not reported"
+            changes.borrow_and_update().is_none(),
+            "the copied text is gone, and andris's own is not reported"
         );
         assert_eq!(platform.clipboard_set().unwrap().as_deref(), Some("pasted"));
         assert_eq!(platform.clipboard_sets().unwrap(), 1);
+        clipboard.set(Arc::from("pasted again")).unwrap();
+        assert!(!changes.has_changed().unwrap(), "nothing more has gone");
 
         platform.copy_text(None);
         assert!(changes.borrow_and_update().is_none());

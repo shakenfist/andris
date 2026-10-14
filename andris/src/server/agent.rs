@@ -215,14 +215,22 @@ struct Outgoing {
 }
 
 impl Outgoing {
+    /// Whether a message with a body of `body` bytes fits in the queue.
+    fn has_room(&self, body: usize) -> bool {
+        self.queued
+            .saturating_add(VdAgentMessageHeader::SIZE)
+            .saturating_add(body)
+            <= MAX_QUEUED
+    }
+
     /// Queue agent message `message_type` with `body`. Returns false, and
     /// queues nothing, if it would take the queue past [`MAX_QUEUED`].
     fn push(&mut self, message_type: u32, body: &[u8]) -> Result<bool> {
-        let chunks = chunk_message(message_type, body)?;
-        let bytes: usize = chunks.iter().map(Vec::len).sum();
-        if self.queued.saturating_add(bytes) > MAX_QUEUED {
+        if !self.has_room(body.len()) {
             return Ok(false);
         }
+        let chunks = chunk_message(message_type, body)?;
+        let bytes: usize = chunks.iter().map(Vec::len).sum();
         self.queued += bytes;
         self.chunks.extend(chunks);
         Ok(true)
@@ -255,6 +263,9 @@ pub struct Agent {
     client_caps: Option<AnnounceCapabilities>,
     /// Whether a refused resize has been logged on this connection.
     refusal_logged: bool,
+    /// Whether a message dropped from a full queue has been logged at
+    /// warning level on this connection.
+    drop_logged: bool,
     /// The last text that crossed the clipboard bridge, either way.
     last_crossed: Option<Arc<str>>,
     /// The desktop text andris grabbed the client's clipboard with, while
@@ -275,6 +286,7 @@ impl Agent {
             reassembler: AgentReassembler::new(MAX_AGENT_MESSAGE),
             client_caps: None,
             refusal_logged: false,
+            drop_logged: false,
             last_crossed: None,
             offered: None,
         }
@@ -371,36 +383,55 @@ impl Agent {
         Ok(())
     }
 
-    /// Queue agent message `message_type`.
-    fn queue<T: WireType>(&mut self, message_type: u32, message: &T) -> Result<()> {
+    /// Queue agent message `message_type`; false if it was dropped.
+    fn queue<T: WireType>(&mut self, message_type: u32, message: &T) -> Result<bool> {
         let mut body = Vec::new();
         message.write(&mut body);
         self.queue_body(message_type, &body)
     }
 
     /// Queue clipboard message `message_type`, in the layout the client's
-    /// capabilities choose.
+    /// capabilities choose; false if it was dropped.
     fn queue_clipboard<T: ClipboardWireType>(
         &mut self,
         message_type: u32,
         message: &T,
         has_selection: bool,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let mut body = Vec::new();
         message.write_with(&mut body, has_selection);
         self.queue_body(message_type, &body)
     }
 
-    fn queue_body(&mut self, message_type: u32, body: &[u8]) -> Result<()> {
-        if !self.outgoing.push(message_type, body)? {
+    /// Queue `body` as agent message `message_type`; false if the queue
+    /// had no room for it and it was dropped.
+    fn queue_body(&mut self, message_type: u32, body: &[u8]) -> Result<bool> {
+        let queued = self.outgoing.push(message_type, body)?;
+        if !queued {
+            self.dropped(message_type, body.len());
+        }
+        Ok(queued)
+    }
+
+    /// Log a message dropped from a full queue: at warning level once per
+    /// connection, since a client that takes nothing could otherwise fill
+    /// the log, and at debug level after that.
+    fn dropped(&mut self, message_type: u32, bytes: usize) {
+        if self.drop_logged {
+            debug!(
+                session = self.session,
+                message_type, bytes, "dropping an agent message: the queue is full"
+            );
+        } else {
+            self.drop_logged = true;
             warn!(
                 session = self.session,
                 message_type,
-                bytes = body.len(),
-                "dropping an agent message: the client has taken too little of what is queued"
+                bytes,
+                "dropping an agent message: the client has taken too little of what is \
+                 queued (logged once per connection)"
             );
         }
-        Ok(())
     }
 
     /// Whether clipboard messages carry a selection, or `None` before the
@@ -484,7 +515,8 @@ impl Agent {
                 VD_AGENT_ERROR
             },
         };
-        self.queue(VD_AGENT_REPLY, &reply)
+        self.queue(VD_AGENT_REPLY, &reply)?;
+        Ok(())
     }
 
     /// Ask the desktop to be `size`; true if it now is.
@@ -599,6 +631,15 @@ impl Agent {
                     request.selection == VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD
                         && request.clipboard_type == VD_AGENT_CLIPBOARD_UTF8_TEXT
                 });
+                // Before the text is copied into a body: a client asking
+                // again and again for large text it does not take would
+                // otherwise cost a copy of it each time, only to drop it.
+                // The answer's fields are at most 8 bytes besides the text.
+                let body = text.as_ref().map_or(0, |text| text.len()).saturating_add(8);
+                if !self.outgoing.has_room(body) {
+                    self.dropped(VD_AGENT_CLIPBOARD, body);
+                    return Ok(());
+                }
                 let answer = match text {
                     Some(text) => ClipboardData {
                         selection: VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD,
@@ -633,19 +674,21 @@ impl Agent {
         if data.is_empty() {
             return;
         }
-        if data.len() > MAX_CLIPBOARD_TEXT {
+        // Checked after the conversion, since replacing invalid UTF-8 can
+        // make the text up to three times longer.
+        let text: Arc<str> = match String::from_utf8(data) {
+            Ok(text) => Arc::from(text),
+            Err(error) => Arc::from(String::from_utf8_lossy(error.as_bytes())),
+        };
+        if text.len() > MAX_CLIPBOARD_TEXT {
             warn!(
                 session = self.session,
-                bytes = data.len(),
+                bytes = text.len(),
                 "dropping the client's clipboard text: it is over the \
                  {MAX_CLIPBOARD_TEXT}-byte limit"
             );
             return;
         }
-        let text: Arc<str> = match String::from_utf8(data) {
-            Ok(text) => Arc::from(text),
-            Err(error) => Arc::from(String::from_utf8_lossy(error.as_bytes())),
-        };
         // The client converts its text to the desktop's LF line ends, as
         // GUEST_LINEEND_LF asks, so the text goes on the desktop as it
         // came. But it is compared, and remembered, with LF line ends, as
@@ -734,9 +777,13 @@ impl Agent {
             selection: VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD,
             types: vec![VD_AGENT_CLIPBOARD_UTF8_TEXT],
         };
-        self.queue_clipboard(VD_AGENT_CLIPBOARD_GRAB, &grab, has_selection)?;
-        self.last_crossed = Some(text.clone());
-        self.offered = Some(text);
+        // Recorded only once the grab is on its way: the client cannot ask
+        // for text it was never offered, and text not offered has not
+        // crossed.
+        if self.queue_clipboard(VD_AGENT_CLIPBOARD_GRAB, &grab, has_selection)? {
+            self.last_crossed = Some(text.clone());
+            self.offered = Some(text);
+        }
         Ok(())
     }
 }
@@ -846,7 +893,10 @@ mod tests {
         let mut outgoing = Outgoing::default();
         let big = vec![0; MAX_AGENT_MESSAGE];
         assert!(outgoing.push(VD_AGENT_CLIPBOARD, &big).unwrap());
+        assert!(outgoing.has_room(MAX_AGENT_MESSAGE));
+        assert!(!outgoing.has_room(MAX_AGENT_MESSAGE + 1));
         assert!(outgoing.push(VD_AGENT_CLIPBOARD, &big).unwrap());
+        assert!(!outgoing.has_room(0));
         assert!(!outgoing.push(VD_AGENT_REPLY, &[0; 8]).unwrap());
         assert_eq!(outgoing.queued, MAX_QUEUED);
     }

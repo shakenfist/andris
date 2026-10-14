@@ -263,6 +263,11 @@ other bridge then offers it to its own client. Text only: UTF-8 on
   bridges. Andris drops an echo of the text that last crossed, in either
   direction, so copying the same text again sends nothing: the other
   side already has it.
+- **The SPICE client gets every copy.** chansrv sends text to the RDP
+  client only when it pastes; andris offers the SPICE client each copy
+  as it is made, and ryll fetches it at once, so text copied in the
+  session, passwords included, reaches the SPICE client unpasted (see
+  [running.md](running.md#what-a-client-gets)).
 - **After the RDP client disconnects**, chansrv may keep owning the
   clipboard and not answer requests for its text until the RDP client
   reconnects. Andris gives up on a fetch after 10 seconds, so the SPICE

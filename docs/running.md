@@ -320,6 +320,15 @@ desktop's clipboard owner does not answer a request for its text within
 10 seconds, andris gives up on that fetch and offers the client
 nothing.
 
+**What the clipboard shares.** Because andris offers each copy as it
+is made, and ryll fetches what it is offered at once, every text copied
+on the desktop reaches the connected SPICE client whether or not anyone
+pastes it there: text copied from a password manager included. A
+password manager that clears the clipboard later withdraws the offer,
+but the client already has the text. Connect only clients you would
+trust with the session's clipboard. Andris offers nothing to a client
+that does not announce clipboard sharing.
+
 **Resizing.** When the client asks for a desktop size, as ryll does
 when its window is resized, andris changes the X server's size through
 RandR, and the display surface follows (see Display above). A size

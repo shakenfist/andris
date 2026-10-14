@@ -454,6 +454,50 @@ async fn a_message_over_the_limit_closes_the_channel() {
     agent.client.expect_closed().await;
 }
 
+/// Clipboard text over the limit is the one oversized message that does
+/// not close the channel: it is skipped, and the stream carries on after
+/// it.
+#[tokio::test]
+async fn clipboard_data_over_the_limit_is_dropped_and_the_channel_stays_open() {
+    let server = TestServer::start().await;
+    let mut agent = AgentClient::ready(&server).await;
+    agent
+        .send_agent(VD_AGENT_CLIPBOARD, &vec![b'a'; MAX_AGENT_MESSAGE + 1])
+        .await;
+    agent.sync(&server).await;
+    assert_eq!(server.platform.clipboard_sets().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn a_truncated_monitors_config_closes_the_channel() {
+    let server = TestServer::start().await;
+    let mut agent = AgentClient::ready(&server).await;
+    let mut config = body(&monitors_config(1024, 768));
+    config.truncate(12);
+    agent.send_agent(VD_AGENT_MONITORS_CONFIG, &config).await;
+    agent.client.expect_closed().await;
+    server.wait_for_no_session().await;
+}
+
+#[tokio::test]
+async fn a_monitors_config_with_no_monitors_gets_an_error_reply() {
+    let server = TestServer::start().await;
+    let mut agent = AgentClient::ready(&server).await;
+    let config = MonitorsConfig {
+        flags: 0,
+        monitors: Vec::new(),
+        physical_sizes: Vec::new(),
+    };
+    agent
+        .send_agent(VD_AGENT_MONITORS_CONFIG, &body(&config))
+        .await;
+    let reply = VdAgentReply::decode(&agent.expect(VD_AGENT_REPLY).await).unwrap();
+    assert_eq!(reply.reply_type, VD_AGENT_MONITORS_CONFIG);
+    assert_eq!(reply.error, VD_AGENT_ERROR);
+    // Still open.
+    agent.sync(&server).await;
+}
+
 #[tokio::test]
 async fn a_malformed_agent_start_closes_the_channel() {
     let server = TestServer::start().await;
@@ -615,6 +659,42 @@ async fn the_client_clipboard_reaches_the_desktop() {
     agent
         .send_agent(VD_AGENT_CLIPBOARD_GRAB, &clip(&grab))
         .await;
+    agent.expect_quiet().await;
+}
+
+/// Text the client put on the desktop replaces what another program had
+/// copied there, so a client that reconnects is not offered that older
+/// text, which would overwrite its own clipboard.
+#[tokio::test]
+async fn a_reconnecting_client_is_not_offered_text_that_was_replaced() {
+    let server = TestServer::start().await;
+    server.platform.copy_text(Some("copied on the desktop"));
+    let mut agent = AgentClient::ready(&server).await;
+    agent.expect(VD_AGENT_CLIPBOARD_GRAB).await;
+
+    let grab = ClipboardGrab {
+        selection: VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD,
+        types: vec![VD_AGENT_CLIPBOARD_UTF8_TEXT],
+    };
+    agent
+        .send_agent(VD_AGENT_CLIPBOARD_GRAB, &clip(&grab))
+        .await;
+    agent.expect(VD_AGENT_CLIPBOARD_REQUEST).await;
+    let data = Clipboard {
+        selection: VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD,
+        clipboard_type: VD_AGENT_CLIPBOARD_UTF8_TEXT,
+        data: "copied on the client".into(),
+    };
+    agent.send_agent(VD_AGENT_CLIPBOARD, &clip(&data)).await;
+    let platform = server.platform.clone();
+    wait_until("the text reaches the desktop", || {
+        platform.clipboard_sets().unwrap() == 1
+    })
+    .await;
+    drop(agent);
+    server.wait_for_no_session().await;
+
+    let mut agent = AgentClient::ready(&server).await;
     agent.expect_quiet().await;
 }
 

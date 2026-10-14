@@ -32,9 +32,11 @@
 //! Text over [`INCR_CHUNK`] bytes, or over what one request can carry if
 //! that is less, goes in pieces (INCR), one per property deletion by the
 //! requestor; each transfer has [`TRANSFER_TIMEOUT`] to take each piece,
-//! and is dropped if its window is destroyed. Andris's own ownership is
-//! never published. When another program takes the selection, the thread
-//! stops serving and fetches that program's text.
+//! and is dropped if its window is destroyed. Andris's own text is never
+//! published: taking the selection publishes `None`, since the text
+//! published before has left the clipboard. When another program takes
+//! the selection, the thread stops serving and fetches that program's
+//! text.
 //!
 //! # The event loop
 //!
@@ -949,6 +951,9 @@ impl ClipboardThread {
         self.fetch = None;
         debug!(bytes = text.len(), "andris owns the X clipboard");
         self.owned = Some(Owned::new(&text, time));
+        // The text another program put there is gone. Left published, a
+        // client connecting later would be offered it as the desktop's.
+        self.publish(None);
         Ok(())
     }
 
@@ -968,6 +973,15 @@ impl ClipboardThread {
 
     /// Answer a request for andris's text.
     fn serve(&mut self, event: &SelectionRequestEvent) -> Result<(), Fault> {
+        // Andris never asks itself, so this is another client naming
+        // andris's window, which would have andris write to its own
+        // properties and later stop watching its own window. It gets no
+        // answer at all: a refusal sent there would look like an owner
+        // refusing a conversion andris has under way.
+        if event.requestor == self.window {
+            debug!("ignored a clipboard request naming andris's own window as the requestor");
+            return Ok(());
+        }
         // Clients from before ICCCM name no property: use the target.
         let property = if event.property == NONE {
             event.target
@@ -1119,7 +1133,8 @@ impl ClipboardThread {
 
     /// Stop following `window`'s events once no transfer to it remains.
     fn unwatch_if_idle(&self, window: Window) -> Result<(), Fault> {
-        if !self.transfers.keys().any(|(other, _)| *other == window) {
+        // Andris's own window keeps its events whatever happens.
+        if window != self.window && !self.transfers.keys().any(|(other, _)| *other == window) {
             xproto::change_window_attributes(
                 &*self.conn,
                 window,

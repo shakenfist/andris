@@ -825,6 +825,40 @@ async fn text_set_through_the_seam_is_pasted() {
     assert_eq!(kind, "INCR");
     assert!(paste(&display, "UTF8_STRING").unwrap() == big.as_bytes());
 
+    // A request naming andris's own window as the requestor is ignored:
+    // andris writes nothing there, and goes on serving.
+    let (conn, _, clipboard) = client(&display, "CLIPBOARD");
+    let owner = conn
+        .get_selection_owner(clipboard)
+        .unwrap()
+        .reply()
+        .unwrap()
+        .owner;
+    let utf8 = conn
+        .intern_atom(false, b"UTF8_STRING")
+        .unwrap()
+        .reply()
+        .unwrap()
+        .atom;
+    let property = conn
+        .intern_atom(false, b"HIJACKED")
+        .unwrap()
+        .reply()
+        .unwrap()
+        .atom;
+    conn.convert_selection(owner, clipboard, utf8, property, x11rb::CURRENT_TIME)
+        .unwrap();
+    // A round trip, so the server has passed the request on before the
+    // paste below asks for the text.
+    conn.get_input_focus().unwrap().reply().unwrap();
+    assert!(paste(&display, "UTF8_STRING").unwrap() == big.as_bytes());
+    let left = conn
+        .get_property(false, owner, property, AtomEnum::ANY, 0, 1)
+        .unwrap()
+        .reply()
+        .unwrap();
+    assert_eq!(left.type_, x11rb::NONE, "andris wrote to its own window");
+
     assert!(
         !changes.has_changed().unwrap(),
         "text andris sets is not reported back"
@@ -843,11 +877,22 @@ async fn another_owner_takes_the_clipboard_from_andris() {
 
     platform.set(Arc::from("andris's text")).unwrap();
     pasted_eventually(&display, "andris's text");
-    let theirs = Copier::new(&display, None, b"their text");
+    let _theirs = Copier::new(&display, None, b"their text");
     assert_eq!(reported(&mut changes).await.as_deref(), Some("their text"));
     assert_eq!(paste(&display, "UTF8_STRING").unwrap(), b"their text");
 
-    // Once they go, nobody serves the clipboard: andris stopped.
+    // Andris taking it back withdraws their text.
+    platform.set(Arc::from("andris's text again")).unwrap();
+    assert_eq!(reported(&mut changes).await, None);
+    pasted_eventually(&display, "andris's text again");
+
+    // Once they take it again and go, nobody serves the clipboard:
+    // andris stopped.
+    let theirs = Copier::new(&display, None, b"their text again");
+    assert_eq!(
+        reported(&mut changes).await.as_deref(),
+        Some("their text again")
+    );
     drop(theirs);
     assert_eq!(reported(&mut changes).await, None);
     assert_eq!(paste(&display, "UTF8_STRING"), None);
@@ -874,11 +919,21 @@ async fn an_owner_that_never_answers_times_out_and_stalls_nothing() {
     platform.set(Arc::from("meanwhile")).unwrap();
     pasted_eventually(&display, "meanwhile");
     assert!(start.elapsed() < CLIPBOARD_BOUND);
-    assert!(!changes.has_changed().unwrap());
+    assert!(
+        changes.has_changed().unwrap(),
+        "andris taking the clipboard withdraws the earlier text"
+    );
+    assert_eq!(*changes.borrow_and_update(), None);
 
     // Once andris has given up on a squatter's text, the earlier text is
     // gone: nothing is offered.
+    let copier = Copier::new(&display, None, b"before again");
+    assert_eq!(
+        reported(&mut changes).await.as_deref(),
+        Some("before again")
+    );
     let second = squat(&display);
+    drop(copier);
     let asked = Instant::now();
     tokio::time::timeout(CONVERSION_TIMEOUT + CLIPBOARD_BOUND, changes.changed())
         .await

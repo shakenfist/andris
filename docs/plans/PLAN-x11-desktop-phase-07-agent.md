@@ -271,7 +271,7 @@ its conventions in its `AGENTS.md`.
 |------|--------|-------|-----------|--------|---------------------|
 | 0 | low | management | none | Complete | Commit the phase 6 close-out and this plan; create the ryll worktree. See brief 0. |
 | 1 | high | opus | none | Complete | Spike: xorgxrdp's refusal, Xvfb's RandR, and chansrv's clipboard, on the test bed. Gated. See brief 1. |
-| 2 | high | opus | none | In progress | Ryll: headless clipboard, and control verbs for the clipboard and resize. Ryll PR. See brief 2. |
+| 2 | high | opus | none | Complete | Ryll: headless clipboard, and control verbs for the clipboard and resize. Ryll PR. See brief 2. |
 | 3 | medium | sonnet | none | Complete | Andris: bump the ryll pin to step 2's merge. See brief 3. |
 | 4 | high | opus | none | Complete | The agent protocol on the main channel, the two seams, and the synthetic platform's side. See brief 4. |
 | 5 | high | opus | none | Complete | X11 display control through RandR. See brief 5. |
@@ -606,6 +606,19 @@ open the pull request when the operator asks.
 ## Result
 
 Filled in as the steps complete.
+
+**Step 2: ryll#534**, merged as `b298b39`. Control protocol 1.3 adds
+`clipboard_set`, `clipboard_get`, `resize` and a `clipboard_changed`
+event for headless and web mode. Its review also found and fixed the
+suspected gap: a display size asked for while no agent was connected
+was never sent. So that the fix could not resize a guest away from a
+size the GUI had just auto-fitted to, the resize queue carries
+`Requested` or `GuestHas`. Its push audit and one review round bounded
+the clipboard (a 100 MiB cap, a length-only event, a bounded request
+line, and a poll that skips an unchanged clipboard). ryll#533 records
+a web-mode overflow found on the way, which predates it. Andris is
+pinned to `b298b39`, and `make lint test e2e e2e-xrdp` pass on it,
+X1 to X11 included.
 
 **Departure: step 3 ran before step 2 merged.** The agent reassembler
 andris needs was already on ryll's `develop`, so step 3 pinned

@@ -33,16 +33,14 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 x11rb = { version = "0.14", features = ["damage", "randr", "shm", "xfixes", "xkb", "xtest"] }
 
-# ryll's shared crates, pinned to 1858569, the head of ryll#534 (headless
-# clipboard and resize verbs), which `make e2e` needs. This rev lives only
-# on that pull request's branch: it is temporary, and moves to ryll#534's
-# merge commit on develop once that merges.
+# ryll's shared crates, pinned to b298b39, ryll#534's merge on develop,
+# whose headless clipboard and resize verbs `make e2e` needs.
 # Both crates come from one ryll workspace, so they must always carry the
 # same rev, here and in [dev-dependencies]; move them together.
-shakenfist-spice-protocol = { version = "0.1.7", git = "https://github.com/shakenfist/ryll", rev = "1858569780db05145bdf849b2fbabd30b6addc07" }
+shakenfist-spice-protocol = { version = "0.1.7", git = "https://github.com/shakenfist/ryll", rev = "b298b39bdeb1c439862053769bb0d5069d51b682" }
 # Only the encoders. openh264 is still built, because the crate depends on
 # it unconditionally (ryll#499).
-shakenfist-spice-compression = { version = "0.1.7", git = "https://github.com/shakenfist/ryll", rev = "1858569780db05145bdf849b2fbabd30b6addc07", default-features = false, features = [
+shakenfist-spice-compression = { version = "0.1.7", git = "https://github.com/shakenfist/ryll", rev = "b298b39bdeb1c439862053769bb0d5069d51b682", default-features = false, features = [
     "encode",
 ] }
 
@@ -51,7 +49,7 @@ rcgen = "0.14"
 # The LZ4 and pure-Rust JPEG decoders too, so tests can decode what the
 # encoders produced. Cargo unifies these features with the ones above in
 # test builds.
-shakenfist-spice-compression = { version = "0.1.7", git = "https://github.com/shakenfist/ryll", rev = "1858569780db05145bdf849b2fbabd30b6addc07", default-features = false, features = [
+shakenfist-spice-compression = { version = "0.1.7", git = "https://github.com/shakenfist/ryll", rev = "b298b39bdeb1c439862053769bb0d5069d51b682", default-features = false, features = [
     "encode",
     "jpeg",
     "lz4",

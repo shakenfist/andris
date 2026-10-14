@@ -278,8 +278,8 @@ its conventions in its `AGENTS.md`.
 | 6 | high | opus | none | Complete | The X11 clipboard thread. See brief 6. |
 | 7 | high | opus | none | Complete | End-to-end checks: `make e2e` and `make e2e-xrdp`. See brief 7. |
 | 8 | medium | sonnet | none | Complete | Documentation, and the xorgxrdp feature request drafted. See brief 8. |
-| 9 | medium | management | none | Not started | Operator acceptance on `:10`, by hand. See brief 9. |
-| 10 | medium | management | none | In progress | Push audit, pull request, queue. See brief 10. |
+| 9 | medium | management | none | Complete | Operator acceptance on `:10`, by hand. See brief 9. |
+| 10 | medium | management | none | Complete | Push audit, pull request, queue. See brief 10. |
 
 Steps 1 and 2 may run in parallel. Step 3 needs step 2's ryll pull
 request merged. Step 4 needs step 3. Steps 5 and 6 both touch
@@ -790,6 +790,16 @@ Declined, with reasons:
 - **Honouring password managers' clipboard hints:** andris#14.
 - **The long `ARCHITECTURE.md` row and the README rewrite**, which the
   docs reviewer judged legitimate.
+
+**Step 9: operator acceptance** (2026-10-14, on `:10` from the Mac,
+against `909a790`, with the RDP client connected from the same Mac).
+Text crossed both ways, and no grab repeated in the 30 s after
+either. Reconnecting ryll put the Mac's clipboard on the desktop
+rather than replacing it. Resizing the ryll window left the desktop
+at the RDP client's size, with one warning for the connection (the
+client asked for 2056x1144, and `RRSetScreenSize` got `BadMatch`),
+and RDP was unaffected. The operator missed the warning at first:
+it lands once per connection, and later refusals log at debug.
 
 **The xorgxrdp feature request (draft).** Not filed; the operator
 decides whether to file it at neutrinolabs/xorgxrdp.

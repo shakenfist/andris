@@ -176,7 +176,7 @@ written with `/next-phase` as each phase comes up.
 | 4. Server skeleton | PLAN-x11-desktop-phase-04-server-skeleton.md | Complete | andris `1950cdb` (#7) |
 | 5. Damage and flow control | PLAN-x11-desktop-phase-05-damage.md | Complete | andris `68b1058` (#8); andris `43bfe88` (#11) |
 | 6. Sharing the xrdp session | PLAN-x11-desktop-phase-06-sharing.md | Complete | andris `498a72c` (#12) |
-| 7. In-process agent: resize and clipboard | PLAN-x11-desktop-phase-07-agent.md | In progress | |
+| 7. In-process agent: resize and clipboard | PLAN-x11-desktop-phase-07-agent.md | Complete | ryll `b298b39` (#534); andris `b7ba2dd` (#16) |
 | 8. Video streams | Not yet written | Not started | |
 | 9. Audio | Not yet written | Not started | |
 | 10. Packaging and dogfood soak | Not yet written | Not started | |

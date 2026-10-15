@@ -159,6 +159,15 @@ Each has the default this plan takes if nobody answers.
    published, because most people will install a wheel. A `.deb` may
    be built as well, but is not the primary channel. No macOS,
    Windows or Homebrew builds.
+7. **H.264 patents in what andris ships.** openh264's code is
+   BSD-2-Clause, but Cisco's patent coverage applies only to Cisco's
+   own binary, downloaded separately onto the user's machine; a build
+   from source carries none. *Decided by the operator on 2026-10-15:*
+   phase 8 builds openh264 from source, as ryll already ships it, and
+   documents the position. Phase 10 decides what the PyPI wheels
+   ship: the compiled encoder, or an andris built with openh264's
+   `libloading` feature that loads a Cisco binary the operator
+   fetches.
 
 ## Execution
 
@@ -176,8 +185,8 @@ written with `/next-phase` as each phase comes up.
 | 4. Server skeleton | PLAN-x11-desktop-phase-04-server-skeleton.md | Complete | andris `1950cdb` (#7) |
 | 5. Damage and flow control | PLAN-x11-desktop-phase-05-damage.md | Complete | andris `68b1058` (#8); andris `43bfe88` (#11) |
 | 6. Sharing the xrdp session | PLAN-x11-desktop-phase-06-sharing.md | Complete | andris `498a72c` (#12) |
-| 7. In-process agent: resize and clipboard | PLAN-x11-desktop-phase-07-agent.md | In progress | |
-| 8. Video streams | Not yet written | Not started | |
+| 7. In-process agent: resize and clipboard | PLAN-x11-desktop-phase-07-agent.md | Complete | ryll `b298b39` (#534); andris `b7ba2dd` (#16) |
+| 8. Video streams | PLAN-x11-desktop-phase-08-video.md | In progress | |
 | 9. Audio | Not yet written | Not started | |
 | 10. Packaging and dogfood soak | Not yet written | Not started | |
 | 11. Human review | Not yet written | Not started | |
@@ -428,11 +437,25 @@ does not announce `VD_AGENT_CAP_CLIPBOARD_GRAB_SERIAL`.
 
 ### Phase 8: Video streams
 
-Detect rectangles with a sustained high update rate and serve them
-as H.264 streams (`STREAM_CREATE`, `STREAM_DATA`), using openh264
-first. Adapt bitrate and frame rate from the client's
-`STREAM_REPORT`, and tear streams down when the region goes quiet.
-Ryll's stream-flap diagnostics are the instrument for tuning this.
+Detect areas of the desktop that keep changing and look
+photographic, and serve each as an H.264 stream (`STREAM_CREATE`,
+`STREAM_DATA`) encoded with openh264, built from source with nasm.
+Adapt the bitrate from the client's `STREAM_REPORT` and from andris's
+own flow control, and tear a stream down when its area goes quiet,
+repairing the area losslessly. One stream per display channel.
+
+The phase starts with a ryll pull request:
+- ryll's H.264 encoder moves from its renderer crate, which andris
+  may not use, into `shakenfist-spice-compression`;
+- ryll advertises `CODEC_H264` by default while preferring MJPEG, so
+  spice-server keeps choosing MJPEG (ryll#398);
+- a stream-compositing stride bug is fixed;
+- headless mode gains a `stats` verb (ryll#512), so e2e can assert on
+  streams.
+
+A client without `CODEC_H264` keeps getting JPEG draws. Ryll's
+stream-flap diagnostics are the instrument for tuning this. Planned in
+[PLAN-x11-desktop-phase-08-video.md](PLAN-x11-desktop-phase-08-video.md).
 
 ### Phase 9: Audio
 

@@ -16,6 +16,7 @@
 
 mod support;
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -24,7 +25,7 @@ use andris::platform::synthetic::{SQUARE_SIZE, SQUARE_TOP};
 use andris::platform::{DisplayGeometry, Frame, Rectangle, Region, Size};
 use andris::server::display::{CAPTURE_RETRY, DisplayOptions, MAX_CAPTURE_FAILURES};
 use andris::server::updates::{
-    JpegQuality, MAX_RECTS_PER_FRAME, STREAM_LATENCY_BUDGET, StreamRequest,
+    JpegQuality, MAX_RECTS_PER_FRAME, STREAM_LATENCY_BUDGET, STREAM_QUIET,
 };
 use shakenfist_spice_compression::{
     JpegDecoder, JpegDecoderRsDecoder, VideoDecoder, decompress_spice_lz4, for_stream,
@@ -1262,135 +1263,323 @@ async fn ack_lag_is_recorded_once_a_window_is_acknowledged() {
     assert!(session.stats().ack_lag.latest().is_some());
 }
 
-/// The area the stream tests stream: two tiles by one and a half, across
-/// three colour bars and the square's path.
-const STREAM_RECT: Rectangle = Rectangle::new(64, 64, 128, 96);
+/// A desktop with room for a video below the square's path, and for a
+/// second beside it.
+const WIDE: Size = Size {
+    width: 640,
+    height: 384,
+};
 
-/// How long to wait for a stream frame before asking again: the encoder
-/// may skip a frame to hold its bitrate, and then sends nothing.
-const SKIPPED: Duration = Duration::from_secs(1);
+/// Where the stream tests play a video: tile-aligned, below the rows the
+/// square crosses.
+const VIDEO: Rectangle = Rectangle::new(320, 192, 256, 192);
+
+/// Where a video moves to: a tile column apart from [`VIDEO`].
+const MOVED: Rectangle = Rectangle::new(0, 192, 256, 192);
+
+/// Every row the square crosses on a [`WIDE`] desktop.
+const SQUARE_PATH: Rectangle = Rectangle::new(0, SQUARE_TOP, WIDE.width, SQUARE_SIZE);
 
 /// The most a decoded stream frame may differ from the desktop, as a mean
-/// over its pixels' red, green and blue.
-const STREAM_TOLERANCE: f64 = 3.0;
+/// over its pixels' red, green and blue. A frame of the video measured
+/// about 3 from the desktop it showed, and about 8 from the desktop a
+/// step of the video earlier, so this tells a current frame from a stale
+/// one.
+const STREAM_TOLERANCE: f64 = 5.0;
 
-/// Ask the display channel for `request`.
-fn request_stream(server: &TestServer, request: StreamRequest) {
-    let session = server.handle.session().unwrap();
-    assert!(
-        session.request_stream(request),
-        "no display channel took {request:?}"
-    );
+/// A server with a [`WIDE`] desktop and the frame interval of the servers
+/// here, its main channel, and a display channel linked with `caps`.
+async fn open_wide(caps: u32) -> (TestServer, TestClient, TestClient) {
+    let display = DisplayOptions {
+        frame_interval: INTERVAL,
+        ..display_options()
+    };
+    open_display_on(TestServer::start_sized(WIDE, display).await, caps).await
 }
 
-/// Ask for a stream over `rect`, and read its `STREAM_CREATE` and
-/// `STREAM_ACTIVATE_REPORT`, checking both. Returns the stream's id and
-/// the `unique_id` its reports must carry.
-async fn start_stream(server: &TestServer, client: &mut TestClient, rect: Rectangle) -> (u32, u32) {
-    request_stream(server, StreamRequest::Start(rect));
-    let message = client.recv().await;
-    assert_eq!(message.header.message_type, display_server::STREAM_CREATE);
-    let create = StreamCreate::decode(message.payload()).unwrap();
-    assert_eq!(
-        create,
-        StreamCreate {
-            surface_id: 0,
-            id: create.id,
-            flags: stream_flags::TOP_DOWN,
-            codec_type: 3,
-            stamp: 0,
-            stream_width: rect.width,
-            stream_height: rect.height,
-            src_width: rect.width,
-            src_height: rect.height,
-            dest: wire_rect(rect),
-            clip: Clip::none(),
-        }
-    );
-    let message = client.recv().await;
-    assert_eq!(
-        message.header.message_type,
-        display_server::STREAM_ACTIVATE_REPORT
-    );
-    let activate = StreamActivateReport::decode(message.payload()).unwrap();
-    assert_eq!(
-        activate,
-        StreamActivateReport {
-            stream_id: create.id,
-            unique_id: activate.unique_id,
-            max_window_size: 5,
-            timeout_ms: 1000,
-        }
-    );
-    (create.id, activate.unique_id)
+/// Changes the desktop every [`INTERVAL`], on a task of its own, until
+/// dropped.
+struct Ticker(tokio::task::JoinHandle<()>);
+
+impl Ticker {
+    fn start(mut step: impl FnMut() + Send + 'static) -> Self {
+        Self(tokio::spawn(async move {
+            loop {
+                step();
+                tokio::time::sleep(INTERVAL).await;
+            }
+        }))
+    }
+
+    /// Play a video in `rect`: a photograph that pans on every tick.
+    fn animate(server: &TestServer, rect: Rectangle) -> Self {
+        let platform = server.platform.clone();
+        Self::start(move || platform.animate(rect).unwrap())
+    }
+
+    /// Move the square on every tick: continuous change that LZ4 sends
+    /// well.
+    fn advance(server: &TestServer) -> Self {
+        let platform = server.platform.clone();
+        Self::start(move || platform.advance().unwrap())
+    }
 }
 
-/// Ask for stream frames until one arrives, since the encoder may skip
-/// some, and check it is for stream `id`. Returns it, with the session's
-/// time just before it was asked for and just after it arrived.
-async fn next_stream_frame(
+impl Drop for Ticker {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Whether two wire rectangles share a pixel.
+fn overlaps(a: &Rect, b: Rectangle) -> bool {
+    let b = wire_rect(b);
+    a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
+}
+
+/// One live stream, as a client holds it.
+struct LiveStream {
+    dest: Rect,
+    decoder: Box<dyn VideoDecoder>,
+}
+
+/// What a client sees of the display channel once its start sequence is
+/// over: the surface, drawn from draws and from decoded stream frames,
+/// and what it was told of streams. Every message is checked as it is
+/// applied.
+struct Viewer {
+    screen: Screen,
+    live: HashMap<u32, LiveStream>,
+    /// Every `STREAM_CREATE`, in order.
+    created: Vec<StreamCreate>,
+    /// The `unique_id` of each stream's reports.
+    unique_ids: HashMap<u32, u32>,
+    /// How many `STREAM_DATA` arrived, and the last.
+    frames: usize,
+    last_frame: Option<StreamData>,
+    /// The ids `STREAM_DESTROY` ended, in order.
+    destroyed: Vec<u32>,
+    /// How many `STREAM_DESTROY_ALL` arrived.
+    destroyed_all: usize,
+    /// The box of every draw, and of every draw while a stream lived.
+    draws: Vec<Rect>,
+    draws_while_streaming: Vec<Rect>,
+    /// Messages received since `SET_ACK`, for the `ACK`s.
+    received: u32,
+}
+
+impl Viewer {
+    /// Run the start sequence, and acknowledge messages from then on as
+    /// ryll does, a window at a time, so that the ack window never holds
+    /// frames back.
+    async fn start(server: &TestServer, client: &mut TestClient) -> Self {
+        let screen = start(server, client, image_compression::AUTO_GLZ).await;
+        client
+            .send(display_client::ACK_SYNC, &body(&AckSync { generation: 1 }))
+            .await;
+        // SET_ACK and the start sequence's four.
+        Self::resume(screen, 5)
+    }
+
+    /// Carry on from `screen`, `received` messages after `SET_ACK`.
+    fn resume(screen: Screen, received: u32) -> Self {
+        Self {
+            screen,
+            live: HashMap::new(),
+            created: Vec::new(),
+            unique_ids: HashMap::new(),
+            frames: 0,
+            last_frame: None,
+            destroyed: Vec::new(),
+            destroyed_all: 0,
+            draws: Vec::new(),
+            draws_while_streaming: Vec::new(),
+            received,
+        }
+    }
+
+    /// Acknowledge `message` if it completes a window, and apply it.
+    async fn take(&mut self, client: &mut TestClient, message: &ReceivedMessage) {
+        self.received += 1;
+        if self.received.is_multiple_of(WINDOW) {
+            client.send(display_client::ACK, &[]).await;
+        }
+        self.apply(message);
+    }
+
+    /// Apply one message, checking it.
+    fn apply(&mut self, message: &ReceivedMessage) {
+        match message.header.message_type {
+            display_server::DRAW_COPY => {
+                let draw = decode_draw(message);
+                self.screen.apply(&draw);
+                if !self.live.is_empty() {
+                    self.draws_while_streaming.push(draw.bbox);
+                }
+                self.draws.push(draw.bbox);
+            }
+            display_server::MARK => assert!(message.payload().is_empty()),
+            display_server::STREAM_CREATE => {
+                let create = StreamCreate::decode(message.payload()).unwrap();
+                let (width, height) = (
+                    (create.dest.right - create.dest.left) as u32,
+                    (create.dest.bottom - create.dest.top) as u32,
+                );
+                assert_eq!(
+                    create,
+                    StreamCreate {
+                        surface_id: 0,
+                        id: create.id,
+                        flags: stream_flags::TOP_DOWN,
+                        codec_type: 3,
+                        stamp: 0,
+                        stream_width: width,
+                        stream_height: height,
+                        src_width: width,
+                        src_height: height,
+                        dest: create.dest,
+                        clip: Clip::none(),
+                    }
+                );
+                let decoder = for_stream(3, Arc::new(JpegDecoderRsDecoder::new())).unwrap();
+                let stream = LiveStream {
+                    dest: create.dest,
+                    decoder,
+                };
+                assert!(
+                    self.live.insert(create.id, stream).is_none(),
+                    "stream {} was created twice",
+                    create.id
+                );
+                self.created.push(create);
+            }
+            display_server::STREAM_ACTIVATE_REPORT => {
+                let activate = StreamActivateReport::decode(message.payload()).unwrap();
+                assert!(self.live.contains_key(&activate.stream_id));
+                assert_eq!((activate.max_window_size, activate.timeout_ms), (5, 1000));
+                self.unique_ids
+                    .insert(activate.stream_id, activate.unique_id);
+            }
+            display_server::STREAM_DATA => {
+                let data = StreamData::decode(message.payload()).unwrap();
+                let stream = self
+                    .live
+                    .get_mut(&data.base.id)
+                    .expect("a frame for a stream that is not live");
+                if let Some(frame) = stream.decoder.decode(&data.data).unwrap() {
+                    let dest = stream.dest;
+                    let width = (dest.right - dest.left) as usize;
+                    assert_eq!(
+                        (frame.width as usize, frame.height as i32),
+                        (width, dest.bottom - dest.top)
+                    );
+                    for (row, y) in (dest.top..dest.bottom).enumerate() {
+                        let at = (y as usize * self.screen.width as usize + dest.left as usize) * 4;
+                        let from = &frame.rgba[row * width * 4..(row + 1) * width * 4];
+                        for (to, pixel) in self.screen.rgba[at..at + width * 4]
+                            .as_chunks_mut::<4>()
+                            .0
+                            .iter_mut()
+                            .zip(from.as_chunks::<4>().0)
+                        {
+                            *to = [pixel[0], pixel[1], pixel[2], 255];
+                        }
+                    }
+                }
+                self.frames += 1;
+                self.last_frame = Some(data);
+            }
+            display_server::STREAM_DESTROY => {
+                let destroy = StreamDestroy::decode(message.payload()).unwrap();
+                assert!(
+                    self.live.remove(&destroy.id).is_some(),
+                    "stream {} ended but was not live",
+                    destroy.id
+                );
+                self.destroyed.push(destroy.id);
+            }
+            display_server::STREAM_DESTROY_ALL => {
+                assert!(message.payload().is_empty());
+                self.live.clear();
+                self.destroyed_all += 1;
+            }
+            other => panic!("unexpected opcode {other}"),
+        }
+    }
+
+    /// Apply whatever arrives within `wait`.
+    async fn read_for(&mut self, client: &mut TestClient, wait: Duration) {
+        let deadline = Instant::now() + wait;
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match client.recv_within(left).await {
+                Some(message) => self.take(client, &message).await,
+                None => return,
+            }
+        }
+    }
+
+    /// Apply messages until `done` holds.
+    async fn read_until(
+        &mut self,
+        client: &mut TestClient,
+        what: &str,
+        done: impl Fn(&Self) -> bool,
+    ) {
+        tokio::time::timeout(support::WAIT, async {
+            while !done(self) {
+                let message = client.recv().await;
+                self.take(client, &message).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting until {what}"));
+    }
+
+    /// The mean difference, over the red, green and blue of every pixel of
+    /// `rect`, between the screen and `desktop`.
+    fn error(&self, desktop: &Frame, rect: Rectangle) -> f64 {
+        let mut total = 0u64;
+        for y in rect.y..rect.y + rect.height {
+            let want = rgba(desktop.row(y).unwrap());
+            let at = y as usize * self.screen.width as usize * 4;
+            let got = &self.screen.rgba[at..at + want.len()];
+            let (left, right) = (rect.x as usize * 4, (rect.x + rect.width) as usize * 4);
+            for (w, g) in want[left..right]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(got[left..right].as_chunks::<4>().0)
+            {
+                total += (0..3).map(|c| u64::from(w[c].abs_diff(g[c]))).sum::<u64>();
+            }
+        }
+        total as f64 / (rect.area() * 3) as f64
+    }
+}
+
+/// Play a video in `rect` until a stream starts and sends a frame.
+/// Returns the video, still playing, and the stream's `STREAM_CREATE`.
+async fn stream_video(
     server: &TestServer,
     client: &mut TestClient,
-    id: u32,
-) -> (StreamData, Duration, Duration) {
-    let session = server.handle.session().unwrap();
-    for _ in 0..10 {
-        let asked = session.elapsed();
-        request_stream(server, StreamRequest::Frame);
-        if let Some(message) = client.recv_within(SKIPPED).await {
-            let arrived = session.elapsed();
-            assert_eq!(message.header.message_type, display_server::STREAM_DATA);
-            let data = StreamData::decode(message.payload()).unwrap();
-            assert_eq!(data.base.id, id);
-            return (data, asked, arrived);
-        }
-    }
-    panic!("ten frames asked for, and none sent");
-}
-
-/// Read `STREAM_DESTROY`, and check it ends stream `id`.
-async fn expect_stream_destroy(client: &mut TestClient, id: u32) {
-    let message = client.recv().await;
-    assert_eq!(message.header.message_type, display_server::STREAM_DESTROY);
-    assert_eq!(
-        StreamDestroy::decode(message.payload()).unwrap(),
-        StreamDestroy { id }
-    );
-}
-
-/// The decoder ryll makes for an H.264 stream.
-fn stream_decoder() -> Box<dyn VideoDecoder> {
-    for_stream(3, Arc::new(JpegDecoderRsDecoder::new())).unwrap()
-}
-
-/// Decode `data` and check it shows what the desktop shows in `rect`, to
-/// within [`STREAM_TOLERANCE`].
-fn assert_frame_shows(
-    decoder: &mut Box<dyn VideoDecoder>,
-    data: &StreamData,
-    server: &TestServer,
+    viewer: &mut Viewer,
     rect: Rectangle,
-) {
-    let decoded = decoder
-        .decode(&data.data)
-        .unwrap()
-        .expect("a whole frame decodes");
-    assert_eq!((decoded.width, decoded.height), (rect.width, rect.height));
-    let expected = server.platform.desktop().unwrap().crop(rect).unwrap();
-    let mut total = 0u64;
-    for y in 0..rect.height {
-        let want = rgba(expected.row(y).unwrap());
-        let at = y as usize * rect.width as usize * 4;
-        let got = &decoded.rgba[at..at + want.len()];
-        for (w, g) in want.as_chunks::<4>().0.iter().zip(got.as_chunks::<4>().0) {
-            total += (0..3).map(|c| u64::from(w[c].abs_diff(g[c]))).sum::<u64>();
-        }
-    }
-    let error = total as f64 / (rect.area() * 3) as f64;
-    assert!(
-        error < STREAM_TOLERANCE,
-        "the frame differs from the desktop by {error:.2} a channel on average"
-    );
+) -> (Ticker, StreamCreate) {
+    let video = Ticker::animate(server, rect);
+    let streams = viewer.created.len();
+    viewer
+        .read_until(client, "a stream starts", |viewer| {
+            viewer.created.len() > streams
+        })
+        .await;
+    let create = viewer.created[streams].clone();
+    let frames = viewer.frames;
+    viewer
+        .read_until(client, "a stream frame arrives", |viewer| {
+            viewer.frames > frames
+        })
+        .await;
+    (video, create)
 }
 
 /// A `STREAM_REPORT` for `stream_id` with `unique_id`, of five frames, one
@@ -1470,54 +1659,181 @@ impl<'a> MakeWriter<'a> for Captured {
 const STREAMS_OFF: &str = "sending no more video streams on this connection";
 
 #[tokio::test]
-async fn a_stream_is_created_sends_frames_that_decode_and_is_destroyed() {
-    let (server, _main, mut client) = open_display(capabilities::DEFAULT_DISPLAY).await;
-    let mut screen = start(&server, &mut client, image_compression::AUTO_GLZ).await;
-    let (id, _) = start_stream(&server, &mut client, STREAM_RECT).await;
-    // Nothing is sent until a frame is asked for.
-    expect_quiet(&mut client).await;
-
-    let mut decoder = stream_decoder();
-    let (data, _, _) = next_stream_frame(&server, &mut client, id).await;
-    assert_frame_shows(&mut decoder, &data, &server, STREAM_RECT);
-
-    // Draws carry on as usual, and the next frame shows the change too.
-    advance_and_expect_frame(&server, &mut client, &mut screen).await;
-    let (data, _, _) = next_stream_frame(&server, &mut client, id).await;
-    assert_frame_shows(&mut decoder, &data, &server, STREAM_RECT);
-
-    request_stream(&server, StreamRequest::Stop);
-    expect_stream_destroy(&mut client, id).await;
-    // With no stream, a frame asked for sends nothing.
-    request_stream(&server, StreamRequest::Frame);
-    expect_quiet(&mut client).await;
-}
-
-#[tokio::test]
-async fn stream_frames_are_stamped_ahead_of_the_session_clock_by_the_budget() {
-    let (server, mut main, mut client) = open_display(capabilities::DEFAULT_DISPLAY).await;
+async fn a_playing_video_streams_and_its_frames_decode() {
+    let (server, mut main, mut client) = open_wide(capabilities::DEFAULT_DISPLAY).await;
     let message = main.recv().await;
     assert_eq!(message.header.message_type, main_server::INIT);
     let init = MainInit::decode(message.payload()).unwrap();
-    start(&server, &mut client, image_compression::AUTO_GLZ).await;
-    let (id, _) = start_stream(&server, &mut client, STREAM_RECT).await;
+    let mut viewer = Viewer::start(&server, &mut client).await;
 
+    let started = Instant::now();
+    let (video, create) = stream_video(&server, &mut client, &mut viewer, VIDEO).await;
+    // Twenty frames at least, a frame interval apart.
+    assert!(started.elapsed() >= INTERVAL * 19);
+    assert_eq!(create.dest, wire_rect(VIDEO));
+    viewer
+        .read_until(&mut client, "frames flow", |viewer| viewer.frames >= 3)
+        .await;
+    drop(video);
+    viewer.read_for(&mut client, QUIET).await;
+
+    // A frame at a time, so that each frame sent shows the desktop as it
+    // is: decoded, it is close to the desktop, and it is stamped ahead of
+    // the session's clock, the one MAIN_INIT gave, by the budget.
+    let session = server.handle.session().unwrap();
     let budget = STREAM_LATENCY_BUDGET.as_millis() as u32;
-    for _ in 0..3 {
-        let (data, asked, arrived) = next_stream_frame(&server, &mut client, id).await;
-        let time = data.base.multi_media_time;
-        // On the clock MAIN_INIT gave the client, between the moment it
-        // was asked for and the moment it arrived, plus the budget.
+    let mut checked = 0;
+    for _ in 0..40 {
+        let asked = session.elapsed();
+        server.platform.animate(VIDEO).unwrap();
+        let frames = viewer.frames;
+        viewer
+            .read_for(&mut client, Duration::from_millis(150))
+            .await;
+        let arrived = session.elapsed();
+        if viewer.frames == frames {
+            // The encoder skipped it to hold its bitrate.
+            continue;
+        }
+        assert_eq!(viewer.frames, frames + 1);
+        let time = viewer.last_frame.as_ref().unwrap().base.multi_media_time;
         assert!(init.multi_media_time + budget <= time);
         let earliest = asked.as_millis() as u32 + budget;
         let latest = arrived.as_millis() as u32 + budget;
         assert!(
             (earliest..=latest).contains(&time),
-            "a frame stamped {time} ms, asked for at {} ms and arrived at {} ms",
+            "a frame stamped {time} ms, asked for at {} ms and read by {} ms",
             asked.as_millis(),
             arrived.as_millis()
         );
+        let error = viewer.error(&server.platform.desktop().unwrap(), VIDEO);
+        assert!(
+            error < STREAM_TOLERANCE,
+            "the frame differs from the desktop by {error:.2} a channel on average"
+        );
+        checked += 1;
+        if checked == 3 {
+            break;
+        }
     }
+    assert_eq!(checked, 3, "too few frames were sent");
+    assert_eq!(viewer.created.len(), 1);
+    assert!(viewer.destroyed.is_empty());
+}
+
+#[tokio::test]
+async fn draws_flow_beside_a_stream_and_never_inside_it() {
+    let (server, _main, mut client) = open_wide(capabilities::DEFAULT_DISPLAY).await;
+    let mut viewer = Viewer::start(&server, &mut client).await;
+    let _square = Ticker::advance(&server);
+    let (_video, create) = stream_video(&server, &mut client, &mut viewer, VIDEO).await;
+    assert_eq!(create.dest, wire_rect(VIDEO));
+    viewer.read_for(&mut client, Duration::from_secs(1)).await;
+
+    let inside: Vec<&Rect> = viewer
+        .draws_while_streaming
+        .iter()
+        .filter(|bbox| overlaps(bbox, VIDEO))
+        .collect();
+    assert!(inside.is_empty(), "draws inside the stream: {inside:?}");
+    let beside = viewer
+        .draws_while_streaming
+        .iter()
+        .filter(|bbox| overlaps(bbox, SQUARE_PATH))
+        .count();
+    assert!(beside >= 10, "only {beside} draws of the square");
+    // One stream, of the video, and it lives on.
+    assert_eq!(viewer.created.len(), 1);
+    assert!(viewer.destroyed.is_empty());
+}
+
+#[tokio::test]
+async fn continuous_lossless_change_never_streams() {
+    // Two tiles wide, so that the square bounces within the same 2 x 2
+    // tiles, changing every one of them on every tick: as hot as a video,
+    // but not a picture.
+    let narrow = Size {
+        width: 128,
+        height: 192,
+    };
+    let display = DisplayOptions {
+        frame_interval: INTERVAL,
+        ..display_options()
+    };
+    let server = TestServer::start_sized(narrow, display).await;
+    let (server, _main, mut client) = open_display_on(server, capabilities::DEFAULT_DISPLAY).await;
+    let mut viewer = Viewer::start(&server, &mut client).await;
+    let square = Ticker::advance(&server);
+    viewer
+        .read_for(&mut client, Duration::from_millis(1500))
+        .await;
+    drop(square);
+    assert!(viewer.created.is_empty());
+    assert!(
+        viewer.draws.len() >= 30,
+        "only {} draws",
+        viewer.draws.len()
+    );
+}
+
+#[tokio::test]
+async fn a_still_stream_ends_and_its_area_is_repaired_at_once() {
+    let (server, _main, mut client) = open_wide(capabilities::DEFAULT_DISPLAY).await;
+    let mut viewer = Viewer::start(&server, &mut client).await;
+    let (video, create) = stream_video(&server, &mut client, &mut viewer, VIDEO).await;
+    drop(video);
+    let stopped = Instant::now();
+    viewer
+        .read_until(&mut client, "the stream ends", |viewer| {
+            !viewer.destroyed.is_empty()
+        })
+        .await;
+    let took = stopped.elapsed();
+    assert!(
+        took >= STREAM_QUIET - INTERVAL * 2 && took < Duration::from_millis(1500),
+        "the stream ended {took:?} after the video stopped"
+    );
+    assert_eq!(viewer.destroyed, vec![create.id]);
+
+    // The lossless refresh follows at once, and the client then shows
+    // the desktop exactly.
+    viewer
+        .read_for(&mut client, Duration::from_millis(250))
+        .await;
+    viewer
+        .screen
+        .assert_shows(&server.platform.desktop().unwrap());
+    viewer.read_for(&mut client, QUIET).await;
+    assert_eq!(viewer.created.len(), 1);
+}
+
+#[tokio::test]
+async fn a_video_that_moves_away_ends_its_stream_and_another_starts() {
+    let (server, _main, mut client) = open_wide(capabilities::DEFAULT_DISPLAY).await;
+    let mut viewer = Viewer::start(&server, &mut client).await;
+    let (video, first) = stream_video(&server, &mut client, &mut viewer, VIDEO).await;
+    drop(video);
+    let (_video, second) = stream_video(&server, &mut client, &mut viewer, MOVED).await;
+    assert_eq!(viewer.destroyed, vec![first.id]);
+    assert_eq!(second.dest, wire_rect(MOVED));
+    assert_eq!(second.id, first.id + 1);
+}
+
+#[tokio::test]
+async fn a_video_that_grows_past_its_stream_restarts_it() {
+    let (server, _main, mut client) = open_wide(capabilities::DEFAULT_DISPLAY).await;
+    let mut viewer = Viewer::start(&server, &mut client).await;
+    let small = Rectangle::new(320, 192, 128, 128);
+    let (video, first) = stream_video(&server, &mut client, &mut viewer, small).await;
+    assert_eq!(first.dest, wire_rect(small));
+    drop(video);
+    // Three times the area, around it: it never goes still.
+    let large = Rectangle::new(256, 192, 384, 192);
+    let grown = Instant::now();
+    let (_video, second) = stream_video(&server, &mut client, &mut viewer, large).await;
+    assert!(grown.elapsed() < STREAM_QUIET + Duration::from_secs(1));
+    assert_eq!(viewer.destroyed, vec![first.id]);
+    assert_eq!(second.dest, wire_rect(large));
 }
 
 #[tokio::test]
@@ -1526,24 +1842,29 @@ async fn no_stream_starts_without_both_h264_caps() {
         capabilities::DEFAULT_DISPLAY & !capabilities::DISPLAY_CODEC_H264,
         capabilities::DEFAULT_DISPLAY & !capabilities::DISPLAY_MULTI_CODEC,
     ] {
-        let (server, _main, mut client) = open_display(caps).await;
-        let mut screen = start(&server, &mut client, image_compression::AUTO_GLZ).await;
-        request_stream(&server, StreamRequest::Start(STREAM_RECT));
-        request_stream(&server, StreamRequest::Frame);
-        request_stream(&server, StreamRequest::Stop);
-        expect_quiet(&mut client).await;
-        // The channel carries on with draws.
-        advance_and_expect_frame(&server, &mut client, &mut screen).await;
-        expect_quiet(&mut client).await;
+        let (server, _main, mut client) = open_wide(caps).await;
+        let mut viewer = Viewer::start(&server, &mut client).await;
+        let video = Ticker::animate(&server, VIDEO);
+        viewer.read_for(&mut client, Duration::from_secs(1)).await;
+        drop(video);
+        assert!(viewer.created.is_empty());
+        // The video goes as draws instead.
+        let drawn = viewer
+            .draws
+            .iter()
+            .filter(|bbox| overlaps(bbox, VIDEO))
+            .count();
+        assert!(drawn >= 20, "only {drawn} draws of the video");
     }
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn reports_for_another_stream_or_unique_id_are_ignored() {
     let (logs, _guard) = Captured::start(tracing::Level::DEBUG);
-    let (server, _main, mut client) = open_display(capabilities::DEFAULT_DISPLAY).await;
-    start(&server, &mut client, image_compression::AUTO_GLZ).await;
-    let (id, unique_id) = start_stream(&server, &mut client, STREAM_RECT).await;
+    let (server, _main, mut client) = open_wide(capabilities::DEFAULT_DISPLAY).await;
+    let mut viewer = Viewer::start(&server, &mut client).await;
+    let (_video, create) = stream_video(&server, &mut client, &mut viewer, VIDEO).await;
+    let (id, unique_id) = (create.id, viewer.unique_ids[&create.id]);
 
     // Another stream's report, even one saying it cannot be decoded, and
     // a report from an earlier stream with this id.
@@ -1557,10 +1878,10 @@ async fn reports_for_another_stream_or_unique_id_are_ignored() {
             .send(display_client::STREAM_REPORT, &body(&report))
             .await;
     }
-    wait_until("the reports are read", || {
-        logs.text().matches("a stream report").count() == 4
-    })
-    .await;
+    let reports = |logs: &Captured| logs.text().matches("a stream report").count();
+    viewer
+        .read_until(&mut client, "the reports are read", |_| reports(&logs) == 4)
+        .await;
     let text = logs.text();
     assert_eq!(
         text.matches("a report for another stream; ignored").count(),
@@ -1576,66 +1897,75 @@ async fn reports_for_another_stream_or_unique_id_are_ignored() {
     assert!(!text.contains(STREAMS_OFF), "{text}");
 
     // The stream lives on.
-    next_stream_frame(&server, &mut client, id).await;
-    expect_quiet(&mut client).await;
+    let frames = viewer.frames;
+    viewer
+        .read_until(&mut client, "more frames arrive", |viewer| {
+            viewer.frames > frames
+        })
+        .await;
+    assert!(viewer.destroyed.is_empty());
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_client_that_cannot_decode_ends_streams_with_one_warning() {
     let (logs, _guard) = Captured::start(tracing::Level::WARN);
-    let (server, _main, mut client) = open_display(capabilities::DEFAULT_DISPLAY).await;
-    let mut screen = start(&server, &mut client, image_compression::AUTO_GLZ).await;
-    let (id, _) = start_stream(&server, &mut client, STREAM_RECT).await;
-    next_stream_frame(&server, &mut client, id).await;
+    let (server, _main, mut client) = open_wide(capabilities::DEFAULT_DISPLAY).await;
+    let mut viewer = Viewer::start(&server, &mut client).await;
+    let (_video, create) = stream_video(&server, &mut client, &mut viewer, VIDEO).await;
 
     // As spice-gtk sends it, with no unique_id.
     client
-        .send(display_client::STREAM_REPORT, &body(&cannot_decode(id)))
+        .send(
+            display_client::STREAM_REPORT,
+            &body(&cannot_decode(create.id)),
+        )
         .await;
-    expect_stream_destroy(&mut client, id).await;
+    viewer
+        .read_until(&mut client, "the stream ends", |viewer| {
+            !viewer.destroyed.is_empty()
+        })
+        .await;
+    assert_eq!(viewer.destroyed, vec![create.id]);
 
-    // Saying it again, or asking for another stream, does nothing.
+    // Saying it again does nothing, and the video, still playing, goes
+    // as draws from now on.
     client
-        .send(display_client::STREAM_REPORT, &body(&cannot_decode(id)))
+        .send(
+            display_client::STREAM_REPORT,
+            &body(&cannot_decode(create.id)),
+        )
         .await;
-    request_stream(&server, StreamRequest::Start(STREAM_RECT));
-    request_stream(&server, StreamRequest::Frame);
-    expect_quiet(&mut client).await;
-
-    // Draws carry on.
-    advance_and_expect_frame(&server, &mut client, &mut screen).await;
+    let draws = viewer.draws.len();
+    viewer.read_for(&mut client, Duration::from_secs(1)).await;
+    assert_eq!(viewer.created.len(), 1);
+    assert!(viewer.draws.len() >= draws + 20);
     let text = logs.text();
     assert_eq!(text.matches(STREAMS_OFF).count(), 1, "{text}");
 }
 
 #[tokio::test]
 async fn a_resize_ends_every_stream_before_the_surface() {
-    let (server, _main, mut client) = open_display(capabilities::DEFAULT_DISPLAY).await;
-    start(&server, &mut client, image_compression::AUTO_GLZ).await;
-    let (id, _) = start_stream(&server, &mut client, STREAM_RECT).await;
-    next_stream_frame(&server, &mut client, id).await;
+    let (server, _main, mut client) = open_wide(capabilities::DEFAULT_DISPLAY).await;
+    let mut viewer = Viewer::start(&server, &mut client).await;
+    let (video, first) = stream_video(&server, &mut client, &mut viewer, VIDEO).await;
+    drop(video);
 
     let size = Size {
-        width: 320,
-        height: 256,
+        width: 640,
+        height: 448,
     };
     server.platform.set_size(size).unwrap();
-    let message = client.recv().await;
-    assert_eq!(
-        message.header.message_type,
-        display_server::STREAM_DESTROY_ALL
-    );
-    assert!(message.payload().is_empty());
-    expect_replaced_surface(&server, &mut client, size).await;
-    expect_quiet(&mut client).await;
+    viewer
+        .read_until(&mut client, "every stream ends", |viewer| {
+            viewer.destroyed_all == 1
+        })
+        .await;
+    assert!(viewer.destroyed.is_empty());
+    // Next comes the surface, in five messages.
+    let screen = expect_replaced_surface(&server, &mut client, size).await;
 
-    // The stream went with the surface, and another may start on the new
-    // one, with the next id.
-    request_stream(&server, StreamRequest::Frame);
-    expect_quiet(&mut client).await;
-    let (next, _) = start_stream(&server, &mut client, STREAM_RECT).await;
-    assert_eq!(next, id + 1);
-    let mut decoder = stream_decoder();
-    let (data, _, _) = next_stream_frame(&server, &mut client, next).await;
-    assert_frame_shows(&mut decoder, &data, &server, STREAM_RECT);
+    // Another stream may start on the new surface, with the next id.
+    let mut viewer = Viewer::resume(screen, viewer.received + 5);
+    let (_video, second) = stream_video(&server, &mut client, &mut viewer, VIDEO).await;
+    assert_eq!(second.id, first.id + 1);
 }

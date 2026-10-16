@@ -106,6 +106,12 @@ impl TestServer {
         Self::start_full(false, display, HandshakeTimeouts::default()).await
     }
 
+    /// A server with only a plain listener, exporting a synthetic
+    /// desktop of `size`, whose display channels run with `display`.
+    pub async fn start_sized(size: Size, display: DisplayOptions) -> Self {
+        Self::start_on(false, size, display, HandshakeTimeouts::default()).await
+    }
+
     /// A server with only a plain listener and the handshake time limits
     /// `timeouts`.
     pub async fn start_with_timeouts(timeouts: HandshakeTimeouts) -> Self {
@@ -132,12 +138,21 @@ impl TestServer {
     }
 
     async fn start_full(tls: bool, display: DisplayOptions, timeouts: HandshakeTimeouts) -> Self {
-        init_logging();
-        let platform = SyntheticPlatform::new(Size {
+        let size = Size {
             width: 256,
             height: 192,
-        })
-        .unwrap();
+        };
+        Self::start_on(tls, size, display, timeouts).await
+    }
+
+    async fn start_on(
+        tls: bool,
+        size: Size,
+        display: DisplayOptions,
+        timeouts: HandshakeTimeouts,
+    ) -> Self {
+        init_logging();
+        let platform = SyntheticPlatform::new(size).unwrap();
         let (tls_options, certificate) = if tls {
             // Through PEM files, so the server's own loader is exercised.
             let generated =

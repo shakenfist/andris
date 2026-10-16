@@ -29,6 +29,12 @@
 //! photograph: smooth gradients and waves with a fixed grain, which LZ4
 //! shrinks little and JPEG a lot. The latest paint is on top.
 //!
+//! [`SyntheticPlatform::animate`] shows one more rectangle above
+//! everything: the same photograph, panned a little further on each call,
+//! as a playing video's area changes. It is one rectangle, not an
+//! overlay, so animating for long costs nothing extra; animating
+//! another rectangle moves it there.
+//!
 //! Paints are kept, not flattened into the pattern: each adds an overlay
 //! that every later capture checks, pixel by pixel, so rendering costs
 //! the pixels captured times the overlays painted. Paints are for tests
@@ -39,8 +45,10 @@
 //!
 //! [`SyntheticPlatform::advance`] reports the square's old and new
 //! rectangles as damage, [`SyntheticPlatform::paint`] and
-//! [`SyntheticPlatform::paint_photo`] the rectangle they paint, and
-//! [`SyntheticPlatform::set_size`] the whole desktop at its new size.
+//! [`SyntheticPlatform::paint_photo`] the rectangle they paint,
+//! [`SyntheticPlatform::animate`] the rectangle it animates and any it
+//! moved from, and [`SyntheticPlatform::set_size`] the whole desktop at
+//! its new size.
 //! [`SyntheticPlatform::paint_undamaged`] changes pixels and reports
 //! nothing, as a change XDamage missed would, and
 //! [`SyntheticPlatform::report_damage`] reports damage and changes
@@ -121,6 +129,13 @@ enum Fill {
     Photo,
 }
 
+/// The animated rectangle, and how many times it has moved on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Animation {
+    rect: Rectangle,
+    frame: u32,
+}
+
 /// What the synthetic desktop looks like now.
 #[derive(Debug)]
 struct State {
@@ -128,6 +143,8 @@ struct State {
     square_x: u32,
     /// Solid rectangles over the pattern, the latest on top.
     overlays: Vec<(Rectangle, Fill)>,
+    /// Above the overlays.
+    animation: Option<Animation>,
     locks: LockState,
     /// How many of the next captures fail.
     failing_captures: u32,
@@ -164,6 +181,7 @@ struct Scene {
     size: Size,
     square_x: u32,
     overlays: Vec<(Rectangle, Fill)>,
+    animation: Option<Animation>,
 }
 
 impl SyntheticPlatform {
@@ -178,6 +196,7 @@ impl SyntheticPlatform {
                 size,
                 square_x: 0,
                 overlays: Vec::new(),
+                animation: None,
                 locks: LockState::default(),
                 failing_captures: 0,
                 failing_size_reads: 0,
@@ -263,6 +282,24 @@ impl SyntheticPlatform {
         let mut state = self.state()?;
         state.overlays.push((rect, fill));
         self.damage.damage(&[rect])
+    }
+
+    /// Show the next frame of a panning photograph in `rect`, above
+    /// everything else, and report it as damage. Each call pans it on, so
+    /// every call changes every pixel of it. Animating another rectangle
+    /// than the last call did moves the animation, and reports the old
+    /// rectangle too, which shows what lies beneath again.
+    pub fn animate(&self, rect: Rectangle) -> Result<()> {
+        // Reported under the lock, as every change is: see the module.
+        let mut state = self.state()?;
+        let old = state.animation;
+        state.animation = Some(Animation {
+            rect,
+            frame: old.map_or(0, |old| old.frame.wrapping_add(1)),
+        });
+        let moved_from = old.map(|old| old.rect).filter(|&old| old != rect);
+        let damaged: Vec<Rectangle> = moved_from.into_iter().chain([rect]).collect();
+        self.damage.damage(&damaged)
     }
 
     /// Report `rect` as damaged without changing a pixel.
@@ -387,6 +424,7 @@ impl SyntheticPlatform {
             size: state.size,
             square_x: state.square_x,
             overlays: state.overlays.clone(),
+            animation: state.animation,
         })
     }
 
@@ -551,17 +589,25 @@ fn render(scene: &Scene, rect: Rectangle) -> Result<Frame> {
     let width = u64::from(scene.size.width);
     for (y, row) in (rect.y..).zip(data.chunks_exact_mut(stride)) {
         for (x, pixel) in (rect.x..).zip(row[..row_bytes].as_chunks_mut::<4>().0) {
-            let overlay = scene
-                .overlays
-                .iter()
-                .rev()
-                .find(|(area, _)| contains(area, x, y));
-            let (r, g, b) = match overlay {
-                Some(&(_, Fill::Solid(rgb))) => rgb,
-                Some((_, Fill::Photo)) => photo_pixel(x, y),
-                None if square.is_some_and(|square| contains(&square, x, y)) => SQUARE,
-                // x < width, so the index is at most 7.
-                None => BARS[(u64::from(x) * 8 / width) as usize],
+            let animation = scene
+                .animation
+                .filter(|animation| contains(&animation.rect, x, y));
+            let overlay = || {
+                scene
+                    .overlays
+                    .iter()
+                    .rev()
+                    .find(|(area, _)| contains(area, x, y))
+            };
+            let (r, g, b) = match animation {
+                Some(animation) => animated_pixel(&animation, x, y),
+                None => match overlay() {
+                    Some(&(_, Fill::Solid(rgb))) => rgb,
+                    Some((_, Fill::Photo)) => photo_pixel(x, y),
+                    None if square.is_some_and(|square| contains(&square, x, y)) => SQUARE,
+                    // x < width, so the index is at most 7.
+                    None => BARS[(u64::from(x) * 8 / width) as usize],
+                },
             };
             *pixel = [b, g, r, 0];
         }
@@ -585,6 +631,24 @@ fn photo_pixel(x: u32, y: u32) -> Rgb {
         (base + fx * 0.2 + fy * 0.15 + wave + grain).clamp(0.0, 255.0) as u8
     };
     (channel(160.0, 0), channel(110.0, 8), channel(60.0, 16))
+}
+
+/// How far the animation pans before it starts again, each way: the
+/// photograph of [`photo_pixel`] keeps its detail this far from its
+/// corner, and goes flat further out, where its gradients saturate.
+const ANIMATION_PERIOD: u32 = 256;
+
+/// Pixel (`x`, `y`) of `animation`'s current frame: the photograph of
+/// [`photo_pixel`], from the animated rectangle's corner, panned 7 pixels
+/// left and 5 up a frame, grain and all, wrapping every
+/// [`ANIMATION_PERIOD`] pixels. So nearly every pixel changes from one
+/// frame to the next, as a panning camera's would.
+fn animated_pixel(animation: &Animation, x: u32, y: u32) -> Rgb {
+    let frame = animation.frame % ANIMATION_PERIOD;
+    photo_pixel(
+        (x - animation.rect.x + frame * 7) % ANIMATION_PERIOD,
+        (y - animation.rect.y + frame * 5) % ANIMATION_PERIOD,
+    )
 }
 
 /// The synthetic cursor: a 32x32 arrow, white with a black outline,
@@ -907,6 +971,43 @@ mod tests {
         // Painting it again changes no pixel.
         platform.paint_photo(photo).unwrap();
         assert_eq!(platform.desktop().unwrap(), desktop);
+    }
+
+    #[test]
+    fn animate_pans_a_photograph_and_moves_without_adding_overlays() {
+        let platform = SyntheticPlatform::new(SIZE).unwrap();
+        let subscription = platform.subscribe_damage().unwrap();
+        subscription.take().unwrap();
+        let pattern = platform.desktop().unwrap();
+        let first = Rectangle::new(128, 64, 128, 128);
+        platform.animate(first).unwrap();
+        assert_eq!(damaged(&subscription), vec![first]);
+        let one = platform.desktop().unwrap();
+        assert_ne!(pixel(&one, 130, 70), pixel(&one, 131, 70), "flat");
+
+        // The next frame changes nearly every pixel of it, and nothing
+        // else.
+        platform.animate(first).unwrap();
+        assert_eq!(damaged(&subscription), vec![first]);
+        let two = platform.desktop().unwrap();
+        let mut differ = 0;
+        for y in 64..192 {
+            for x in 128..256 {
+                differ += usize::from(pixel(&one, x, y) != pixel(&two, x, y));
+            }
+        }
+        assert!(differ > 128 * 128 * 9 / 10, "only {differ} pixels changed");
+        assert_eq!(pixel(&two, 10, 10), pixel(&pattern, 10, 10));
+
+        // Moving it reports both rectangles, and shows the pattern where
+        // it was.
+        let second = Rectangle::new(512, 384, 128, 128);
+        platform.animate(second).unwrap();
+        assert_eq!(damaged(&subscription), vec![first, second]);
+        let moved = platform.desktop().unwrap();
+        assert_eq!(pixel(&moved, 130, 70), pixel(&pattern, 130, 70));
+        assert_ne!(pixel(&moved, 520, 390), pixel(&pattern, 520, 390));
+        assert!(platform.state().unwrap().overlays.is_empty());
     }
 
     #[test]

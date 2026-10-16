@@ -27,10 +27,10 @@
 //! must lose nothing when dropped: [`ChannelConn::recv`] and
 //! [`ChannelConn::wait_for_room`] keep what they read,
 //! [`DamageSubscription::changed`] loses nothing, the sleeps are made
-//! afresh each time round, and an interval's `tick()` and the stream
-//! requests' `recv()` are cancel-safe. Frames, refreshes, the scrub and
-//! stream requests run in branch bodies, after the `select!` has chosen,
-//! so nothing drops them part way but the end of the channel.
+//! afresh each time round, and an interval's `tick()` is cancel-safe.
+//! Frames, refreshes, the scrub and the end of a quiet stream run in
+//! branch bodies, after the `select!` has chosen, so nothing drops them
+//! part way but the end of the channel.
 //!
 //! # The shadow
 //!
@@ -64,19 +64,34 @@
 //!
 //! A client with both the `MULTI_CODEC` and `CODEC_H264` capabilities may
 //! be sent one H.264 stream at a time, which [`Streams`] holds; the
-//! stream module says what its messages carry. Nothing yet decides on its
-//! own to stream an area: a stream starts, sends a frame and ends on a
-//! [`StreamRequest`] made through the session, and draws carry on as
-//! usual meanwhile. A frame's capture is stamped from the session's
-//! clock, the one `MAIN_INIT` gave the client, and encoded on the
-//! blocking pool. The client's `STREAM_REPORT`s are recorded. A report
-//! that the client cannot decode the stream, or a failure of the encoder,
-//! ends the stream and turns streams off for the rest of the channel,
-//! with one warning. Replacing the surface ends every stream first, with
-//! `STREAM_DESTROY_ALL`, once any stream has been created.
+//! stream module says what its messages carry.
+//!
+//! - **Starting.** Each frame that changed something is recorded in the
+//!   [`HeatMap`]: the tiles it changed, and which of them went out
+//!   photographic. When no stream lives, the largest area the heat map
+//!   finds starts one.
+//! - **Feeding.** While a stream lives, damage to the tiles it covers
+//!   wholly is taken out of the frame's draws. If any were damaged, the
+//!   stream's rectangle is captured, brought into the shadow, and sent as
+//!   one `STREAM_DATA`, encoded on the blocking pool and stamped from the
+//!   session's clock, the one `MAIN_INIT` gave the client. Its tiles are
+//!   then lossy, due only once the stream has ended. A frame due while
+//!   the ack window is full is not captured, as for draws, and counts as
+//!   a server drop.
+//! - **Ending.** A stream ends when nothing has changed it for
+//!   [`STREAM_QUIET`], or when an area that touches it has grown past it.
+//!   Its tiles then fall due at once, so the lossless refresh repairs the
+//!   area, and their heat is forgotten, so that it streams again only
+//!   after a fresh run of frames. A report that the client cannot decode
+//!   the stream, or a failure of the encoder, ends it too, and turns
+//!   streams off for the rest of the channel, with one warning.
+//!   Replacing the surface ends every stream first, with
+//!   `STREAM_DESTROY_ALL`, once any stream has been created.
 //!
 //! [running]: https://github.com/shakenfist/andris/blob/develop/docs/running.md
 //! [`LossyTiles`]: super::updates::LossyTiles
+//! [`HeatMap`]: super::updates::HeatMap
+//! [`STREAM_QUIET`]: super::updates::STREAM_QUIET
 
 use std::time::Duration;
 
@@ -93,8 +108,8 @@ use tracing::{debug, info, warn};
 use super::channel::{ACK_WINDOW, ChannelConn, ChannelContext, ClientCaps};
 use super::opcodes::DisplayOpcode;
 use super::updates::{
-    Draw, EncodeOptions, JpegQuality, LossyTiles, ReportVerdict, SURFACE_ID, Stream, StreamCaps,
-    StreamRequest, Streams, UpdateEncoder,
+    Choice, Draw, EncodeOptions, HeatMap, JpegQuality, LossyTiles, ReportVerdict, STREAM_QUIET,
+    SURFACE_ID, Stream, StreamCaps, Streams, Update, UpdateEncoder, choose,
 };
 use crate::config::DEFAULT_FRAME_INTERVAL_MS;
 use crate::platform::{self, Capture, DamageSubscription, Rectangle, Region, Size, TILE};
@@ -177,7 +192,6 @@ pub async fn run(ctx: ChannelContext, mut conn: ChannelConn<DisplayOpcode>) -> R
     let scrub_every = scrub_tick(ctx.display.scrub_period);
     let lossy = LossyTiles::new(ctx.display.lossless_delay);
     let streams = Streams::new(stream_caps(&ctx.caps), ctx.display.frame_interval);
-    let mut stream_requests = ctx.session.stream_requests();
     let mut display = Display {
         ctx,
         conn,
@@ -193,6 +207,11 @@ pub async fn run(ctx: ChannelContext, mut conn: ChannelConn<DisplayOpcode>) -> R
         scrub_top: 0,
         lossy,
         streams,
+        heat: HeatMap::new(Size {
+            width: 0,
+            height: 0,
+        }),
+        next_drop: Instant::now(),
     };
 
     // Wait for INIT, handling whatever else arrives first.
@@ -210,8 +229,18 @@ pub async fn run(ctx: ChannelContext, mut conn: ChannelConn<DisplayOpcode>) -> R
         let cap_open = now >= display.next_frame;
         let room = display.conn.may_send();
         if display.damage_pending && cap_open && room {
-            display.frame().await?;
+            // Boxed, because a frame's future is the largest the loop
+            // awaits, and a debug build keeps copies of it on the stack.
+            Box::pin(display.frame()).await?;
             continue;
+        }
+        // A frame due now would feed the stream, but the ack window is
+        // full: it is not captured, and damage merges meanwhile, as for
+        // draws. It counts as a server drop, once a frame interval.
+        let stream_blocked =
+            display.damage_pending && cap_open && !room && display.stream_frame_due();
+        if stream_blocked && now >= display.next_drop {
+            display.server_drop(now);
         }
         // A refresh is a frame too, but pending damage goes first.
         let refresh_at = display.lossy.next_due();
@@ -229,11 +258,12 @@ pub async fn run(ctx: ChannelContext, mut conn: ChannelConn<DisplayOpcode>) -> R
         let wanted = pending || refresh_due;
         let await_room = wanted && cap_open;
         let next_frame = display.next_frame;
+        let next_drop = display.next_drop;
+        let quiet_at = display.streams.live().map(Stream::quiet_at);
         // Every branch is cancel-safe: next_incoming wraps recv() or
         // wait_for_room(), each of which keeps whatever it read; changed()
         // loses nothing when dropped; each sleep is made afresh each time
-        // round; an interval's tick() is cancel-safe; and so is an mpsc
-        // receiver's recv(), which once closed only disables its branch.
+        // round; and an interval's tick() is cancel-safe.
         tokio::select! {
             incoming = next_incoming(&mut display.conn, await_room) => match incoming? {
                 Incoming::Message(message) => display.handle(&message).await?,
@@ -245,7 +275,10 @@ pub async fn run(ctx: ChannelContext, mut conn: ChannelConn<DisplayOpcode>) -> R
             () = tokio::time::sleep_until(refresh_at.unwrap_or(now)),
                 if refresh_at.is_some() && !refresh_due => {}
             _ = scrub_ticks.tick() => display.scrub().await?,
-            Some(request) = stream_requests.recv() => display.stream_request(request).await?,
+            () = tokio::time::sleep_until(next_drop), if stream_blocked && next_drop > now => {}
+            () = tokio::time::sleep_until(quiet_at.unwrap_or(now)), if quiet_at.is_some() => {
+                display.end_quiet_stream().await?;
+            }
         }
     }
 }
@@ -337,6 +370,10 @@ struct Display {
     lossy: LossyTiles,
     /// The video stream, if one is live, and whether one may start.
     streams: Streams,
+    /// The surface's recent changes, from which streams start.
+    heat: HeatMap,
+    /// The earliest the next server drop may be counted.
+    next_drop: Instant,
 }
 
 impl Display {
@@ -532,41 +569,69 @@ impl Display {
     /// then `MARK`; or, for the first frame or after a resize, run the
     /// start sequence from a capture of the whole desktop. A failed
     /// capture sends nothing, and puts the damage back to be taken again.
+    ///
+    /// While a stream lives, damage to the tiles it covers is sent as a
+    /// stream frame instead, after the draws. What the frame changed then
+    /// goes into the heat map, which may start or end a stream.
     async fn frame(&mut self) -> Result<()> {
         self.damage_pending = false;
-        let region = self.damage.take().context("taking the desktop's damage")?;
-        if region.is_empty() {
+        let taken = self.damage.take().context("taking the desktop's damage")?;
+        if taken.is_empty() {
             return Ok(());
         }
         let now = Instant::now();
         self.next_frame = now + self.ctx.display.frame_interval;
-        // Damage postpones the refresh of the lossy tiles it touches,
-        // whatever the capture finds.
-        self.lossy.touch(&region, now);
 
         // Without a surface of the region's size, the surface is created
-        // afresh, which needs all of the desktop.
-        let whole = self.surface != Some(region.size());
-        let rects = (!whole).then(|| region.rectangles(MAX_CAPTURE_RECTS));
-        let Some(mut capture) = self.capture_or_skip(rects).await? else {
-            return self.damage.restore(&region);
-        };
-        if !whole && self.surface != Some(capture.size()) {
-            // The desktop resized before its damage said so.
-            let Some(all) = self.capture_or_skip(None).await? else {
-                return self.damage.restore(&region);
-            };
-            capture = all;
+        // afresh, which needs all of the desktop, and ends any stream.
+        let whole = self.surface != Some(taken.size());
+        let mut region = taken.clone();
+        let mut streamed = false;
+        if !whole && let Some(stream) = self.streams.live() {
+            for (col, row) in stream.covered(taken.size()).tiles() {
+                streamed |= region.contains_tile(col, row);
+                region.remove_tile(col, row);
+            }
         }
+        // Damage postpones the refresh of the lossy tiles it touches,
+        // whatever the capture finds. A stream's tiles are due only once
+        // it ends.
+        self.lossy.touch(&region, now);
 
-        if self.surface != Some(capture.size()) {
-            return self.replace_surface(capture).await;
+        let mut changed = Region::empty(taken.size());
+        let mut photographic = Region::empty(taken.size());
+        if !region.is_empty() {
+            let rects = (!whole).then(|| region.rectangles(MAX_CAPTURE_RECTS));
+            let Some(mut capture) = self.capture_or_skip(rects).await? else {
+                return self.damage.restore(&taken);
+            };
+            if !whole && self.surface != Some(capture.size()) {
+                // The desktop resized before its damage said so.
+                let Some(all) = self.capture_or_skip(None).await? else {
+                    return self.damage.restore(&taken);
+                };
+                capture = all;
+            }
+
+            if self.surface != Some(capture.size()) {
+                return self.replace_surface(capture).await;
+            }
+            let update = self.send_update(capture).await?;
+            if !update.draws.is_empty() {
+                self.send(DisplayOpcode::Mark, &[]).await?;
+                self.conn.session().counters().frame_sent(false);
+            }
+            for draw in update.draws.iter().filter(|draw| draw.is_lossy()) {
+                photographic.add(draw.rect);
+            }
+            changed = update.changed;
         }
-        if self.send_update(capture).await? > 0 {
-            self.send(DisplayOpcode::Mark, &[]).await?;
-            self.conn.session().counters().frame_sent(false);
+        if streamed && let Some(frame) = self.stream_frame(&taken, now).await? {
+            // A stream's frame is photographic.
+            changed.union(&frame);
+            photographic.union(&frame);
         }
-        Ok(())
+        self.detect(now, &changed, &photographic).await
     }
 
     /// Destroy the surface, if there is one, and start one at `capture`'s
@@ -621,6 +686,7 @@ impl Display {
         // shadow describes, lossily or not.
         self.encoder.reset();
         self.lossy.reset(size);
+        self.heat.reset(size);
         self.send_update(capture).await?;
         if self
             .ctx
@@ -672,9 +738,9 @@ impl Display {
     }
 
     /// Send what in `capture` differs from what the client was last
-    /// sent: all of it after [`UpdateEncoder::reset`]. Returns how many
-    /// draws were sent.
-    async fn send_update(&mut self, capture: Capture) -> Result<usize> {
+    /// sent: all of it after [`UpdateEncoder::reset`]. Returns what was
+    /// sent.
+    async fn send_update(&mut self, capture: Capture) -> Result<Update> {
         let options = self.encode_options();
         let started = Instant::now();
         let update = self
@@ -685,7 +751,7 @@ impl Display {
         counters.encode_done(started.elapsed());
         counters.area_updated(update.captured_area, update.changed_area);
         self.send_draws(&update.draws).await?;
-        Ok(update.draws.len())
+        Ok(update)
     }
 
     /// Send `draws`, and record which tiles they leave lossy or exact.
@@ -740,40 +806,47 @@ impl Display {
         Ok(())
     }
 
-    /// Act on a [`StreamRequest`].
-    async fn stream_request(&mut self, request: StreamRequest) -> Result<()> {
-        match request {
-            StreamRequest::Start(rect) => self.start_stream(rect).await,
-            StreamRequest::Frame => self.stream_frame().await,
-            StreamRequest::Stop => self.end_stream().await,
+    /// Record a frame sent at `now`, which changed `changed`, of which
+    /// `photographic` went out photographic, in the heat map, and start
+    /// or end a stream as it says. Does nothing when streams may not be
+    /// sent, or the frame changed nothing.
+    async fn detect(
+        &mut self,
+        now: Instant,
+        changed: &Region,
+        photographic: &Region,
+    ) -> Result<()> {
+        if !self.streams.enabled() || changed.is_empty() {
+            return Ok(());
+        }
+        self.heat.record(now, changed, photographic);
+        let candidates = self.heat.candidates(now);
+        match choose(&candidates, self.streams.live().map(Stream::rect)) {
+            Choice::Start(rect) => self.start_stream(rect, now).await,
+            Choice::End => {
+                debug!(
+                    session = self.conn.session().id(),
+                    "a changing area has outgrown the video stream; ending it"
+                );
+                self.end_stream().await
+            }
+            Choice::Stay => Ok(()),
         }
     }
 
-    /// Start a stream over `rect`, as [`Streams::start`] shapes it, and
-    /// send its `STREAM_CREATE`, then its `STREAM_ACTIVATE_REPORT` if the
-    /// client sends reports. Does nothing without a surface, or if no
-    /// stream may start. If the encoder cannot be built, streams are
+    /// Start a stream over `rect` at `now`, as [`Streams::start`] shapes
+    /// it, and send its `STREAM_CREATE`, then its `STREAM_ACTIVATE_REPORT`
+    /// if the client sends reports. Does nothing without a surface, or if
+    /// no stream may start. If the encoder cannot be built, streams are
     /// turned off.
-    async fn start_stream(&mut self, rect: Rectangle) -> Result<()> {
+    async fn start_stream(&mut self, rect: Rectangle, now: Instant) -> Result<()> {
         let session = self.conn.session().id();
         let Some(size) = self.surface else {
-            debug!(session, %rect, "no surface yet; no stream");
             return Ok(());
         };
-        if !self.streams.may_start() {
-            debug!(
-                session,
-                %rect,
-                "the client cannot take a stream, streams are off, or one is live; no stream"
-            );
-            return Ok(());
-        }
-        let (create, activate) = match self.streams.start(rect, size) {
+        let (create, activate) = match self.streams.start(rect, size, now) {
             Ok(Some(stream)) => (stream.create()?, stream.activate_report()),
-            Ok(None) => {
-                debug!(session, %rect, "too little of the area lies on the surface; no stream");
-                return Ok(());
-            }
+            Ok(None) => return Ok(()),
             Err(e) => return self.disable_streams(None, &format!("{e:#}")).await,
         };
         debug!(
@@ -793,53 +866,108 @@ impl Display {
         Ok(())
     }
 
-    /// Capture the live stream's rectangle, encode it on the blocking
-    /// pool, and send it as one `STREAM_DATA` stamped with the session's
-    /// time as the capture started. Sends nothing without a live stream,
-    /// when the capture fails, or when the encoder skips the frame. A
-    /// capture that finds the desktop resized adds damage of it all, so
+    /// Whether pending damage would feed the live stream.
+    fn stream_frame_due(&self) -> bool {
+        self.streams
+            .live()
+            .is_some_and(|stream| self.damage.touches(stream.rect()))
+    }
+
+    /// Count a server drop against the live stream: a frame of it was due
+    /// at `now` while the ack window was full. The next is counted a frame
+    /// interval later at the soonest.
+    fn server_drop(&mut self, now: Instant) {
+        if let Some(stream) = self.streams.live_mut() {
+            stream.server_drop();
+        }
+        self.next_drop = now + self.ctx.display.frame_interval;
+    }
+
+    /// Capture the live stream's rectangle, bring the shadow up to date
+    /// with it, and send it as one `STREAM_DATA` stamped with the
+    /// session's time as the capture started. `damage` is the frame's,
+    /// for a failed capture to put back. Returns the tiles that changed,
+    /// or `None` if nothing did, or nothing was captured.
+    ///
+    /// A capture that changed nothing sends nothing. One that changed
+    /// something leaves the stream's tiles lossy, due only after it would
+    /// end, even if the encoder skips the frame to hold its bitrate: the
+    /// next frame catches the client up, or the refresh at the end does.
+    /// A capture that finds the desktop resized adds damage of it all, so
     /// that a frame replaces the surface, ending the stream. A failure of
     /// the encoder ends the stream and turns streams off.
     ///
-    /// The stream moves into the encoding task with the pixels, and back
-    /// out with the result, so no stream is live meanwhile. If the task
-    /// panics, the stream is lost with it and this fails, closing the
-    /// channel.
-    async fn stream_frame(&mut self) -> Result<()> {
-        let Some(rect) = self.streams.live().map(Stream::rect) else {
-            return Ok(());
+    /// The shadow and the stream move into one task on the blocking pool
+    /// with the capture, and back out with the result, so no stream is
+    /// live meanwhile. If the task panics, both are lost with it and this
+    /// fails, closing the channel.
+    async fn stream_frame(&mut self, damage: &Region, now: Instant) -> Result<Option<Region>> {
+        let Some(live) = self.streams.live() else {
+            return Ok(None);
         };
+        let (rect, size) = (live.rect(), damage.size());
+        let covered = live.covered(size);
         let captured_at = self.conn.session().elapsed();
         let Some(capture) = self.capture_or_skip(Some(vec![rect])).await? else {
-            return Ok(());
+            let mut lost = Region::empty(size);
+            for (col, row) in covered.tiles() {
+                if damage.contains_tile(col, row) {
+                    lost.insert_tile(col, row);
+                }
+            }
+            self.damage.restore(&lost)?;
+            return Ok(None);
         };
         if self.surface != Some(capture.size()) {
             // The desktop resized before its damage said so. Any damage
             // starts a frame, whose capture finds the new size.
             self.damage.add(&Region::full(capture.size()))?;
-            return Ok(());
+            return Ok(None);
         }
-        let Some(pixels) = capture
-            .into_patches()
-            .pop()
-            .map(|patch| patch.into_pixels())
-        else {
-            bail!("a capture of the stream's {rect} has no pixels");
-        };
         let Some(mut stream) = self.streams.take() else {
-            return Ok(());
+            return Ok(None);
         };
-        let (stream, encoded) = tokio::task::spawn_blocking(move || {
-            let encoded = stream.encode(&pixels);
-            (stream, encoded)
+        let mut encoder = std::mem::take(&mut self.encoder);
+        let started = Instant::now();
+        let (encoder, mut stream, result) = tokio::task::spawn_blocking(move || {
+            let result = encoder.absorb(&capture).map(|changed| {
+                let frame = (!changed.is_empty()).then(|| match capture.patches() {
+                    [patch] => stream.encode(patch.pixels()),
+                    patches => Err(anyhow::anyhow!(
+                        "a capture of the stream's {rect} came back in {} patches",
+                        patches.len()
+                    )),
+                });
+                (changed, frame)
+            });
+            (encoder, stream, result)
         })
         .await
         .context("the stream's encoding task failed")?;
-        match encoded {
+        self.encoder = encoder;
+        let (changed, frame) = match result {
+            Ok(result) => result,
+            Err(e) => {
+                self.streams.put_back(stream);
+                return Err(e.context("bringing the shadow up to date with a stream's capture"));
+            }
+        };
+        let Some(frame) = frame else {
+            self.streams.put_back(stream);
+            return Ok(None);
+        };
+        self.conn
+            .session()
+            .counters()
+            .encode_done(started.elapsed());
+        let held = now + STREAM_QUIET + self.ctx.display.lossless_delay;
+        self.lossy.mark(&stream.touched(size), held);
+        stream.changed(now);
+        match frame {
             Ok(Some(frame)) => {
                 let data = stream.data(frame, captured_at);
                 self.streams.put_back(stream);
-                self.send_msg(DisplayOpcode::StreamData, &data).await
+                self.send_msg(DisplayOpcode::StreamData, &data).await?;
             }
             Ok(None) => {
                 debug!(
@@ -848,13 +976,30 @@ impl Display {
                     "the encoder skipped a frame to hold its bitrate"
                 );
                 self.streams.put_back(stream);
-                Ok(())
             }
             Err(e) => {
                 self.disable_streams(Some(stream), &format!("encoding failed: {e:#}"))
-                    .await
+                    .await?;
             }
         }
+        Ok(Some(changed))
+    }
+
+    /// End the live stream if nothing has changed it for
+    /// [`STREAM_QUIET`].
+    async fn end_quiet_stream(&mut self) -> Result<()> {
+        let quiet = self
+            .streams
+            .live()
+            .is_some_and(|stream| stream.quiet_at() <= Instant::now());
+        if !quiet {
+            return Ok(());
+        }
+        debug!(
+            session = self.conn.session().id(),
+            "the video stream has been still; ending it"
+        );
+        self.end_stream().await
     }
 
     /// End the live stream, if there is one.
@@ -865,13 +1010,20 @@ impl Display {
         }
     }
 
-    /// Tell the client `stream` has ended.
+    /// Tell the client `stream` has ended. Its tiles fall due at once, so
+    /// the next refresh sends them losslessly, and their heat is
+    /// forgotten.
     async fn destroy_stream(&mut self, stream: Stream) -> Result<()> {
         debug!(
             session = self.conn.session().id(),
             stream = stream.id(),
             "ending a video stream"
         );
+        if let Some(size) = self.surface {
+            let touched = stream.touched(size);
+            self.lossy.make_due(&touched, Instant::now());
+            self.heat.forget(&touched);
+        }
         self.send_msg(DisplayOpcode::StreamDestroy, &stream.destroy())
             .await
     }

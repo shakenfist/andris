@@ -40,10 +40,24 @@
 //! decode. It ends the stream, and the channel then sends no more
 //! streams, as it does after the encoder fails.
 //!
+//! # Its tiles
+//!
+//! A stream's rectangle is tile-aligned but where the surface's edge
+//! clips it, or rounding it to even dimensions leaves a row or column
+//! out. [`Stream::covered`] holds the tiles it covers wholly: damage to
+//! those goes into the stream, and damage anywhere else, a partly
+//! covered tile included, is drawn as usual. [`Stream::touched`] holds
+//! every tile it touches, which its frames leave lossy.
+//!
+//! # Its end
+//!
+//! A stream that has not changed for [`STREAM_QUIET`] ends. Until then,
+//! its tiles are not due for the lossless refresh: they are due once it
+//! has ended, which then repairs the area.
+//!
 //! This module knows nothing of sockets: the display channel sends what
-//! it builds, and runs [`Stream::encode`] off the async threads. Nothing
-//! in andris yet decides on its own which area to stream: a stream
-//! starts, sends a frame and ends only on a [`StreamRequest`].
+//! it builds, and runs [`Stream::encode`] off the async threads. Which
+//! area streams is the heat map's to find.
 
 use std::time::Duration;
 
@@ -54,9 +68,10 @@ use shakenfist_spice_protocol::messages::{
     Clip, StreamActivateReport, StreamCreate, StreamData, StreamDataHeader, StreamDestroy,
     StreamReport,
 };
+use tokio::time::Instant;
 
 use super::encode::{SURFACE_ID, wire_rect};
-use crate::platform::{Frame, Rectangle, Size};
+use crate::platform::{Frame, Rectangle, Region, Size};
 
 /// `SPICE_VIDEO_CODEC_TYPE_H264` (spice-protocol enums.h), which ryll's
 /// protocol crate does not name; its compression crate does, but only
@@ -84,6 +99,12 @@ pub const STREAM_IDS: u32 = 64;
 /// client's clock: both clocks are monotonic, and they drift apart over a
 /// session by far less than this.
 pub const STREAM_LATENCY_BUDGET: Duration = Duration::from_millis(80);
+
+/// How long a stream may go without a change before it ends, and its
+/// area is sent again losslessly: spice-server's timeout. Long enough to
+/// ride out a video's still scene or a short stall in its player, short
+/// enough that a paused video is sharp again in about a second.
+pub const STREAM_QUIET: Duration = Duration::from_secs(1);
 
 /// How many frames a client's report covers at most.
 pub const REPORT_WINDOW: u32 = 5;
@@ -116,21 +137,6 @@ pub struct StreamCaps {
     pub h264: bool,
     /// Whether the client sends `STREAM_REPORT`s when asked.
     pub reports: bool,
-}
-
-/// A request to a display channel about its stream, made through
-/// [`Session::request_stream`]. Andris does not yet find areas to stream
-/// on its own, so tests start, feed and end streams with these.
-///
-/// [`Session::request_stream`]: crate::server::session::Session::request_stream
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamRequest {
-    /// Start a stream over the rectangle, as [`Streams::start`] does.
-    Start(Rectangle),
-    /// Capture the live stream's rectangle and send it as a frame.
-    Frame,
-    /// End the live stream.
-    Stop,
 }
 
 /// What a client's `STREAM_REPORT` meant.
@@ -179,10 +185,16 @@ impl Streams {
         }
     }
 
-    /// Whether a stream may start: the client can decode H.264, streams
-    /// have not been turned off, and none is live.
+    /// Whether streams may be sent at all: the client can decode H.264,
+    /// and streams have not been turned off.
+    pub fn enabled(&self) -> bool {
+        self.caps.h264 && !self.disabled
+    }
+
+    /// Whether a stream may start: streams are [`Streams::enabled`], and
+    /// none is live.
     pub fn may_start(&self) -> bool {
-        self.caps.h264 && !self.disabled && self.live.is_none()
+        self.enabled() && self.live.is_none()
     }
 
     /// Whether streams have been turned off for this channel.
@@ -195,13 +207,18 @@ impl Streams {
         self.live.as_ref()
     }
 
-    /// Start a stream over `rect` on a surface of `size`, if
+    /// The live stream, to change.
+    pub fn live_mut(&mut self) -> Option<&mut Stream> {
+        self.live.as_mut()
+    }
+
+    /// Start a stream over `rect` on a surface of `size` at `now`, if
     /// [`Streams::may_start`]. The rectangle is clipped to the surface and
     /// rounded down to even dimensions, as H.264 needs. Returns the new
     /// stream, or `None` if none may start or nothing of `rect` is left.
     /// Fails if the encoder cannot be built; the caller then turns
     /// streams off with [`Streams::disable`].
-    pub fn start(&mut self, rect: Rectangle, size: Size) -> Result<Option<&Stream>> {
+    pub fn start(&mut self, rect: Rectangle, size: Size, now: Instant) -> Result<Option<&Stream>> {
         if !self.may_start() {
             return Ok(None);
         }
@@ -227,6 +244,8 @@ impl Streams {
             target_bps,
             unique_id: self.caps.reports.then(rand::random),
             last_report: None,
+            last_change: now,
+            server_drops: 0,
         })))
     }
 
@@ -297,6 +316,11 @@ pub struct Stream {
     /// The `unique_id` its reports carry, if they were asked for.
     unique_id: Option<u32>,
     last_report: Option<StreamReport>,
+    /// When a frame last changed it, or when it started.
+    last_change: Instant,
+    /// How many frames were due while the client's ack window was full,
+    /// and so were never captured.
+    server_drops: u64,
 }
 
 impl std::fmt::Debug for Stream {
@@ -308,6 +332,8 @@ impl std::fmt::Debug for Stream {
             .field("target_bps", &self.target_bps)
             .field("unique_id", &self.unique_id)
             .field("last_report", &self.last_report)
+            .field("last_change", &self.last_change)
+            .field("server_drops", &self.server_drops)
             .finish_non_exhaustive()
     }
 }
@@ -335,6 +361,47 @@ impl Stream {
     /// The client's last report for this stream.
     pub fn last_report(&self) -> Option<&StreamReport> {
         self.last_report.as_ref()
+    }
+
+    /// The tiles of a surface of `size` the stream covers wholly: damage
+    /// to them goes into the stream rather than into draws.
+    pub fn covered(&self, size: Size) -> Region {
+        let mut covered = Region::empty(size);
+        for (col, row) in self.rect.tiles() {
+            if self.rect.contains(&covered.tile_rect(col, row)) {
+                covered.insert_tile(col, row);
+            }
+        }
+        covered
+    }
+
+    /// Every tile of a surface of `size` the stream touches, wholly or
+    /// in part: its frames leave them all lossy.
+    pub fn touched(&self, size: Size) -> Region {
+        let mut touched = Region::empty(size);
+        touched.add(self.rect);
+        touched
+    }
+
+    /// Record that a frame sent at `now` changed the stream.
+    pub fn changed(&mut self, now: Instant) {
+        self.last_change = now;
+    }
+
+    /// When the stream ends if nothing changes it first.
+    pub fn quiet_at(&self) -> Instant {
+        self.last_change + STREAM_QUIET
+    }
+
+    /// Count a frame that was due while the client's ack window was
+    /// full, and so was never captured.
+    pub fn server_drop(&mut self) {
+        self.server_drops = self.server_drops.saturating_add(1);
+    }
+
+    /// How many frames were due while the client's ack window was full.
+    pub fn server_drops(&self) -> u64 {
+        self.server_drops
     }
 
     /// The stream's `STREAM_CREATE`.
@@ -482,7 +549,7 @@ mod tests {
     fn create_draws_the_rectangle_top_down_as_h264() {
         let mut streams = streams(BOTH);
         let rect = Rectangle::new(64, 32, 128, 96);
-        let stream = streams.start(rect, SIZE).unwrap().unwrap();
+        let stream = streams.start(rect, SIZE, Instant::now()).unwrap().unwrap();
         let create = stream.create().unwrap();
         assert_eq!(
             create,
@@ -513,7 +580,7 @@ mod tests {
     fn reports_are_activated_only_for_a_client_that_sends_them() {
         let mut with = streams(BOTH);
         let stream = with
-            .start(Rectangle::new(0, 0, 64, 64), SIZE)
+            .start(Rectangle::new(0, 0, 64, 64), SIZE, Instant::now())
             .unwrap()
             .unwrap();
         let unique_id = stream.unique_id().unwrap();
@@ -532,7 +599,7 @@ mod tests {
             reports: false,
         });
         let stream = without
-            .start(Rectangle::new(0, 0, 64, 64), SIZE)
+            .start(Rectangle::new(0, 0, 64, 64), SIZE, Instant::now())
             .unwrap()
             .unwrap();
         assert_eq!(stream.unique_id(), None);
@@ -543,7 +610,7 @@ mod tests {
     fn data_carries_the_frame_and_its_time() {
         let mut streams = streams(BOTH);
         let stream = streams
-            .start(Rectangle::new(0, 0, 64, 64), SIZE)
+            .start(Rectangle::new(0, 0, 64, 64), SIZE, Instant::now())
             .unwrap()
             .unwrap();
         let frame = H264Frame {
@@ -567,7 +634,7 @@ mod tests {
     fn the_rectangle_is_clipped_and_rounded_down_to_even() {
         let mut streams = streams(BOTH);
         let stream = streams
-            .start(Rectangle::new(201, 99, 300, 99), SIZE)
+            .start(Rectangle::new(201, 99, 300, 99), SIZE, Instant::now())
             .unwrap()
             .unwrap();
         // Clipped to 55 x 93, then rounded down.
@@ -577,13 +644,13 @@ mod tests {
         // Outside the surface, or a pixel wide: nothing starts.
         assert!(
             streams
-                .start(Rectangle::new(300, 0, 64, 64), SIZE)
+                .start(Rectangle::new(300, 0, 64, 64), SIZE, Instant::now())
                 .unwrap()
                 .is_none()
         );
         assert!(
             streams
-                .start(Rectangle::new(0, 0, 1, 64), SIZE)
+                .start(Rectangle::new(0, 0, 1, 64), SIZE, Instant::now())
                 .unwrap()
                 .is_none()
         );
@@ -594,11 +661,15 @@ mod tests {
         let mut streams = streams(BOTH);
         let rect = Rectangle::new(0, 0, 64, 64);
         for expected in (0..STREAM_IDS).chain(0..2) {
-            let id = streams.start(rect, SIZE).unwrap().unwrap().id();
+            let id = streams
+                .start(rect, SIZE, Instant::now())
+                .unwrap()
+                .unwrap()
+                .id();
             assert_eq!(id, expected);
             // A second stream waits for the first to end.
             assert!(!streams.may_start());
-            assert!(streams.start(rect, SIZE).unwrap().is_none());
+            assert!(streams.start(rect, SIZE, Instant::now()).unwrap().is_none());
             assert_eq!(streams.end().unwrap().id(), expected);
         }
     }
@@ -612,7 +683,7 @@ mod tests {
         assert!(!streams.may_start());
         assert!(
             streams
-                .start(Rectangle::new(0, 0, 64, 64), SIZE)
+                .start(Rectangle::new(0, 0, 64, 64), SIZE, Instant::now())
                 .unwrap()
                 .is_none()
         );
@@ -627,7 +698,7 @@ mod tests {
         assert!(streams.is_disabled());
         assert!(
             streams
-                .start(Rectangle::new(0, 0, 64, 64), SIZE)
+                .start(Rectangle::new(0, 0, 64, 64), SIZE, Instant::now())
                 .unwrap()
                 .is_none()
         );
@@ -638,7 +709,7 @@ mod tests {
         let mut streams = streams(BOTH);
         assert!(!streams.end_all());
         streams
-            .start(Rectangle::new(0, 0, 64, 64), SIZE)
+            .start(Rectangle::new(0, 0, 64, 64), SIZE, Instant::now())
             .unwrap()
             .unwrap();
         assert!(streams.end_all());
@@ -652,7 +723,7 @@ mod tests {
         let mut streams = streams(BOTH);
         assert_eq!(streams.report(report(0, 0)), ReportVerdict::NoStream);
         let unique_id = streams
-            .start(Rectangle::new(0, 0, 64, 64), SIZE)
+            .start(Rectangle::new(0, 0, 64, 64), SIZE, Instant::now())
             .unwrap()
             .unwrap()
             .unique_id()
@@ -682,7 +753,7 @@ mod tests {
     fn cannot_decode_counts_whatever_its_unique_id_but_not_for_another_stream() {
         let mut streams = streams(BOTH);
         streams
-            .start(Rectangle::new(0, 0, 64, 64), SIZE)
+            .start(Rectangle::new(0, 0, 64, 64), SIZE, Instant::now())
             .unwrap()
             .unwrap();
         assert_eq!(streams.report(cannot_decode(1)), ReportVerdict::OtherStream);
@@ -706,7 +777,7 @@ mod tests {
             reports: false,
         });
         streams
-            .start(Rectangle::new(0, 0, 64, 64), SIZE)
+            .start(Rectangle::new(0, 0, 64, 64), SIZE, Instant::now())
             .unwrap()
             .unwrap();
         assert_eq!(streams.report(report(0, 0)), ReportVerdict::OtherUniqueId);
@@ -733,7 +804,7 @@ mod tests {
     fn a_padded_capture_encodes_to_a_frame_ryll_decodes() {
         let mut streams = streams(BOTH);
         let rect = Rectangle::new(64, 64, 96, 64);
-        streams.start(rect, SIZE).unwrap().unwrap();
+        streams.start(rect, SIZE, Instant::now()).unwrap().unwrap();
         let mut stream = streams.take().unwrap();
         let pixels = padded_frame(rect.size(), 0x40);
         let frame = stream.encode(&pixels).unwrap().expect("the first frame");
@@ -754,7 +825,7 @@ mod tests {
     fn a_capture_of_another_size_is_an_error() {
         let mut streams = streams(BOTH);
         streams
-            .start(Rectangle::new(0, 0, 64, 64), SIZE)
+            .start(Rectangle::new(0, 0, 64, 64), SIZE, Instant::now())
             .unwrap()
             .unwrap();
         let mut stream = streams.take().unwrap();
@@ -768,5 +839,71 @@ mod tests {
             ))
             .unwrap_err();
         assert!(err.to_string().contains("is not the"), "{err}");
+    }
+
+    #[test]
+    fn covered_tiles_are_the_whole_ones_and_touched_tiles_all_of_them() {
+        // A surface 301 x 200: the last tile column is 45 pixels wide and
+        // the last row 8 rows tall.
+        let size = Size {
+            width: 301,
+            height: 200,
+        };
+        let mut streams = streams(BOTH);
+        let stream = streams
+            .start(Rectangle::new(192, 128, 200, 100), size, Instant::now())
+            .unwrap()
+            .unwrap();
+        // Clipped to 109 x 72, then rounded to 108 x 72: the surface's
+        // last column stays out of the stream, and so does the last tile
+        // column, which holds it.
+        assert_eq!(stream.rect(), Rectangle::new(192, 128, 108, 72));
+        let mut covered = Region::empty(size);
+        covered.add(Rectangle::new(192, 128, 64, 72));
+        assert_eq!(stream.covered(size), covered);
+        let mut touched = Region::empty(size);
+        touched.add(Rectangle::new(192, 128, 109, 72));
+        assert_eq!(stream.touched(size), touched);
+
+        // A tile-aligned stream covers every tile it touches.
+        streams.end();
+        let rect = Rectangle::new(64, 0, 128, 128);
+        let stream = streams.start(rect, SIZE, Instant::now()).unwrap().unwrap();
+        assert_eq!(stream.covered(SIZE), stream.touched(SIZE));
+        assert_eq!(stream.covered(SIZE).tile_count(), 4);
+    }
+
+    #[test]
+    fn a_stream_goes_quiet_a_second_after_its_last_change() {
+        let start = Instant::now();
+        let mut streams = streams(BOTH);
+        streams
+            .start(Rectangle::new(0, 0, 64, 64), SIZE, start)
+            .unwrap()
+            .unwrap();
+        let mut stream = streams.take().unwrap();
+        assert_eq!(stream.quiet_at(), start + STREAM_QUIET);
+        let later = start + Duration::from_millis(700);
+        stream.changed(later);
+        assert_eq!(stream.quiet_at(), later + STREAM_QUIET);
+
+        assert_eq!(stream.server_drops(), 0);
+        stream.server_drop();
+        stream.server_drop();
+        assert_eq!(stream.server_drops(), 2);
+    }
+
+    #[test]
+    fn enabled_until_disabled_and_only_with_h264() {
+        let mut streams = streams(BOTH);
+        assert!(streams.enabled());
+        streams
+            .start(Rectangle::new(0, 0, 64, 64), SIZE, Instant::now())
+            .unwrap()
+            .unwrap();
+        assert!(streams.enabled() && !streams.may_start());
+        streams.disable();
+        assert!(!streams.enabled());
+        assert!(!self::streams(StreamCaps::default()).enabled());
     }
 }

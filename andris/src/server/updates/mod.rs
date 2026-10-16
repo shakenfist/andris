@@ -51,6 +51,7 @@
 //! - [`shadow`] holds the shadow and compares captures with it;
 //! - [`encode`] chooses each draw's encoding and builds its message;
 //! - [`lossy`] tracks the tiles sent lossily;
+//! - [`heat`] finds the area worth sending as a video stream;
 //! - [`stream`] holds a display channel's video stream, an area sent as
 //!   H.264 frames rather than draws, and builds its messages.
 //!
@@ -61,24 +62,29 @@
 //! [`Region::rectangles`]: crate::platform::Region::rectangles
 
 mod encode;
+mod heat;
 mod lossy;
 mod shadow;
 mod stream;
 #[cfg(test)]
 mod test_support;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 
 pub use encode::{
     EncodeOptions, Encoding, JPEG_MAX_PERCENT, JPEG_MIN_AREA, JPEG_MIN_LZ4_PERCENT, JPEG_MIN_SIDE,
     JpegQuality, SURFACE_ID, looks_photographic,
 };
 use encode::{encode_draw, split};
+pub use heat::{
+    Candidate, Choice, HOT_FRAMES, HOT_MAX_GAP, HOT_WINDOW, HeatMap, MIN_PHOTOGRAPHIC_PERCENT,
+    MIN_STREAM_SIDE, OUTGROWN_FACTOR, choose,
+};
 pub use lossy::LossyTiles;
 use shadow::Shadow;
 pub use stream::{
     CODEC_TYPE_H264, REPORT_TIMEOUT, REPORT_WINDOW, ReportVerdict, STREAM_IDS,
-    STREAM_LATENCY_BUDGET, Stream, StreamCaps, StreamRequest, Streams, frames_per_second,
+    STREAM_LATENCY_BUDGET, STREAM_QUIET, Stream, StreamCaps, Streams, frames_per_second,
     multi_media_time,
 };
 
@@ -136,7 +142,7 @@ impl std::fmt::Debug for Draw {
 }
 
 /// What one capture, or one refresh, sends.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Update {
     /// The draws, top first and then left first; empty when nothing
     /// changed. Each draws one rectangle, so their number is the
@@ -146,6 +152,8 @@ pub struct Update {
     pub captured_area: u64,
     /// The pixels of the tiles that changed, clipped to the surface.
     pub changed_area: u64,
+    /// The tiles that changed; none for a refresh.
+    pub changed: Region,
 }
 
 impl Update {
@@ -233,7 +241,19 @@ impl UpdateEncoder {
             draws,
             captured_area,
             changed_area,
+            changed,
         })
+    }
+
+    /// Bring the shadow up to date with `capture` and encode nothing, as
+    /// for a capture the client is sent as a video stream's frame.
+    /// Returns the tiles that changed. Fails without a shadow of
+    /// `capture`'s size.
+    pub fn absorb(&mut self, capture: &Capture) -> Result<Region> {
+        match &mut self.shadow {
+            Some(shadow) if shadow.size == capture.size() => shadow.apply(capture),
+            _ => bail!("there is no {} shadow to bring up to date", capture.size()),
+        }
     }
 
     /// The tiles where `capture` differs from the shadow, leaving the
@@ -262,6 +282,7 @@ impl UpdateEncoder {
             draws: self.encode(region, options)?,
             captured_area: 0,
             changed_area: 0,
+            changed: Region::empty(size),
         })
     }
 

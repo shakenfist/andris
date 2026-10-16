@@ -18,12 +18,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use shakenfist_spice_protocol::{MOUSE_MODE_CLIENT, MOUSE_MODE_SERVER};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use tracing::info;
 
 use super::link::ServedChannel;
 use super::stats::{Stats, StatsSnapshot};
-use super::updates::StreamRequest;
 
 /// A one-way cancel signal that any number of tasks can await.
 ///
@@ -124,9 +123,6 @@ pub struct Session {
     /// The channel serving each type, by its claim's cancel signal.
     channels: Mutex<HashMap<ServedChannel, Arc<Cancel>>>,
     stats: Stats,
-    /// Where [`Session::request_stream`] sends: the display channel
-    /// serving, if one has started.
-    stream_requests: Mutex<Option<mpsc::UnboundedSender<StreamRequest>>>,
 }
 
 impl Session {
@@ -138,7 +134,6 @@ impl Session {
             cancel: Cancel::new(),
             channels: Mutex::new(HashMap::new()),
             stats: Stats::default(),
-            stream_requests: Mutex::new(None),
         }
     }
 
@@ -196,32 +191,6 @@ impl Session {
     /// `PING` timestamps use it, so a `PONG` carries its own send time.
     pub fn clock_ns(&self) -> u64 {
         u64::try_from(self.elapsed().as_nanos()).unwrap_or(u64::MAX)
-    }
-
-    /// Take the requests [`Session::request_stream`] makes from now on,
-    /// for a display channel that has started, in place of the channel
-    /// before it.
-    pub(crate) fn stream_requests(&self) -> mpsc::UnboundedReceiver<StreamRequest> {
-        let (sender, receiver) = mpsc::unbounded_channel();
-        // A single store, so a panic while holding the lock cannot leave
-        // it half-updated.
-        *self
-            .stream_requests
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sender);
-        receiver
-    }
-
-    /// Ask the display channel to start, feed or end its video stream.
-    /// Returns whether a display channel took the request: false before
-    /// one has started, or once it has closed. Andris does not yet find
-    /// areas to stream on its own, so only tests call this.
-    pub fn request_stream(&self, request: StreamRequest) -> bool {
-        self.stream_requests
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-            .is_some_and(|sender| sender.send(request).is_ok())
     }
 
     /// The session's mouse mode. The main channel changes it and the

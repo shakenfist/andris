@@ -33,14 +33,16 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 x11rb = { version = "0.14", features = ["damage", "randr", "shm", "xfixes", "xkb", "xtest"] }
 
-# ryll's shared crates, pinned to b298b39, ryll#534's merge on develop,
-# whose headless clipboard and resize verbs `make e2e` needs.
+# ryll's shared crates, pinned to a157ced, ryll#552's merge on develop,
+# which moved the H.264 encoder into shakenfist-spice-compression (behind
+# its `encode` feature) and added the control-socket `stats` verb that
+# `make e2e` needs.
 # Both crates come from one ryll workspace, so they must always carry the
 # same rev, here and in [dev-dependencies]; move them together.
-shakenfist-spice-protocol = { version = "0.1.7", git = "https://github.com/shakenfist/ryll", rev = "b298b39bdeb1c439862053769bb0d5069d51b682" }
-# Only the encoders. openh264 is still built, because the crate depends on
-# it unconditionally (ryll#499).
-shakenfist-spice-compression = { version = "0.1.7", git = "https://github.com/shakenfist/ryll", rev = "b298b39bdeb1c439862053769bb0d5069d51b682", default-features = false, features = [
+shakenfist-spice-protocol = { version = "0.1.7", git = "https://github.com/shakenfist/ryll", rev = "a157ced013962b0ec3f26acfcda92dba3f4ce1f0" }
+# Only the encoders. openh264 is also built, because the crate depends on
+# it unconditionally (ryll#499), and is now used too, for the H.264 encoder.
+shakenfist-spice-compression = { version = "0.1.7", git = "https://github.com/shakenfist/ryll", rev = "a157ced013962b0ec3f26acfcda92dba3f4ce1f0", default-features = false, features = [
     "encode",
 ] }
 
@@ -49,7 +51,7 @@ rcgen = "0.14"
 # The LZ4 and pure-Rust JPEG decoders too, so tests can decode what the
 # encoders produced. Cargo unifies these features with the ones above in
 # test builds.
-shakenfist-spice-compression = { version = "0.1.7", git = "https://github.com/shakenfist/ryll", rev = "b298b39bdeb1c439862053769bb0d5069d51b682", default-features = false, features = [
+shakenfist-spice-compression = { version = "0.1.7", git = "https://github.com/shakenfist/ryll", rev = "a157ced013962b0ec3f26acfcda92dba3f4ce1f0", default-features = false, features = [
     "encode",
     "jpeg",
     "lz4",

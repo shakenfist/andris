@@ -1208,7 +1208,7 @@ dependencies = [
 [[package]]
 name = "shakenfist-spice-compression"
 version = "0.1.7"
-source = "git+https://github.com/shakenfist/ryll?rev=b298b39bdeb1c439862053769bb0d5069d51b682#b298b39bdeb1c439862053769bb0d5069d51b682"
+source = "git+https://github.com/shakenfist/ryll?rev=a157ced013962b0ec3f26acfcda92dba3f4ce1f0#a157ced013962b0ec3f26acfcda92dba3f4ce1f0"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -1221,6 +1221,7 @@ dependencies = [
  "objc2-core-graphics",
  "objc2-image-io",
  "openh264",
+ "openh264-sys2",
  "thiserror",
  "tracing",
  "windows",
@@ -1229,7 +1230,7 @@ dependencies = [
 [[package]]
 name = "shakenfist-spice-protocol"
 version = "0.1.7"
-source = "git+https://github.com/shakenfist/ryll?rev=b298b39bdeb1c439862053769bb0d5069d51b682#b298b39bdeb1c439862053769bb0d5069d51b682"
+source = "git+https://github.com/shakenfist/ryll?rev=a157ced013962b0ec3f26acfcda92dba3f4ce1f0#a157ced013962b0ec3f26acfcda92dba3f4ce1f0"
 dependencies = [
  "anyhow",
  "byteorder",

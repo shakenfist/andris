@@ -66,6 +66,11 @@
 //! otherwise every frame gets too small a share, and the stream falls
 //! far short of its target.
 //!
+//! The encoder is told the frames are video, not screen content. For
+//! screen content openh264 encodes every frame at its lowest QP and
+//! meets the target only by skipping frames, so a moving picture would
+//! play at a few frames a second; video fits each frame to its share.
+//!
 //! # Its end
 //!
 //! A stream that has not changed for [`STREAM_QUIET`] ends. Until then,
@@ -81,7 +86,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use shakenfist_spice_compression::{
-    Bgrx, H264Config, H264Encoder, H264Frame, even_dimensions, target_bitrate_bps,
+    Bgrx, H264Config, H264Content, H264Encoder, H264Frame, even_dimensions, target_bitrate_bps,
 };
 use shakenfist_spice_protocol::constants::stream_flags;
 use shakenfist_spice_protocol::messages::{
@@ -164,7 +169,10 @@ pub const FRAME_RATE_WINDOW: Duration = Duration::from_secs(1);
 /// How far, in percent, the measured frame rate must move from the
 /// encoder's before the encoder is told: a stream's rate wobbles from
 /// one second to the next, and each change shifts every frame's budget.
-pub const FRAME_RATE_HYSTERESIS_PERCENT: f32 = 20.0;
+/// Small, because the budget follows the rate: a 25 fps video in a
+/// stream budgeted at the default 30 fps came to 84% of its target,
+/// a gap a looser threshold (20%) left uncorrected.
+pub const FRAME_RATE_HYSTERESIS_PERCENT: f32 = 10.0;
 
 /// What may move a stream's bitrate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -438,7 +446,14 @@ impl Streams {
         if rect.is_empty() {
             return Ok(None);
         }
-        let config = H264Config::new(width, height, self.frame_rate);
+        // Video, not screen content: openh264 holds a screen's bitrate by
+        // encoding at its lowest QP and skipping frames, which plays a
+        // 25 fps video at about 7 fps. A stream's area is photographic by
+        // the heat map's choice. Skipping stays on, for real overload.
+        let config = H264Config {
+            content: H264Content::Video,
+            ..H264Config::new(width, height, self.frame_rate)
+        };
         let cap = target_bitrate_bps(width, height, self.frame_rate);
         let encoder = H264Encoder::new(config)
             .with_context(|| format!("creating an H.264 encoder for {rect}"))?;
@@ -1424,8 +1439,8 @@ mod tests {
         assert_eq!(stream.frame_rate(), 10.0);
         assert_eq!(stream.encoder.frame_rate(), 10.0);
 
-        // Eleven a second is within the hysteresis.
-        for ms in (1500..3000).step_by(91) {
+        // Ten or eleven a second is within the hysteresis.
+        for ms in (1500..3000).step_by(95) {
             assert_eq!(stream.pace(at(ms)).unwrap(), None);
         }
         assert_eq!(stream.frame_rate(), 10.0);
@@ -1451,5 +1466,31 @@ mod tests {
             assert_eq!(stream.pace(at(ms)).unwrap(), None);
         }
         assert_eq!(stream.frame_rate(), 30.0);
+
+        // A 25 fps video in a stream configured for 30 is told 25: the
+        // budget would otherwise be a sixth short.
+        let mut streams = self::streams(BOTH);
+        streams
+            .start(Rectangle::new(0, 0, 64, 64), SIZE, start)
+            .unwrap()
+            .unwrap();
+        let mut stream = streams.take().unwrap();
+        let mut last = None;
+        for ms in (0..1500).step_by(40) {
+            last = stream.pace(at(ms)).unwrap().or(last);
+        }
+        assert_eq!(last, Some(25.0));
+    }
+
+    #[test]
+    fn a_stream_is_encoded_as_video_and_may_skip() {
+        let mut streams = streams(BOTH);
+        let stream = streams
+            .start(Rectangle::new(0, 0, 64, 64), SIZE, Instant::now())
+            .unwrap()
+            .unwrap();
+        let config = stream.encoder.config();
+        assert_eq!(config.content, H264Content::Video);
+        assert!(config.skip_frames);
     }
 }

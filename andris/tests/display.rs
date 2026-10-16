@@ -1,12 +1,14 @@
 //! The display channel: its start sequence, the draws it sends and how
 //! they decode, compression choice, damage-driven frames and their
 //! `MARK`s, the rate cap, the ack window, the scrub, resizing, failed
-//! captures, and JPEG with its lossless refresh, against an in-process
-//! andris on the synthetic platform.
+//! captures, JPEG with its lossless refresh, and video streams, against
+//! an in-process andris on the synthetic platform.
 //!
 //! Every draw is decoded, with ryll's `DrawCopy` reader and its LZ4 and
 //! JPEG decoders, onto a client-side copy of the surface, which is
-//! compared with what the synthetic desktop shows.
+//! compared with what the synthetic desktop shows. Stream frames are
+//! decoded with ryll's H.264 stream decoder, and compared with the
+//! desktop within a tolerance.
 
 // Test helpers, where a failed unwrap is a failed test. clippy's
 // allow-unwrap-in-tests covers only #[test] functions themselves.
@@ -14,24 +16,32 @@
 
 mod support;
 
+use std::io::Write;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use andris::platform::synthetic::{SQUARE_SIZE, SQUARE_TOP};
 use andris::platform::{DisplayGeometry, Frame, Rectangle, Region, Size};
 use andris::server::display::{CAPTURE_RETRY, DisplayOptions, MAX_CAPTURE_FAILURES};
-use andris::server::updates::{JpegQuality, MAX_RECTS_PER_FRAME};
-use shakenfist_spice_compression::{JpegDecoder, JpegDecoderRsDecoder, decompress_spice_lz4};
+use andris::server::updates::{
+    JpegQuality, MAX_RECTS_PER_FRAME, STREAM_LATENCY_BUDGET, StreamRequest,
+};
+use shakenfist_spice_compression::{
+    JpegDecoder, JpegDecoderRsDecoder, VideoDecoder, decompress_spice_lz4, for_stream,
+};
 use shakenfist_spice_protocol::constants::{
-    bitmap_flags, bitmap_fmt, clip_type, image_compression, ropd, surface_fmt,
+    bitmap_flags, bitmap_fmt, clip_type, image_compression, ropd, stream_flags, surface_fmt,
 };
 use shakenfist_spice_protocol::messages::{
-    AckSync, DisplayHead, DisplayInit, DisplayMonitorsConfig, DrawCopy, ImagePayload,
-    PreferredCompression, PreferredVideoCodecType, ReceivedMessage, Rect, SetAck, StreamReport,
-    SurfaceCreate, SurfaceDestroy, WireType,
+    AckSync, Clip, DisplayHead, DisplayInit, DisplayMonitorsConfig, DrawCopy, ImagePayload,
+    MainInit, PreferredCompression, PreferredVideoCodecType, ReceivedMessage, Rect, SetAck,
+    StreamActivateReport, StreamCreate, StreamData, StreamDestroy, StreamReport, SurfaceCreate,
+    SurfaceDestroy, WireType,
 };
 use shakenfist_spice_protocol::{
-    ChannelType, ImageType, capabilities, display_client, display_server,
+    ChannelType, ImageType, capabilities, display_client, display_server, main_server,
 };
+use tracing_subscriber::fmt::MakeWriter;
 
 use support::{TestClient, TestServer, display_options, wait_until};
 
@@ -1250,4 +1260,382 @@ async fn ack_lag_is_recorded_once_a_window_is_acknowledged() {
     })
     .await;
     assert!(session.stats().ack_lag.latest().is_some());
+}
+
+/// The area the stream tests stream: two tiles by one and a half, across
+/// three colour bars and the square's path.
+const STREAM_RECT: Rectangle = Rectangle::new(64, 64, 128, 96);
+
+/// How long to wait for a stream frame before asking again: the encoder
+/// may skip a frame to hold its bitrate, and then sends nothing.
+const SKIPPED: Duration = Duration::from_secs(1);
+
+/// The most a decoded stream frame may differ from the desktop, as a mean
+/// over its pixels' red, green and blue.
+const STREAM_TOLERANCE: f64 = 3.0;
+
+/// Ask the display channel for `request`.
+fn request_stream(server: &TestServer, request: StreamRequest) {
+    let session = server.handle.session().unwrap();
+    assert!(
+        session.request_stream(request),
+        "no display channel took {request:?}"
+    );
+}
+
+/// Ask for a stream over `rect`, and read its `STREAM_CREATE` and
+/// `STREAM_ACTIVATE_REPORT`, checking both. Returns the stream's id and
+/// the `unique_id` its reports must carry.
+async fn start_stream(server: &TestServer, client: &mut TestClient, rect: Rectangle) -> (u32, u32) {
+    request_stream(server, StreamRequest::Start(rect));
+    let message = client.recv().await;
+    assert_eq!(message.header.message_type, display_server::STREAM_CREATE);
+    let create = StreamCreate::decode(message.payload()).unwrap();
+    assert_eq!(
+        create,
+        StreamCreate {
+            surface_id: 0,
+            id: create.id,
+            flags: stream_flags::TOP_DOWN,
+            codec_type: 3,
+            stamp: 0,
+            stream_width: rect.width,
+            stream_height: rect.height,
+            src_width: rect.width,
+            src_height: rect.height,
+            dest: wire_rect(rect),
+            clip: Clip::none(),
+        }
+    );
+    let message = client.recv().await;
+    assert_eq!(
+        message.header.message_type,
+        display_server::STREAM_ACTIVATE_REPORT
+    );
+    let activate = StreamActivateReport::decode(message.payload()).unwrap();
+    assert_eq!(
+        activate,
+        StreamActivateReport {
+            stream_id: create.id,
+            unique_id: activate.unique_id,
+            max_window_size: 5,
+            timeout_ms: 1000,
+        }
+    );
+    (create.id, activate.unique_id)
+}
+
+/// Ask for stream frames until one arrives, since the encoder may skip
+/// some, and check it is for stream `id`. Returns it, with the session's
+/// time just before it was asked for and just after it arrived.
+async fn next_stream_frame(
+    server: &TestServer,
+    client: &mut TestClient,
+    id: u32,
+) -> (StreamData, Duration, Duration) {
+    let session = server.handle.session().unwrap();
+    for _ in 0..10 {
+        let asked = session.elapsed();
+        request_stream(server, StreamRequest::Frame);
+        if let Some(message) = client.recv_within(SKIPPED).await {
+            let arrived = session.elapsed();
+            assert_eq!(message.header.message_type, display_server::STREAM_DATA);
+            let data = StreamData::decode(message.payload()).unwrap();
+            assert_eq!(data.base.id, id);
+            return (data, asked, arrived);
+        }
+    }
+    panic!("ten frames asked for, and none sent");
+}
+
+/// Read `STREAM_DESTROY`, and check it ends stream `id`.
+async fn expect_stream_destroy(client: &mut TestClient, id: u32) {
+    let message = client.recv().await;
+    assert_eq!(message.header.message_type, display_server::STREAM_DESTROY);
+    assert_eq!(
+        StreamDestroy::decode(message.payload()).unwrap(),
+        StreamDestroy { id }
+    );
+}
+
+/// The decoder ryll makes for an H.264 stream.
+fn stream_decoder() -> Box<dyn VideoDecoder> {
+    for_stream(3, Arc::new(JpegDecoderRsDecoder::new())).unwrap()
+}
+
+/// Decode `data` and check it shows what the desktop shows in `rect`, to
+/// within [`STREAM_TOLERANCE`].
+fn assert_frame_shows(
+    decoder: &mut Box<dyn VideoDecoder>,
+    data: &StreamData,
+    server: &TestServer,
+    rect: Rectangle,
+) {
+    let decoded = decoder
+        .decode(&data.data)
+        .unwrap()
+        .expect("a whole frame decodes");
+    assert_eq!((decoded.width, decoded.height), (rect.width, rect.height));
+    let expected = server.platform.desktop().unwrap().crop(rect).unwrap();
+    let mut total = 0u64;
+    for y in 0..rect.height {
+        let want = rgba(expected.row(y).unwrap());
+        let at = y as usize * rect.width as usize * 4;
+        let got = &decoded.rgba[at..at + want.len()];
+        for (w, g) in want.as_chunks::<4>().0.iter().zip(got.as_chunks::<4>().0) {
+            total += (0..3).map(|c| u64::from(w[c].abs_diff(g[c]))).sum::<u64>();
+        }
+    }
+    let error = total as f64 / (rect.area() * 3) as f64;
+    assert!(
+        error < STREAM_TOLERANCE,
+        "the frame differs from the desktop by {error:.2} a channel on average"
+    );
+}
+
+/// A `STREAM_REPORT` for `stream_id` with `unique_id`, of five frames, one
+/// dropped.
+fn stream_report(stream_id: u32, unique_id: u32) -> StreamReport {
+    StreamReport {
+        stream_id,
+        unique_id,
+        start_frame_mm_time: 1000,
+        end_frame_mm_time: 1100,
+        num_frames: 5,
+        num_drops: 1,
+        last_frame_delay: 30,
+        audio_delay: u32::MAX,
+    }
+}
+
+/// The report spice-gtk sends for a stream it cannot decode: no frames,
+/// `u32::MAX` dropped, and the rest zero.
+fn cannot_decode(stream_id: u32) -> StreamReport {
+    StreamReport {
+        stream_id,
+        unique_id: 0,
+        start_frame_mm_time: 0,
+        end_frame_mm_time: 0,
+        num_frames: 0,
+        num_drops: u32::MAX,
+        last_frame_delay: 0,
+        audio_delay: 0,
+    }
+}
+
+/// What the server logs, for tests that read it.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl Captured {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+
+    /// Capture what this thread logs at `level` and above, until the
+    /// guard is dropped. The server's tasks run on the thread of a
+    /// `current_thread` test, so this sees what they log.
+    fn start(level: tracing::Level) -> (Self, tracing::subscriber::DefaultGuard) {
+        let logs = Self::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(level)
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (logs, guard)
+    }
+}
+
+impl Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for Captured {
+    type Writer = Captured;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// What andris warns once when streams are turned off.
+const STREAMS_OFF: &str = "sending no more video streams on this connection";
+
+#[tokio::test]
+async fn a_stream_is_created_sends_frames_that_decode_and_is_destroyed() {
+    let (server, _main, mut client) = open_display(capabilities::DEFAULT_DISPLAY).await;
+    let mut screen = start(&server, &mut client, image_compression::AUTO_GLZ).await;
+    let (id, _) = start_stream(&server, &mut client, STREAM_RECT).await;
+    // Nothing is sent until a frame is asked for.
+    expect_quiet(&mut client).await;
+
+    let mut decoder = stream_decoder();
+    let (data, _, _) = next_stream_frame(&server, &mut client, id).await;
+    assert_frame_shows(&mut decoder, &data, &server, STREAM_RECT);
+
+    // Draws carry on as usual, and the next frame shows the change too.
+    advance_and_expect_frame(&server, &mut client, &mut screen).await;
+    let (data, _, _) = next_stream_frame(&server, &mut client, id).await;
+    assert_frame_shows(&mut decoder, &data, &server, STREAM_RECT);
+
+    request_stream(&server, StreamRequest::Stop);
+    expect_stream_destroy(&mut client, id).await;
+    // With no stream, a frame asked for sends nothing.
+    request_stream(&server, StreamRequest::Frame);
+    expect_quiet(&mut client).await;
+}
+
+#[tokio::test]
+async fn stream_frames_are_stamped_ahead_of_the_session_clock_by_the_budget() {
+    let (server, mut main, mut client) = open_display(capabilities::DEFAULT_DISPLAY).await;
+    let message = main.recv().await;
+    assert_eq!(message.header.message_type, main_server::INIT);
+    let init = MainInit::decode(message.payload()).unwrap();
+    start(&server, &mut client, image_compression::AUTO_GLZ).await;
+    let (id, _) = start_stream(&server, &mut client, STREAM_RECT).await;
+
+    let budget = STREAM_LATENCY_BUDGET.as_millis() as u32;
+    for _ in 0..3 {
+        let (data, asked, arrived) = next_stream_frame(&server, &mut client, id).await;
+        let time = data.base.multi_media_time;
+        // On the clock MAIN_INIT gave the client, between the moment it
+        // was asked for and the moment it arrived, plus the budget.
+        assert!(init.multi_media_time + budget <= time);
+        let earliest = asked.as_millis() as u32 + budget;
+        let latest = arrived.as_millis() as u32 + budget;
+        assert!(
+            (earliest..=latest).contains(&time),
+            "a frame stamped {time} ms, asked for at {} ms and arrived at {} ms",
+            asked.as_millis(),
+            arrived.as_millis()
+        );
+    }
+}
+
+#[tokio::test]
+async fn no_stream_starts_without_both_h264_caps() {
+    for caps in [
+        capabilities::DEFAULT_DISPLAY & !capabilities::DISPLAY_CODEC_H264,
+        capabilities::DEFAULT_DISPLAY & !capabilities::DISPLAY_MULTI_CODEC,
+    ] {
+        let (server, _main, mut client) = open_display(caps).await;
+        let mut screen = start(&server, &mut client, image_compression::AUTO_GLZ).await;
+        request_stream(&server, StreamRequest::Start(STREAM_RECT));
+        request_stream(&server, StreamRequest::Frame);
+        request_stream(&server, StreamRequest::Stop);
+        expect_quiet(&mut client).await;
+        // The channel carries on with draws.
+        advance_and_expect_frame(&server, &mut client, &mut screen).await;
+        expect_quiet(&mut client).await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn reports_for_another_stream_or_unique_id_are_ignored() {
+    let (logs, _guard) = Captured::start(tracing::Level::DEBUG);
+    let (server, _main, mut client) = open_display(capabilities::DEFAULT_DISPLAY).await;
+    start(&server, &mut client, image_compression::AUTO_GLZ).await;
+    let (id, unique_id) = start_stream(&server, &mut client, STREAM_RECT).await;
+
+    // Another stream's report, even one saying it cannot be decoded, and
+    // a report from an earlier stream with this id.
+    for report in [
+        cannot_decode(id + 1),
+        stream_report(id + 1, unique_id),
+        stream_report(id, unique_id.wrapping_add(1)),
+        stream_report(id, unique_id),
+    ] {
+        client
+            .send(display_client::STREAM_REPORT, &body(&report))
+            .await;
+    }
+    wait_until("the reports are read", || {
+        logs.text().matches("a stream report").count() == 4
+    })
+    .await;
+    let text = logs.text();
+    assert_eq!(
+        text.matches("a report for another stream; ignored").count(),
+        2,
+        "{text}"
+    );
+    assert_eq!(
+        text.matches("a report from an earlier stream with this id; ignored")
+            .count(),
+        1,
+        "{text}"
+    );
+    assert!(!text.contains(STREAMS_OFF), "{text}");
+
+    // The stream lives on.
+    next_stream_frame(&server, &mut client, id).await;
+    expect_quiet(&mut client).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_client_that_cannot_decode_ends_streams_with_one_warning() {
+    let (logs, _guard) = Captured::start(tracing::Level::WARN);
+    let (server, _main, mut client) = open_display(capabilities::DEFAULT_DISPLAY).await;
+    let mut screen = start(&server, &mut client, image_compression::AUTO_GLZ).await;
+    let (id, _) = start_stream(&server, &mut client, STREAM_RECT).await;
+    next_stream_frame(&server, &mut client, id).await;
+
+    // As spice-gtk sends it, with no unique_id.
+    client
+        .send(display_client::STREAM_REPORT, &body(&cannot_decode(id)))
+        .await;
+    expect_stream_destroy(&mut client, id).await;
+
+    // Saying it again, or asking for another stream, does nothing.
+    client
+        .send(display_client::STREAM_REPORT, &body(&cannot_decode(id)))
+        .await;
+    request_stream(&server, StreamRequest::Start(STREAM_RECT));
+    request_stream(&server, StreamRequest::Frame);
+    expect_quiet(&mut client).await;
+
+    // Draws carry on.
+    advance_and_expect_frame(&server, &mut client, &mut screen).await;
+    let text = logs.text();
+    assert_eq!(text.matches(STREAMS_OFF).count(), 1, "{text}");
+}
+
+#[tokio::test]
+async fn a_resize_ends_every_stream_before_the_surface() {
+    let (server, _main, mut client) = open_display(capabilities::DEFAULT_DISPLAY).await;
+    start(&server, &mut client, image_compression::AUTO_GLZ).await;
+    let (id, _) = start_stream(&server, &mut client, STREAM_RECT).await;
+    next_stream_frame(&server, &mut client, id).await;
+
+    let size = Size {
+        width: 320,
+        height: 256,
+    };
+    server.platform.set_size(size).unwrap();
+    let message = client.recv().await;
+    assert_eq!(
+        message.header.message_type,
+        display_server::STREAM_DESTROY_ALL
+    );
+    assert!(message.payload().is_empty());
+    expect_replaced_surface(&server, &mut client, size).await;
+    expect_quiet(&mut client).await;
+
+    // The stream went with the surface, and another may start on the new
+    // one, with the next id.
+    request_stream(&server, StreamRequest::Frame);
+    expect_quiet(&mut client).await;
+    let (next, _) = start_stream(&server, &mut client, STREAM_RECT).await;
+    assert_eq!(next, id + 1);
+    let mut decoder = stream_decoder();
+    let (data, _, _) = next_stream_frame(&server, &mut client, next).await;
+    assert_frame_shows(&mut decoder, &data, &server, STREAM_RECT);
 }

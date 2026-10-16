@@ -367,7 +367,7 @@ its conventions in its `AGENTS.md`.
 | 1 | high | opus | none | Complete | Spike: openh264 in andris's image with nasm, bitrate changes, `Send`, and the e2e picture source. Gated. See brief 1. |
 | 2 | high | opus | none | Complete | Ryll: move the H.264 encoder, advertise H.264, fix the stride, add `stats`. Ryll PR. See brief 2. |
 | 3 | medium | sonnet | none | Complete | Andris: bump the ryll pin, add nasm to the image. See brief 3. |
-| 4 | high | opus | none | Not started | The stream lifecycle on the display channel: caps, opcodes, encoder, create/data/destroy, reports parsed. See brief 4. |
+| 4 | high | opus | none | Complete | The stream lifecycle on the display channel: caps, opcodes, encoder, create/data/destroy, reports parsed. See brief 4. |
 | 5 | high | opus | none | Not started | Detection, the frame path inside a stream, teardown and lossless repair. See brief 5. |
 | 6 | high | opus | none | Not started | Rate control from reports and server drops; metrics fields. See brief 6. |
 | 7 | high | opus | none | Not started | End-to-end checks: `make e2e` and one `make e2e-xrdp` check. See brief 7. |

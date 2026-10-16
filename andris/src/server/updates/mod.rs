@@ -50,7 +50,9 @@
 //!   and [`Draw`];
 //! - [`shadow`] holds the shadow and compares captures with it;
 //! - [`encode`] chooses each draw's encoding and builds its message;
-//! - [`lossy`] tracks the tiles sent lossily.
+//! - [`lossy`] tracks the tiles sent lossily;
+//! - [`stream`] holds a display channel's video stream, an area sent as
+//!   H.264 frames rather than draws, and builds its messages.
 //!
 //! This module knows nothing of sockets, so it is tested on its own.
 //!
@@ -61,6 +63,7 @@
 mod encode;
 mod lossy;
 mod shadow;
+mod stream;
 #[cfg(test)]
 mod test_support;
 
@@ -73,6 +76,11 @@ pub use encode::{
 use encode::{encode_draw, split};
 pub use lossy::LossyTiles;
 use shadow::Shadow;
+pub use stream::{
+    CODEC_TYPE_H264, REPORT_TIMEOUT, REPORT_WINDOW, ReportVerdict, STREAM_IDS,
+    STREAM_LATENCY_BUDGET, Stream, StreamCaps, StreamRequest, Streams, frames_per_second,
+    multi_media_time,
+};
 
 use crate::platform::{Capture, Rectangle, Region, Size};
 

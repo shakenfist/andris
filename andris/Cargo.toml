@@ -49,8 +49,9 @@ shakenfist-spice-compression = { version = "0.1.7", git = "https://github.com/sh
 [dev-dependencies]
 rcgen = "0.14"
 # The LZ4 and pure-Rust JPEG decoders too, so tests can decode what the
-# encoders produced. Cargo unifies these features with the ones above in
-# test builds.
+# encoders produced. `jpeg` also gates the video stream decoders
+# (`video::for_stream`), H.264's among them. Cargo unifies these features
+# with the ones above in test builds only.
 shakenfist-spice-compression = { version = "0.1.7", git = "https://github.com/shakenfist/ryll", rev = "a157ced013962b0ec3f26acfcda92dba3f4ce1f0", default-features = false, features = [
     "encode",
     "jpeg",

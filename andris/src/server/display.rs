@@ -27,10 +27,10 @@
 //! must lose nothing when dropped: [`ChannelConn::recv`] and
 //! [`ChannelConn::wait_for_room`] keep what they read,
 //! [`DamageSubscription::changed`] loses nothing, the sleeps are made
-//! afresh each time round, and an interval's `tick()` is cancel-safe.
-//! Frames, refreshes and the scrub run in branch bodies, after the
-//! `select!` has chosen, so nothing drops them part way but the end of
-//! the channel.
+//! afresh each time round, and an interval's `tick()` and the stream
+//! requests' `recv()` are cancel-safe. Frames, refreshes, the scrub and
+//! stream requests run in branch bodies, after the `select!` has chosen,
+//! so nothing drops them part way but the end of the channel.
 //!
 //! # The shadow
 //!
@@ -60,6 +60,21 @@
 //! for the rate cap and the ack window, behind any pending damage; it
 //! then marks them exact. So a still screen always ends up exact.
 //!
+//! # Video streams
+//!
+//! A client with both the `MULTI_CODEC` and `CODEC_H264` capabilities may
+//! be sent one H.264 stream at a time, which [`Streams`] holds; the
+//! stream module says what its messages carry. Nothing yet decides on its
+//! own to stream an area: a stream starts, sends a frame and ends on a
+//! [`StreamRequest`] made through the session, and draws carry on as
+//! usual meanwhile. A frame's capture is stamped from the session's
+//! clock, the one `MAIN_INIT` gave the client, and encoded on the
+//! blocking pool. The client's `STREAM_REPORT`s are recorded. A report
+//! that the client cannot decode the stream, or a failure of the encoder,
+//! ends the stream and turns streams off for the rest of the channel,
+//! with one warning. Replacing the surface ends every stream first, with
+//! `STREAM_DESTROY_ALL`, once any stream has been created.
+//!
 //! [running]: https://github.com/shakenfist/andris/blob/develop/docs/running.md
 //! [`LossyTiles`]: super::updates::LossyTiles
 
@@ -75,9 +90,12 @@ use shakenfist_spice_protocol::{capabilities, display_client};
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
-use super::channel::{ACK_WINDOW, ChannelConn, ChannelContext};
+use super::channel::{ACK_WINDOW, ChannelConn, ChannelContext, ClientCaps};
 use super::opcodes::DisplayOpcode;
-use super::updates::{Draw, EncodeOptions, JpegQuality, LossyTiles, SURFACE_ID, UpdateEncoder};
+use super::updates::{
+    Draw, EncodeOptions, JpegQuality, LossyTiles, ReportVerdict, SURFACE_ID, Stream, StreamCaps,
+    StreamRequest, Streams, UpdateEncoder,
+};
 use crate::config::DEFAULT_FRAME_INTERVAL_MS;
 use crate::platform::{self, Capture, DamageSubscription, Rectangle, Region, Size, TILE};
 
@@ -158,6 +176,8 @@ pub async fn run(ctx: ChannelContext, mut conn: ChannelConn<DisplayOpcode>) -> R
         .context("subscribing to the desktop's damage")?;
     let scrub_every = scrub_tick(ctx.display.scrub_period);
     let lossy = LossyTiles::new(ctx.display.lossless_delay);
+    let streams = Streams::new(stream_caps(&ctx.caps), ctx.display.frame_interval);
+    let mut stream_requests = ctx.session.stream_requests();
     let mut display = Display {
         ctx,
         conn,
@@ -172,6 +192,7 @@ pub async fn run(ctx: ChannelContext, mut conn: ChannelConn<DisplayOpcode>) -> R
         capture_retry: Instant::now(),
         scrub_top: 0,
         lossy,
+        streams,
     };
 
     // Wait for INIT, handling whatever else arrives first.
@@ -179,7 +200,7 @@ pub async fn run(ctx: ChannelContext, mut conn: ChannelConn<DisplayOpcode>) -> R
         let Some(message) = display.conn.recv().await? else {
             return Ok(());
         };
-        display.handle(&message)?;
+        display.handle(&message).await?;
     }
 
     let mut scrub_ticks = tokio::time::interval_at(Instant::now() + scrub_every, scrub_every);
@@ -211,10 +232,11 @@ pub async fn run(ctx: ChannelContext, mut conn: ChannelConn<DisplayOpcode>) -> R
         // Every branch is cancel-safe: next_incoming wraps recv() or
         // wait_for_room(), each of which keeps whatever it read; changed()
         // loses nothing when dropped; each sleep is made afresh each time
-        // round; and an interval's tick() is cancel-safe.
+        // round; an interval's tick() is cancel-safe; and so is an mpsc
+        // receiver's recv(), which once closed only disables its branch.
         tokio::select! {
             incoming = next_incoming(&mut display.conn, await_room) => match incoming? {
-                Incoming::Message(message) => display.handle(&message)?,
+                Incoming::Message(message) => display.handle(&message).await?,
                 Incoming::Closed => return Ok(()),
                 Incoming::Room => {}
             },
@@ -223,6 +245,7 @@ pub async fn run(ctx: ChannelContext, mut conn: ChannelConn<DisplayOpcode>) -> R
             () = tokio::time::sleep_until(refresh_at.unwrap_or(now)),
                 if refresh_at.is_some() && !refresh_due => {}
             _ = scrub_ticks.tick() => display.scrub().await?,
+            Some(request) = stream_requests.recv() => display.stream_request(request).await?,
         }
     }
 }
@@ -237,6 +260,17 @@ fn scrub_tick(period: Duration) -> Duration {
 /// [`TILE`] rows, enough of them that [`SCRUB_SLICES`] slices cover it.
 fn scrub_slice_height(height: u32) -> u32 {
     height.div_ceil(TILE).div_ceil(SCRUB_SLICES).max(1) * TILE
+}
+
+/// What the client's display capabilities allow of streams: H.264, the
+/// only codec andris encodes, needs both `MULTI_CODEC` and `CODEC_H264`,
+/// and reports need `STREAM_REPORT`.
+fn stream_caps(caps: &ClientCaps) -> StreamCaps {
+    StreamCaps {
+        h264: caps
+            .has_channel_mask(capabilities::DISPLAY_MULTI_CODEC | capabilities::DISPLAY_CODEC_H264),
+        reports: caps.has_channel_mask(capabilities::DISPLAY_STREAM_REPORT),
+    }
 }
 
 /// What the client's side of the main loop's select produced.
@@ -301,15 +335,18 @@ struct Display {
     /// The tiles last sent lossily, and when each is due to be sent again
     /// losslessly.
     lossy: LossyTiles,
+    /// The video stream, if one is live, and whether one may start.
+    streams: Streams,
 }
 
 impl Display {
     /// Handle one message from the client. `PREFERRED_COMPRESSION` takes
     /// effect from the next draw (see [`Display::encode_options`]);
-    /// `PREFERRED_VIDEO_CODEC_TYPE` and `STREAM_REPORT` are parsed and
-    /// ignored, since andris sends no streams. A malformed message fails,
-    /// closing the channel; an unknown one is ignored.
-    fn handle(&mut self, message: &ReceivedMessage) -> Result<()> {
+    /// `STREAM_REPORT` is recorded against the live stream, or ends it if
+    /// the client cannot decode it; `PREFERRED_VIDEO_CODEC_TYPE` is parsed
+    /// and ignored. A malformed message fails, closing the channel; an
+    /// unknown one is ignored.
+    async fn handle(&mut self, message: &ReceivedMessage) -> Result<()> {
         let session = self.conn.session().id();
         match message.header.message_type {
             display_client::INIT => {
@@ -339,13 +376,17 @@ impl Display {
                 self.preferred_compression = Some(preferred.image_compression);
             }
             display_client::PREFERRED_VIDEO_CODEC_TYPE => {
+                // Andris encodes only H.264, so the client's order among
+                // the codecs it can decode changes nothing: its caps
+                // decide (see stream_caps).
                 PreferredVideoCodecType::decode(message.payload())
                     .context("a malformed PREFERRED_VIDEO_CODEC_TYPE")?;
                 self.conn.ignore(message);
             }
             display_client::STREAM_REPORT => {
-                StreamReport::decode(message.payload()).context("a malformed STREAM_REPORT")?;
-                self.conn.ignore(message);
+                let report =
+                    StreamReport::decode(message.payload()).context("a malformed STREAM_REPORT")?;
+                self.stream_report(report).await?;
             }
             _ => self.conn.ignore(message),
         }
@@ -371,6 +412,42 @@ impl Display {
                 && preferred != Some(image_compression::OFF),
             jpeg,
         }
+    }
+
+    /// Act on a client's `STREAM_REPORT`.
+    async fn stream_report(&mut self, report: StreamReport) -> Result<()> {
+        let session = self.conn.session().id();
+        let (stream, unique_id) = (report.stream_id, report.unique_id);
+        debug!(
+            session,
+            stream,
+            unique_id,
+            frames = report.num_frames,
+            drops = report.num_drops,
+            last_frame_delay_ms = report.last_frame_delay,
+            "a stream report"
+        );
+        match self.streams.report(report) {
+            ReportVerdict::Recorded => {}
+            ReportVerdict::CannotDecode => {
+                let live = self.streams.end();
+                self.disable_streams(live, "the client cannot decode it")
+                    .await?;
+            }
+            ReportVerdict::NoStream => {
+                debug!(session, stream, "a report with no stream live; ignored");
+            }
+            ReportVerdict::OtherStream => {
+                debug!(session, stream, "a report for another stream; ignored");
+            }
+            ReportVerdict::OtherUniqueId => {
+                debug!(
+                    session,
+                    stream, unique_id, "a report from an earlier stream with this id; ignored"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Wait for room in the ack window, then send one message.
@@ -502,6 +579,11 @@ impl Display {
                 to = %capture.size(),
                 "the desktop changed size; replacing the surface"
             );
+            // Streams are drawn on the surface, so they end first. A
+            // client never sent a stream is told nothing of them.
+            if self.streams.end_all() {
+                self.send(DisplayOpcode::StreamDestroyAll, &[]).await?;
+            }
             self.send_msg(
                 DisplayOpcode::SurfaceDestroy,
                 &SurfaceDestroy {
@@ -656,6 +738,160 @@ impl Display {
             self.conn.session().counters().frame_sent(true);
         }
         Ok(())
+    }
+
+    /// Act on a [`StreamRequest`].
+    async fn stream_request(&mut self, request: StreamRequest) -> Result<()> {
+        match request {
+            StreamRequest::Start(rect) => self.start_stream(rect).await,
+            StreamRequest::Frame => self.stream_frame().await,
+            StreamRequest::Stop => self.end_stream().await,
+        }
+    }
+
+    /// Start a stream over `rect`, as [`Streams::start`] shapes it, and
+    /// send its `STREAM_CREATE`, then its `STREAM_ACTIVATE_REPORT` if the
+    /// client sends reports. Does nothing without a surface, or if no
+    /// stream may start. If the encoder cannot be built, streams are
+    /// turned off.
+    async fn start_stream(&mut self, rect: Rectangle) -> Result<()> {
+        let session = self.conn.session().id();
+        let Some(size) = self.surface else {
+            debug!(session, %rect, "no surface yet; no stream");
+            return Ok(());
+        };
+        if !self.streams.may_start() {
+            debug!(
+                session,
+                %rect,
+                "the client cannot take a stream, streams are off, or one is live; no stream"
+            );
+            return Ok(());
+        }
+        let (create, activate) = match self.streams.start(rect, size) {
+            Ok(Some(stream)) => (stream.create()?, stream.activate_report()),
+            Ok(None) => {
+                debug!(session, %rect, "too little of the area lies on the surface; no stream");
+                return Ok(());
+            }
+            Err(e) => return self.disable_streams(None, &format!("{e:#}")).await,
+        };
+        debug!(
+            session,
+            stream = create.id,
+            width = create.stream_width,
+            height = create.stream_height,
+            x = create.dest.left,
+            y = create.dest.top,
+            "starting a video stream"
+        );
+        self.send_msg(DisplayOpcode::StreamCreate, &create).await?;
+        if let Some(activate) = activate {
+            self.send_msg(DisplayOpcode::StreamActivateReport, &activate)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Capture the live stream's rectangle, encode it on the blocking
+    /// pool, and send it as one `STREAM_DATA` stamped with the session's
+    /// time as the capture started. Sends nothing without a live stream,
+    /// when the capture fails, or when the encoder skips the frame. A
+    /// capture that finds the desktop resized adds damage of it all, so
+    /// that a frame replaces the surface, ending the stream. A failure of
+    /// the encoder ends the stream and turns streams off.
+    ///
+    /// The stream moves into the encoding task with the pixels, and back
+    /// out with the result, so no stream is live meanwhile. If the task
+    /// panics, the stream is lost with it and this fails, closing the
+    /// channel.
+    async fn stream_frame(&mut self) -> Result<()> {
+        let Some(rect) = self.streams.live().map(Stream::rect) else {
+            return Ok(());
+        };
+        let captured_at = self.conn.session().elapsed();
+        let Some(capture) = self.capture_or_skip(Some(vec![rect])).await? else {
+            return Ok(());
+        };
+        if self.surface != Some(capture.size()) {
+            // The desktop resized before its damage said so. Any damage
+            // starts a frame, whose capture finds the new size.
+            self.damage.add(&Region::full(capture.size()))?;
+            return Ok(());
+        }
+        let Some(pixels) = capture
+            .into_patches()
+            .pop()
+            .map(|patch| patch.into_pixels())
+        else {
+            bail!("a capture of the stream's {rect} has no pixels");
+        };
+        let Some(mut stream) = self.streams.take() else {
+            return Ok(());
+        };
+        let (stream, encoded) = tokio::task::spawn_blocking(move || {
+            let encoded = stream.encode(&pixels);
+            (stream, encoded)
+        })
+        .await
+        .context("the stream's encoding task failed")?;
+        match encoded {
+            Ok(Some(frame)) => {
+                let data = stream.data(frame, captured_at);
+                self.streams.put_back(stream);
+                self.send_msg(DisplayOpcode::StreamData, &data).await
+            }
+            Ok(None) => {
+                debug!(
+                    session = self.conn.session().id(),
+                    stream = stream.id(),
+                    "the encoder skipped a frame to hold its bitrate"
+                );
+                self.streams.put_back(stream);
+                Ok(())
+            }
+            Err(e) => {
+                self.disable_streams(Some(stream), &format!("encoding failed: {e:#}"))
+                    .await
+            }
+        }
+    }
+
+    /// End the live stream, if there is one.
+    async fn end_stream(&mut self) -> Result<()> {
+        match self.streams.end() {
+            Some(stream) => self.destroy_stream(stream).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Tell the client `stream` has ended.
+    async fn destroy_stream(&mut self, stream: Stream) -> Result<()> {
+        debug!(
+            session = self.conn.session().id(),
+            stream = stream.id(),
+            "ending a video stream"
+        );
+        self.send_msg(DisplayOpcode::StreamDestroy, &stream.destroy())
+            .await
+    }
+
+    /// Turn streams off for the rest of the channel, because of `why`,
+    /// ending `stream`, which must no longer be live. Warns only the first
+    /// time.
+    async fn disable_streams(&mut self, stream: Option<Stream>, why: &str) -> Result<()> {
+        if self.streams.disable() {
+            warn!(
+                session = self.conn.session().id(),
+                stream = ?stream.as_ref().map(Stream::id),
+                why,
+                "a video stream failed; sending no more video streams on this connection"
+            );
+        }
+        match stream {
+            Some(stream) => self.destroy_stream(stream).await,
+            None => Ok(()),
+        }
     }
 
     /// Re-read the scrub's next slice of the desktop, and add each tile

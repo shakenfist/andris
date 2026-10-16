@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The xrdp test bed's interleaving checks, X1 to X11.
+"""The xrdp test bed's interleaving checks, X1 to X12.
 
 scripts/xrdp-testbed/run.sh runs this inside the andris-xrdp-testbed
 container, as root, once its smoke checks have passed: andris shares the
@@ -57,6 +57,11 @@ The checks, each printing PASS or FAIL with what it saw:
       to resize it: andris logs the refusal once for two requests, ryll's
       surface keeps the session's size, and a resize from RDP afterwards
       still reaches ryll.
+  X12 scripts/e2e-video.py plays a moving picture in the session, which
+      xorgxrdp also sends to FreeRDP: ryll's `stats` show one H.264 stream
+      created and decoding frames, with no decode failure, and it is
+      destroyed once the picture stops. RDP is unaffected: FreeRDP stays
+      connected throughout, and logs no error while the picture plays.
   X7  The session ended, by ending its window manager (the keylogger):
       andris exits within 10 s, logging that the desktop has gone. Andris
       is run.sh's child, so run.sh checks its exit status afterwards.
@@ -434,6 +439,12 @@ class Bed:
 
     def andris_log(self):
         return os.path.join(self.args.work, 'andris.log')
+
+    def freerdp_log(self):
+        """The log of the FreeRDP running now: run.sh's first, or the newest the checks started."""
+        if self.restarts['freerdp']:
+            return os.path.join(self.args.work, f'freerdp-{self.restarts["freerdp"]}.log')
+        return os.path.join(self.args.work, 'freerdp.log')
 
     def restart_ryll(self):
         self.control.close()
@@ -865,6 +876,49 @@ def x11(bed):
             f'stayed {size[0]}x{size[1]}; an RDP resize to {target[0]}x{target[1]} then reached ryll')
 
 
+# FreeRDP's log lines for an error, as WLog writes them.
+FREERDP_ERROR = '[ERROR]'
+
+
+def x12(bed):
+    """A video in the session streams to ryll as H.264, and RDP is unaffected."""
+    freerdp_log = bed.freerdp_log()
+    with open(freerdp_log, 'rb') as f:
+        mark = len(f.read())
+    video = drive.Video(bed.args.session, bed.args.work, 'video', bed.watch)
+    try:
+        start = time.monotonic()
+        stats = drive.poll_stats(bed.control, 'no H.264 stream decoded frames', drive.STREAM_BOUND,
+                                 drive.h264_decoding, bed.watch)
+        stream = drive.h264_decoding(stats)[0]
+        started = time.monotonic() - start
+        time.sleep(drive.STREAM_SPELL)
+        later = drive.poll_stats(bed.control, 'stats could not be read', 1.0, lambda d: True, bed.watch)
+        live = [s for s in later['streams'] if s['stream_id'] == stream['stream_id']]
+        first = stream['frames_decoded_ok']
+        if later['streams_created_total'] != 1 or not live or live[0]['frames_decoded_ok'] <= first:
+            raise Failure(f'the video did not play as one decoding stream for {drive.STREAM_SPELL:.0f} s; '
+                          f'stats: {later}')
+        video.stop(bed.watch)
+        stopped = time.monotonic()
+        drive.poll_stats(bed.control, 'the stream was not destroyed', drive.DESTROY_BOUND,
+                         lambda d: d['streams_destroyed_total'] >= 1 and not d['streams'], bed.watch)
+        ended = time.monotonic() - stopped
+    finally:
+        video.close()
+    bed.watch.check()
+    with open(freerdp_log, 'rb') as f:
+        f.seek(mark)
+        errors = [line for line in f.read().decode('utf-8', 'replace').splitlines() if FREERDP_ERROR in line]
+    if errors:
+        raise Failure(f'FreeRDP logged {len(errors)} error(s) while the video played: {errors[:3]}')
+    rects = drive.stream_rects(bed.andris_log())
+    return (f'an H.264 stream ({stream["width"]}x{stream["height"]}, andris logged '
+            f'{", ".join(drive.describe_rect(r) for r in rects)}) was decoding after {started:.1f} s, decoded '
+            f'{live[0]["frames_decoded_ok"]} frames with no failure, and was destroyed {ended:.2f} s after the '
+            f'video stopped; FreeRDP stayed up, and logged no error')
+
+
 def x7(bed):
     """End the session by ending its window manager, the keylogger."""
     andris = bed.watch.pids['andris']
@@ -908,7 +962,7 @@ def setup(bed):
 
 
 CHECKS = (('X1', x1), ('X2', x2), ('X3', x3), ('X4', x4), ('X5', x5), ('X6', x6), ('X8', x8), ('X9', x9),
-          ('X10', x10), ('X11', x11))
+          ('X10', x10), ('X11', x11), ('X12', x12))
 
 
 def main():

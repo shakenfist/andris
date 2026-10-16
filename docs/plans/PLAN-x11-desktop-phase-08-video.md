@@ -370,7 +370,7 @@ its conventions in its `AGENTS.md`.
 | 4 | high | opus | none | Complete | The stream lifecycle on the display channel: caps, opcodes, encoder, create/data/destroy, reports parsed. See brief 4. |
 | 5 | high | opus | none | Complete | Detection, the frame path inside a stream, teardown and lossless repair. See brief 5. |
 | 6 | high | opus | none | Complete | Rate control from reports and server drops; metrics fields. See brief 6. |
-| 7 | high | opus | none | Not started | End-to-end checks: `make e2e` and one `make e2e-xrdp` check. See brief 7. |
+| 7 | high | opus | none | Complete | End-to-end checks: `make e2e` and one `make e2e-xrdp` check. See brief 7. |
 | 8 | medium | sonnet | none | Not started | Documentation. See brief 8. |
 | 9 | medium | management | none | Not started | Operator acceptance on `:10`, with a video. See brief 9. |
 | 10 | medium | management | none | Not started | Push audit, pull request, queue. See brief 10. |

@@ -37,7 +37,24 @@ up. It asserts, in order:
               reaches ryll as a new surface of that size, and andris logs
               each as applied. Then two sizes above the start, which Xvfb's
               RandR does not allow: ryll is told both were refused, andris
-              logs the refusal once, and ryll's surface keeps its size.
+              logs the refusal once, and ryll's surface keeps its size;
+  video       scripts/e2e-video.py plays a moving picture beside a static
+              text area. Polling ryll's `stats` every POLL: within
+              STREAM_BOUND one H.264 stream is created and decodes frames,
+              and for STREAM_SPELL more it keeps decoding with no decode
+              failure, and no second stream starts. Andris logs the
+              stream's rectangle, which must cover the video and not the
+              text. The video then stops (SIGUSR1): the stream is destroyed
+              within DESTROY_BOUND, and within REPAIR_BOUND of that a
+              screenshot of the video's area matches its last frame
+              exactly, which proves andris repaired the area losslessly.
+              Last, a summary of ryll's STREAM_REPORTs and of andris's
+              bitrate changes, from andris's debug log, is printed.
+
+With --no-stream, for a ryll started with --no-h264, it checks only that:
+once a surface is up, the video plays for NO_STREAM_SPELL with ryll's
+`stats` showing no stream created at any poll. scripts/e2e.sh then reads
+andris's session-end metrics line for the JPEG draws the video went as.
 
 Every wait gives up at once if a process named with --watch (andris, ryll,
 the keylogger) exits, rather than running out its bound.
@@ -45,9 +62,10 @@ the keylogger) exits, rather than running out its bound.
 The control-socket client follows ryll's tools/proxmox-smoke.py: NDJSON
 requests with an integer id, responses matched by id, events skipped. See
 ryll's docs/control-socket-protocol.md. `send_key` takes the logical set-1
-make code, with the 0xE0 prefix in the high byte. Protocol 1.3 is required,
-for the clipboard and resize verbs; 1.2 fixed extended keys, which older
-servers sent with the bytes the wrong way round.
+make code, with the 0xE0 prefix in the high byte. Protocol 1.4 is required,
+for the `stats` verb; 1.3 added the clipboard and resize verbs, and 1.2
+fixed extended keys, which older servers sent with the bytes the wrong way
+round.
 
 The resize checks read andris's log (--andris-log), and ryll's (--ryll-log),
 whose debug lines record each agent reply andris sends.
@@ -62,6 +80,7 @@ import json
 import os
 import re
 import select
+import signal
 import socket
 import subprocess
 import sys
@@ -94,8 +113,9 @@ CHANGE_BOUND = 2.0
 
 POLL = 0.25
 
-# The control protocol needed: 1.3 added the clipboard and resize verbs.
-PROTOCOL = (1, 3)
+# The control protocol needed: 1.4 added `stats`, which the video checks
+# read streams from.
+PROTOCOL = (1, 4)
 
 # Clipboard: from one side's copy to the other side having the text. Ryll
 # looks at its clipboard every 500 ms, and the largest text crosses the
@@ -121,6 +141,28 @@ KEYS = ((0x1E, 'a'), (0xE04B, 'Left'))
 
 # The key that makes the keylogger repaint its square: set-1 'x'.
 SQUARE_SCANCODE = 0x2D
+
+# The video's window, whose left edge and top are 64-aligned, so that the
+# tiles the video changes end where the text area's begin: andris's stream
+# is the bounding box of whole tiles.
+VIDEO_X = 64
+VIDEO_Y = 64
+
+# From the video's first frame to an H.264 stream in ryll that has decoded
+# frames: andris wants 20 frames of change first, under a second at 25 fps.
+STREAM_BOUND = 15.0
+# How long the stream is then watched decoding.
+STREAM_SPELL = 3.0
+# From SIGUSR1 to the video, to ryll seeing the stream destroyed: andris
+# ends a stream a second after its last change.
+DESTROY_BOUND = 2.0
+# From the destroy to a screenshot matching the video's last frame: the
+# lossless refresh of the stream's area is due at once, behind any frame.
+REPAIR_BOUND = 2.0
+# The --no-stream run: how long the video plays with no stream allowed.
+NO_STREAM_SPELL = 5.0
+# How long the video script may take to build its picture and map.
+VIDEO_BOUND = 30.0
 
 
 def log(message):
@@ -266,7 +308,7 @@ def connect(path, deadline, watch):
         version = tuple(int(part) for part in hello['protocol_version'].split('.'))
         if version < PROTOCOL:
             raise Failure(f'ryll speaks control protocol {hello["protocol_version"]}; {wanted} or later is '
-                          'needed for the clipboard and resize verbs')
+                          'needed for the stats verb')
         log(f'connected to {path}, protocol {hello["protocol_version"]}')
         return control
     raise Failure(f'could not connect to {path} within {SURFACE_BOUND:.0f} s: {last}')
@@ -695,18 +737,271 @@ def check_resize(control, start_size, andris_log, ryll_log, watch):
         f'({refusal_reason(lines[0])}); the surface stayed {start_size[0]}x{start_size[1]}')
 
 
+# -- the video
+
+
+def video_module():
+    """Import the video script, for its layout."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'e2e-video.py')
+    spec = importlib.util.spec_from_file_location('e2e_video', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def overlaps(a, b):
+    """Whether two (x, y, width, height) rectangles share a pixel."""
+    return a[0] < b[0] + b[2] and b[0] < a[0] + a[2] and a[1] < b[1] + b[3] and b[1] < a[1] + a[3]
+
+
+def describe_rect(rect):
+    return f'{rect[2]}x{rect[3]}+{rect[0]}+{rect[1]}'
+
+
+class Video:
+    """scripts/e2e-video.py, playing on a display, its log and its last frame in `work`."""
+
+    def __init__(self, display, work, name, watch):
+        module = video_module()
+        self.width = 320
+        self.height = 240
+        self.rect = (VIDEO_X, VIDEO_Y, self.width, self.height)
+        self.text = (VIDEO_X + self.width, VIDEO_Y, module.TEXT_WIDTH, self.height)
+        self.log_path = os.path.join(work, f'{name}.log')
+        self.frame_path = os.path.join(work, f'{name}-last.ppm')
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'e2e-video.py')
+        with open(self.log_path, 'wb') as out:
+            self.child = subprocess.Popen(
+                [sys.executable, '-u', script, '--display', display, '--x', str(VIDEO_X), '--y', str(VIDEO_Y),
+                 '--width', str(self.width), '--height', str(self.height), '--last-frame', self.frame_path],
+                stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+        self.wait_line('READY', VIDEO_BOUND, watch)
+
+    def lines(self):
+        with open(self.log_path, encoding='utf-8', errors='replace') as f:
+            return [line.strip() for line in f]
+
+    def wait_line(self, prefix, bound, watch):
+        deadline = time.monotonic() + bound
+        while True:
+            found = [line for line in self.lines() if line.startswith(prefix)]
+            if found:
+                return found[0]
+            if self.child.poll() is not None:
+                raise Failure(f'the video script exited {self.child.returncode}: {self.lines()[-5:]}')
+            watch.check()
+            if time.monotonic() >= deadline:
+                raise Failure(f'the video script did not print {prefix} within {bound:.0f} s: {self.lines()[-5:]}')
+            time.sleep(POLL / 5)
+
+    def stop(self, watch):
+        """Stop painting, leaving the last frame on screen; return the STOPPED line."""
+        self.child.send_signal(signal.SIGUSR1)
+        return self.wait_line('STOPPED', 10.0, watch)
+
+    def close(self):
+        if self.child.poll() is None:
+            self.child.terminate()
+            try:
+                self.child.wait(10)
+            except subprocess.TimeoutExpired:
+                self.child.kill()
+                self.child.wait()
+
+    def last_frame(self):
+        """The last frame painted, from its PPM, as RGB bytes."""
+        with open(self.frame_path, 'rb') as f:
+            data = f.read()
+        header = f'P6\n{self.width} {self.height}\n255\n'.encode()
+        if not data.startswith(header) or len(data) != len(header) + self.width * self.height * 3:
+            raise Failure(f'{self.frame_path} is not a {self.width}x{self.height} binary PPM')
+        return data[len(header):]
+
+
+def display_stats(control):
+    return control.call('stats')['display']
+
+
+def decode_failures(display):
+    """Every decode failure ryll's stats show, as text; empty if none."""
+    found = []
+    for codec, counts in (display.get('decodes') or {}).items():
+        if counts.get('decode_failures_total'):
+            found.append(f'{codec}: {counts["decode_failures_total"]} failed decodes')
+    for stream in (display.get('streams') or []) + (display.get('streams_recently_destroyed') or []):
+        if stream.get('frames_decode_failed'):
+            found.append(f'stream {stream["stream_id"]}: {stream["frames_decode_failed"]} failed frames')
+    return found
+
+
+def poll_stats(control, what, bound, test, watch):
+    """Poll `stats` every POLL until test(display) is true, failing on any decode failure; return the display
+    stats that passed."""
+    deadline = time.monotonic() + bound
+    display = None
+    while True:
+        display = display_stats(control)
+        failures = decode_failures(display)
+        if failures:
+            raise Failure(f'ryll failed to decode stream frames ({"; ".join(failures)}); stats: {display}')
+        if test(display):
+            return display
+        watch.check()
+        if time.monotonic() >= deadline:
+            raise Failure(f'{what} within {bound:.0f} s; last stats: {display}')
+        time.sleep(POLL)
+
+
+def h264_decoding(display):
+    return [s for s in display.get('streams') or [] if s['codec'] == 'h264' and s['frames_decoded_ok'] > 0]
+
+
+# Andris's info line for a stream starting, with its rectangle as
+# WxH+X+Y; see andris/src/server/display.rs.
+STARTED = re.compile(r'starting a video stream .*\brect=(\d+)x(\d+)\+(\d+)\+(\d+)')
+
+
+def stream_rects(andris_log):
+    rects = []
+    for line in log_lines(andris_log, STARTED.pattern):
+        w, h, x, y = (int(part) for part in STARTED.search(line).groups())
+        rects.append((x, y, w, h))
+    return rects
+
+
+def screenshot_rgb(control, surface_id, rect):
+    """The RGB bytes of `rect` of a screenshot of the surface."""
+    result = control.call('screenshot', {'surface_id': surface_id, 'format': 'rgba'})
+    width = result['width']
+    data = base64.b64decode(result['data_base64'])
+    x, y, w, h = rect
+    out = bytearray()
+    for row in range(y, y + h):
+        start = (row * width + x) * 4
+        rgba = data[start:start + w * 4]
+        out += bytes(b for i, b in enumerate(rgba) if i % 4 != 3)
+    return bytes(out)
+
+
+def differing(a, b):
+    """How many pixels of two RGB buffers differ, and by how much at most in one channel."""
+    pixels = sum(1 for i in range(0, len(a), 3) if a[i:i + 3] != b[i:i + 3])
+    worst = max((abs(p - q) for p, q in zip(a, b)), default=0)
+    return pixels, worst
+
+
+def check_video(control, surface_id, display, work, andris_log, watch):
+    """An H.264 stream of the video, its end, and the lossless repair of its area."""
+    video = Video(display, work, 'video', watch)
+    try:
+        start = time.monotonic()
+        decoding = poll_stats(control, 'no H.264 stream decoded frames', STREAM_BOUND,
+                              lambda d: h264_decoding(d), watch)
+        stream = h264_decoding(decoding)[0]
+        log(f'video: an H.264 stream ({stream["width"]}x{stream["height"]}) was decoding frames after '
+            f'{time.monotonic() - start:.1f} s')
+        first = stream['frames_decoded_ok']
+        time.sleep(STREAM_SPELL)
+        later = poll_stats(control, 'stats could not be read', 1.0, lambda d: True, watch)
+        if later['streams_created_total'] != 1:
+            raise Failure(f'{later["streams_created_total"]} streams were created for one video; stats: {later}')
+        live = [s for s in later['streams'] if s['stream_id'] == stream['stream_id']]
+        if not live or live[0]['frames_decoded_ok'] <= first:
+            raise Failure(f'the stream stopped decoding frames within {STREAM_SPELL:.0f} s; stats: {later}')
+        log(f'video: one stream created, {live[0]["frames_decoded_ok"]} frames decoded, no decode failures, '
+            f'{later["stream_reports_sent_total"]} stream reports sent')
+
+        rects = stream_rects(andris_log)
+        if len(rects) != 1:
+            raise Failure(f'andris logged {len(rects)} streams starting, not 1: {rects}')
+        if not overlaps(rects[0], video.rect) or overlaps(rects[0], video.text):
+            raise Failure(f'andris streamed {describe_rect(rects[0])}, which does not cover the video at '
+                          f'{describe_rect(video.rect)} alone: the text area is at {describe_rect(video.text)}')
+        log(f'video: andris streamed {describe_rect(rects[0])}, clear of the text area at '
+            f'{describe_rect(video.text)}')
+
+        stopped = time.monotonic()
+        log(f'video: {video.stop(watch)}')
+        destroyed = poll_stats(control, 'the stream was not destroyed', DESTROY_BOUND,
+                               lambda d: d['streams_destroyed_total'] >= 1 and not d['streams'], watch)
+        took = time.monotonic() - stopped
+        log(f'video: the stream was destroyed {took:.2f} s after the video stopped '
+            f'({destroyed["streams_destroyed_total"]} destroyed in all)')
+
+        want = video.last_frame()
+        repaired = time.monotonic()
+        got = b''
+        while True:
+            got = screenshot_rgb(control, surface_id, video.rect)
+            if got == want:
+                break
+            watch.check()
+            if time.monotonic() - repaired >= REPAIR_BOUND:
+                pixels, worst = differing(got, want)
+                raise Failure(f'{REPAIR_BOUND:.0f} s after the stream ended, {pixels} pixels of the video\'s area '
+                              f'still differ from its last frame, by up to {worst} in a channel')
+            time.sleep(POLL / 5)
+        log(f'video: {time.monotonic() - repaired:.2f} s after the destroy, a screenshot of the video\'s area '
+            f'matched its last frame exactly')
+    finally:
+        video.close()
+
+
+# Andris's debug lines for a client's stream report, and a bitrate change.
+REPORT = re.compile(r'a stream report .*\bframes=(\d+) drops=(\d+) last_frame_delay_ms=(-?\d+)')
+CHANGED = re.compile(r"the stream's bitrate changed .*\bfrom_kbps=(\d+) to_kbps=(\d+) reason=(\w+)")
+
+
+def report_summary(andris_log):
+    """What ryll's STREAM_REPORTs said, and what andris's rate control made of them, from andris's log."""
+    reports = [tuple(int(v) for v in REPORT.search(line).groups()) for line in log_lines(andris_log, REPORT.pattern)]
+    changes = [CHANGED.search(line).groups() for line in log_lines(andris_log, CHANGED.pattern)]
+    if not reports:
+        return 'andris logged no stream reports (is andris::server::display at debug?)'
+    delays = sorted(delay for _, _, delay in reports)
+    drops = sum(drop for _, drop, _ in reports)
+    moved = ', '.join(f'{a}->{b} kbit/s ({why})' for a, b, why in changes) or 'none'
+    return (f'{len(reports)} stream reports covering {sum(f for f, _, _ in reports)} frames, {drops} late; '
+            f'last_frame_delay min {delays[0]} ms, median {delays[len(delays) // 2]} ms, max {delays[-1]} ms; '
+            f'bitrate changes: {moved}')
+
+
+def check_no_stream(control, display, work, watch):
+    """With a ryll that has no CODEC_H264, the video never becomes a stream."""
+    video = Video(display, work, 'video-no-h264', watch)
+    try:
+        deadline = time.monotonic() + NO_STREAM_SPELL
+        polls = 0
+        while time.monotonic() < deadline:
+            stats = display_stats(control)
+            polls += 1
+            if stats['streams_created_total'] or stats['streams']:
+                raise Failure(f'a stream was created for a client without CODEC_H264; stats: {stats}')
+            watch.check()
+            time.sleep(POLL)
+        log(f'no-h264: the video played for {NO_STREAM_SPELL:.0f} s, and {polls} polls of stats showed no stream')
+        log(f'no-h264: {video.stop(watch)}')
+    finally:
+        video.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--socket', required=True, help="ryll's control socket")
-    parser.add_argument('--keylog', required=True, help="the keylogger's output file")
+    parser.add_argument('--keylog', help="the keylogger's output file (required unless --no-stream)")
     parser.add_argument('--width', type=int, default=1024)
     parser.add_argument('--height', type=int, default=768)
     parser.add_argument('--display', required=True, help='the X display andris exports, for xclip')
     parser.add_argument('--andris-log', required=True, help="andris's log")
     parser.add_argument('--ryll-log', required=True, help="ryll's log, written with --verbose")
+    parser.add_argument('--work', required=True, help='where the video script writes its log and last frame')
+    parser.add_argument('--no-stream', action='store_true',
+                        help='for a ryll started with --no-h264: check only that the video never streams')
     parser.add_argument('--watch', action='append', default=[], metavar='NAME=PID',
                         help='a process that must stay up; fail at once if it exits (repeatable)')
     args = parser.parse_args()
+    if not args.no_stream and not args.keylog:
+        parser.error('--keylog is required unless --no-stream')
     watch = Watch(args.watch)
 
     keylogger = keylogger_module()
@@ -717,6 +1012,10 @@ def main():
         control = connect(args.socket, deadline, watch)
         surface = wait_surface(control, deadline, args.width, args.height, watch)
         wait_frame(control, surface['surface_id'], colour, watch)
+        if args.no_stream:
+            check_no_stream(control, args.display, args.work, watch)
+            log('PASS')
+            return 0
         events = ['surface_drawn', 'clipboard_changed']
         subscribed = control.call('subscribe', {'events': events})['subscribed']
         if set(events) - set(subscribed):
@@ -726,6 +1025,8 @@ def main():
         check_small_change(control, surface['surface_id'], keylogger, args.height, watch)
         check_clipboard(control, args.display, watch)
         check_resize(control, (args.width, args.height), args.andris_log, args.ryll_log, watch)
+        check_video(control, surface['surface_id'], args.display, args.work, args.andris_log, watch)
+        log(f'stream reports: {report_summary(args.andris_log)}')
     except (Failure, RuntimeError, EOFError, OSError, subprocess.SubprocessError) as e:
         log(f'FAIL: {e}')
         return 1

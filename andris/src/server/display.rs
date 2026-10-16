@@ -834,13 +834,7 @@ impl Display {
         let candidates = self.heat.candidates(now);
         match choose(&candidates, self.streams.live().map(Stream::rect)) {
             Choice::Start(rect) => self.start_stream(rect, now).await,
-            Choice::End => {
-                debug!(
-                    session = self.conn.session().id(),
-                    "a changing area has outgrown the video stream; ending it"
-                );
-                self.end_stream().await
-            }
+            Choice::End => self.end_stream("a changing area has outgrown it").await,
             Choice::Stay => Ok(()),
         }
     }
@@ -855,22 +849,22 @@ impl Display {
         let Some(size) = self.surface else {
             return Ok(());
         };
-        let (create, activate, target) = match self.streams.start(rect, size, now) {
+        let (create, activate, target, rect) = match self.streams.start(rect, size, now) {
             Ok(Some(stream)) => (
                 stream.create()?,
                 stream.activate_report(),
                 stream.target_bps(),
+                stream.rect(),
             ),
             Ok(None) => return Ok(()),
             Err(e) => return self.disable_streams(None, &format!("{e:#}")).await,
         };
-        debug!(
+        // At info, as operators want to see where streams go and how
+        // often, and the end-to-end test checks the rectangle.
+        info!(
             session,
             stream = create.id,
-            width = create.stream_width,
-            height = create.stream_height,
-            x = create.dest.left,
-            y = create.dest.top,
+            %rect,
             target_kbps = target / 1000,
             "starting a video stream"
         );
@@ -1054,28 +1048,25 @@ impl Display {
         if !quiet {
             return Ok(());
         }
-        debug!(
-            session = self.conn.session().id(),
-            "the video stream has been still; ending it"
-        );
-        self.end_stream().await
+        self.end_stream("it has been still").await
     }
 
-    /// End the live stream, if there is one.
-    async fn end_stream(&mut self) -> Result<()> {
+    /// End the live stream, if there is one, because of `why`.
+    async fn end_stream(&mut self, why: &str) -> Result<()> {
         match self.streams.end() {
-            Some(stream) => self.destroy_stream(stream).await,
+            Some(stream) => self.destroy_stream(stream, why).await,
             None => Ok(()),
         }
     }
 
-    /// Tell the client `stream` has ended. Its tiles fall due at once, so
-    /// the next refresh sends them losslessly, and their heat is
-    /// forgotten.
-    async fn destroy_stream(&mut self, stream: Stream) -> Result<()> {
-        debug!(
+    /// Tell the client `stream` has ended, because of `why`. Its tiles
+    /// fall due at once, so the next refresh sends them losslessly, and
+    /// their heat is forgotten.
+    async fn destroy_stream(&mut self, stream: Stream, why: &str) -> Result<()> {
+        info!(
             session = self.conn.session().id(),
             stream = stream.id(),
+            why,
             "ending a video stream"
         );
         self.conn.session().counters().stream_destroyed();
@@ -1101,7 +1092,7 @@ impl Display {
             );
         }
         match stream {
-            Some(stream) => self.destroy_stream(stream).await,
+            Some(stream) => self.destroy_stream(stream, why).await,
             None => Ok(()),
         }
     }

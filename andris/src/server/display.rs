@@ -108,8 +108,9 @@ use tracing::{debug, info, warn};
 use super::channel::{ACK_WINDOW, ChannelConn, ChannelContext, ClientCaps};
 use super::opcodes::DisplayOpcode;
 use super::updates::{
-    Choice, Draw, EncodeOptions, HeatMap, JpegQuality, LossyTiles, ReportVerdict, STREAM_QUIET,
-    SURFACE_ID, Stream, StreamCaps, Streams, Update, UpdateEncoder, choose,
+    Choice, Draw, EncodeOptions, Encoded, HeatMap, JpegQuality, LossyTiles, RateChange, RateEvent,
+    ReportVerdict, STREAM_QUIET, SURFACE_ID, Stream, StreamCaps, Streams, Update, UpdateEncoder,
+    choose,
 };
 use crate::config::DEFAULT_FRAME_INTERVAL_MS;
 use crate::platform::{self, Capture, DamageSubscription, Rectangle, Region, Size, TILE};
@@ -229,8 +230,9 @@ pub async fn run(ctx: ChannelContext, mut conn: ChannelConn<DisplayOpcode>) -> R
         let cap_open = now >= display.next_frame;
         let room = display.conn.may_send();
         if display.damage_pending && cap_open && room {
-            // Boxed, because a frame's future is the largest the loop
-            // awaits, and a debug build keeps copies of it on the stack.
+            // Boxed, as are a message's handling and a server drop,
+            // because they are the largest futures the loop awaits, and a
+            // debug build keeps copies of each on the stack.
             Box::pin(display.frame()).await?;
             continue;
         }
@@ -240,7 +242,7 @@ pub async fn run(ctx: ChannelContext, mut conn: ChannelConn<DisplayOpcode>) -> R
         let stream_blocked =
             display.damage_pending && cap_open && !room && display.stream_frame_due();
         if stream_blocked && now >= display.next_drop {
-            display.server_drop(now);
+            Box::pin(display.server_drop(now)).await?;
         }
         // A refresh is a frame too, but pending damage goes first.
         let refresh_at = display.lossy.next_due();
@@ -266,7 +268,7 @@ pub async fn run(ctx: ChannelContext, mut conn: ChannelConn<DisplayOpcode>) -> R
         // round; and an interval's tick() is cancel-safe.
         tokio::select! {
             incoming = next_incoming(&mut display.conn, await_room) => match incoming? {
-                Incoming::Message(message) => display.handle(&message).await?,
+                Incoming::Message(message) => Box::pin(display.handle(&message)).await?,
                 Incoming::Closed => return Ok(()),
                 Incoming::Room => {}
             },
@@ -464,8 +466,14 @@ impl Display {
             last_frame_delay_ms = report.last_frame_delay,
             "a stream report"
         );
+        let event = RateEvent::from(&report);
         match self.streams.report(report) {
-            ReportVerdict::Recorded => {}
+            ReportVerdict::Recorded => {
+                if let Some(stream) = self.streams.live_mut() {
+                    let changed = stream.rate_event(event, Instant::now());
+                    self.rate_changed(changed).await?;
+                }
+            }
             ReportVerdict::CannotDecode => {
                 let live = self.streams.end();
                 self.disable_streams(live, "the client cannot decode it")
@@ -646,6 +654,9 @@ impl Display {
             );
             // Streams are drawn on the surface, so they end first. A
             // client never sent a stream is told nothing of them.
+            if self.streams.live().is_some() {
+                self.conn.session().counters().stream_destroyed();
+            }
             if self.streams.end_all() {
                 self.send(DisplayOpcode::StreamDestroyAll, &[]).await?;
             }
@@ -844,8 +855,12 @@ impl Display {
         let Some(size) = self.surface else {
             return Ok(());
         };
-        let (create, activate) = match self.streams.start(rect, size, now) {
-            Ok(Some(stream)) => (stream.create()?, stream.activate_report()),
+        let (create, activate, target) = match self.streams.start(rect, size, now) {
+            Ok(Some(stream)) => (
+                stream.create()?,
+                stream.activate_report(),
+                stream.target_bps(),
+            ),
             Ok(None) => return Ok(()),
             Err(e) => return self.disable_streams(None, &format!("{e:#}")).await,
         };
@@ -856,8 +871,10 @@ impl Display {
             height = create.stream_height,
             x = create.dest.left,
             y = create.dest.top,
+            target_kbps = target / 1000,
             "starting a video stream"
         );
+        self.conn.session().counters().stream_created(target);
         self.send_msg(DisplayOpcode::StreamCreate, &create).await?;
         if let Some(activate) = activate {
             self.send_msg(DisplayOpcode::StreamActivateReport, &activate)
@@ -876,11 +893,39 @@ impl Display {
     /// Count a server drop against the live stream: a frame of it was due
     /// at `now` while the ack window was full. The next is counted a frame
     /// interval later at the soonest.
-    fn server_drop(&mut self, now: Instant) {
-        if let Some(stream) = self.streams.live_mut() {
-            stream.server_drop();
-        }
+    async fn server_drop(&mut self, now: Instant) -> Result<()> {
         self.next_drop = now + self.ctx.display.frame_interval;
+        let Some(stream) = self.streams.live_mut() else {
+            return Ok(());
+        };
+        self.conn.session().counters().stream_server_drop();
+        let changed = stream.server_drop(now);
+        self.rate_changed(changed).await
+    }
+
+    /// Log a change of the live stream's bitrate, and record it in the
+    /// metrics; or, if the encoder refused it, end the stream and turn
+    /// streams off.
+    async fn rate_changed(&mut self, changed: Result<Option<RateChange>>) -> Result<()> {
+        match changed {
+            Ok(None) => Ok(()),
+            Ok(Some(change)) => {
+                debug!(
+                    session = self.conn.session().id(),
+                    stream = ?self.streams.live().map(Stream::id),
+                    from_kbps = change.from / 1000,
+                    to_kbps = change.to / 1000,
+                    reason = ?change.reason,
+                    "the stream's bitrate changed"
+                );
+                self.conn.session().counters().stream_target(change.to);
+                Ok(())
+            }
+            Err(e) => {
+                let live = self.streams.end();
+                self.disable_streams(live, &format!("{e:#}")).await
+            }
+        }
     }
 
     /// Capture the live stream's rectangle, bring the shadow up to date
@@ -932,7 +977,7 @@ impl Display {
         let (encoder, mut stream, result) = tokio::task::spawn_blocking(move || {
             let result = encoder.absorb(&capture).map(|changed| {
                 let frame = (!changed.is_empty()).then(|| match capture.patches() {
-                    [patch] => stream.encode(patch.pixels()),
+                    [patch] => stream.encode(patch.pixels(), now),
                     patches => Err(anyhow::anyhow!(
                         "a capture of the stream's {rect} came back in {} patches",
                         patches.len()
@@ -956,17 +1001,31 @@ impl Display {
             self.streams.put_back(stream);
             return Ok(None);
         };
-        self.conn
-            .session()
-            .counters()
-            .encode_done(started.elapsed());
+        let counters = self.conn.session().counters();
+        counters.stream_encode_done(started.elapsed());
         let held = now + STREAM_QUIET + self.ctx.display.lossless_delay;
         self.lossy.mark(&stream.touched(size), held);
         stream.changed(now);
-        match frame {
+        if let Ok(Encoded {
+            frame_rate: Some(rate),
+            ..
+        }) = &frame
+        {
+            debug!(
+                session = self.conn.session().id(),
+                stream = stream.id(),
+                frame_rate = rate,
+                "the stream's frame rate changed"
+            );
+        }
+        match frame.map(|encoded| encoded.frame) {
             Ok(Some(frame)) => {
                 let data = stream.data(frame, captured_at);
                 self.streams.put_back(stream);
+                self.conn
+                    .session()
+                    .counters()
+                    .stream_frame_sent(data.data.len() as u64);
                 self.send_msg(DisplayOpcode::StreamData, &data).await?;
             }
             Ok(None) => {
@@ -1019,6 +1078,7 @@ impl Display {
             stream = stream.id(),
             "ending a video stream"
         );
+        self.conn.session().counters().stream_destroyed();
         if let Some(size) = self.surface {
             let touched = stream.touched(size);
             self.lossy.make_due(&touched, Instant::now());

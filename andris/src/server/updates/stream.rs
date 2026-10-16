@@ -49,6 +49,23 @@
 //! covered tile included, is drawn as usual. [`Stream::touched`] holds
 //! every tile it touches, which its frames leave lossy.
 //!
+//! # Its bitrate
+//!
+//! A stream starts at [`target_bitrate_bps`] for its size and the
+//! configured frame rate, which is also the most it may ever aim for.
+//! [`RateControl`] then moves the target on the client's reports and on
+//! andris's own server drops (frames due while the ack window was full):
+//! down quickly when frames arrive late or the window fills, up slowly
+//! while reports stay clean. Each change goes to the encoder at once.
+//!
+//! openh264's bitrate mode budgets each frame as the target divided by
+//! the frame rate it was told, whatever the frames' times, and a stream
+//! sends a frame only when its area changed, often less often than the
+//! configured rate. So the stream also tracks the rate it actually
+//! sends at, and keeps the encoder's near it ([`Stream::pace`]):
+//! otherwise every frame gets too small a share, and the stream falls
+//! far short of its target.
+//!
 //! # Its end
 //!
 //! A stream that has not changed for [`STREAM_QUIET`] ends. Until then,
@@ -59,10 +76,13 @@
 //! it builds, and runs [`Stream::encode`] off the async threads. Which
 //! area streams is the heat map's to find.
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use shakenfist_spice_compression::{Bgrx, H264Config, H264Encoder, H264Frame, even_dimensions};
+use shakenfist_spice_compression::{
+    Bgrx, H264Config, H264Encoder, H264Frame, even_dimensions, target_bitrate_bps,
+};
 use shakenfist_spice_protocol::constants::stream_flags;
 use shakenfist_spice_protocol::messages::{
     Clip, StreamActivateReport, StreamCreate, StreamData, StreamDataHeader, StreamDestroy,
@@ -111,6 +131,194 @@ pub const REPORT_WINDOW: u32 = 5;
 
 /// The longest a client waits between reports, while frames arrive.
 pub const REPORT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// The lowest bitrate rate control goes to, in bits a second. Below
+/// this a desktop-sized stream is too blurred to be worth watching; a
+/// link that cannot carry it is better served by the draws a client
+/// without streams gets.
+pub const MIN_STREAM_BITRATE_BPS: u32 = 256_000;
+
+/// A report whose last frame arrived with less headroom than this before
+/// its time, though in time, cuts the bitrate by a quarter: the pipeline
+/// is close to using up [`STREAM_LATENCY_BUDGET`], and the next slower
+/// frame would be late.
+pub const LOW_HEADROOM: Duration = Duration::from_millis(20);
+
+/// How long reports must stay clean, with no change in between, before
+/// the bitrate rises by [`RAISE_PERCENT`]. Rising slowly and falling
+/// fast keeps a stream from oscillating around what the link carries.
+pub const CLEAN_PERIOD: Duration = Duration::from_secs(2);
+
+/// How much a clean [`CLEAN_PERIOD`] raises the bitrate, in percent.
+pub const RAISE_PERCENT: u32 = 10;
+
+/// Two server drops this close together cut the bitrate by a quarter:
+/// the client is acknowledging more slowly than the stream sends, even
+/// if its reports have not said so yet. One alone may be a hiccup.
+pub const SERVER_DROP_WINDOW: Duration = Duration::from_secs(1);
+
+/// How far back [`Stream::pace`] counts frames to measure the rate a
+/// stream sends at.
+pub const FRAME_RATE_WINDOW: Duration = Duration::from_secs(1);
+
+/// How far, in percent, the measured frame rate must move from the
+/// encoder's before the encoder is told: a stream's rate wobbles from
+/// one second to the next, and each change shifts every frame's budget.
+pub const FRAME_RATE_HYSTERESIS_PERCENT: f32 = 20.0;
+
+/// What may move a stream's bitrate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateEvent {
+    /// A client's `STREAM_REPORT` for the stream: how many frames it
+    /// covers, how many of them were late, and the last one's headroom,
+    /// in milliseconds before its time (negative if it was late).
+    Report {
+        frames: u32,
+        drops: u32,
+        last_frame_delay_ms: i32,
+    },
+    /// A frame was due while the client's ack window was full.
+    ServerDrop,
+}
+
+impl From<&StreamReport> for RateEvent {
+    fn from(report: &StreamReport) -> Self {
+        Self::Report {
+            frames: report.num_frames,
+            drops: report.num_drops,
+            last_frame_delay_ms: report.last_frame_delay,
+        }
+    }
+}
+
+/// Why a stream's bitrate moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateReason {
+    /// A report counted late frames, or a late last frame: halved.
+    Late,
+    /// A report's last frame had under [`LOW_HEADROOM`] to spare: cut by
+    /// a quarter.
+    LowHeadroom,
+    /// Two server drops within [`SERVER_DROP_WINDOW`]: cut by a quarter.
+    ServerDrops,
+    /// Reports stayed clean for [`CLEAN_PERIOD`]: raised by
+    /// [`RAISE_PERCENT`].
+    Clean,
+}
+
+/// A change of a stream's bitrate, in bits a second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateChange {
+    pub from: u32,
+    pub to: u32,
+    pub reason: RateReason,
+}
+
+/// A stream's target bitrate, and what deciding the next change needs to
+/// remember. It knows nothing of the encoder: [`RateControl::adjust`]
+/// says what the target becomes, and the stream applies it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateControl {
+    target: u32,
+    cap: u32,
+    /// When the current run of clean reports began, if one has, since
+    /// the last change.
+    clean_since: Option<Instant>,
+    /// A server drop not yet followed by another within
+    /// [`SERVER_DROP_WINDOW`].
+    last_server_drop: Option<Instant>,
+}
+
+impl RateControl {
+    /// Aim for `cap`, the most the stream may ever aim for, at first.
+    pub fn new(cap: u32) -> Self {
+        Self {
+            target: cap,
+            cap,
+            clean_since: None,
+            last_server_drop: None,
+        }
+    }
+
+    /// The bitrate aimed for, in bits a second.
+    pub fn target(&self) -> u32 {
+        self.target
+    }
+
+    /// The most the stream may aim for, in bits a second.
+    pub fn cap(&self) -> u32 {
+        self.cap
+    }
+
+    /// Account for `event` at `now`, and return the change it makes to
+    /// the target, if any:
+    ///
+    /// - a report with late frames, or a late last frame, halves it;
+    /// - a report whose last frame had under [`LOW_HEADROOM`] to spare
+    ///   cuts it by a quarter;
+    /// - a clean report that ends [`CLEAN_PERIOD`] of clean reports, with
+    ///   no change since they began, raises it by [`RAISE_PERCENT`];
+    /// - a server drop within [`SERVER_DROP_WINDOW`] of the one before
+    ///   cuts it by a quarter.
+    ///
+    /// It never goes below [`MIN_STREAM_BITRATE_BPS`], nor above the cap.
+    /// Any cut, or any server drop, starts the clean run again. A report
+    /// of no frames says nothing, and changes nothing.
+    pub fn adjust(&mut self, event: RateEvent, now: Instant) -> Option<RateChange> {
+        let (target, reason) = match event {
+            RateEvent::Report { frames: 0, .. } => return None,
+            RateEvent::Report {
+                drops,
+                last_frame_delay_ms,
+                ..
+            } if drops > 0 || last_frame_delay_ms < 0 => (self.target / 2, RateReason::Late),
+            RateEvent::Report {
+                last_frame_delay_ms,
+                ..
+            } if i64::from(last_frame_delay_ms) < LOW_HEADROOM.as_millis() as i64 => {
+                (quarter_off(self.target), RateReason::LowHeadroom)
+            }
+            RateEvent::Report { .. } => {
+                let since = *self.clean_since.get_or_insert(now);
+                if now.saturating_duration_since(since) < CLEAN_PERIOD {
+                    return None;
+                }
+                let raised = u64::from(self.target) * u64::from(100 + RAISE_PERCENT) / 100;
+                (u32::try_from(raised).unwrap_or(u32::MAX), RateReason::Clean)
+            }
+            RateEvent::ServerDrop => {
+                self.clean_since = None;
+                match self.last_server_drop.take() {
+                    Some(last) if now.saturating_duration_since(last) <= SERVER_DROP_WINDOW => {
+                        (quarter_off(self.target), RateReason::ServerDrops)
+                    }
+                    _ => {
+                        self.last_server_drop = Some(now);
+                        return None;
+                    }
+                }
+            }
+        };
+        // A raise starts the next clean run now; a cut ends the run.
+        self.clean_since = (reason == RateReason::Clean).then_some(now);
+        let target = target.clamp(MIN_STREAM_BITRATE_BPS.min(self.cap), self.cap);
+        if target == self.target {
+            return None;
+        }
+        let change = RateChange {
+            from: self.target,
+            to: target,
+            reason,
+        };
+        self.target = target;
+        Some(change)
+    }
+}
+
+/// Three quarters of `bps`.
+fn quarter_off(bps: u32) -> u32 {
+    (u64::from(bps) * 3 / 4) as u32
+}
 
 /// The multimedia time of a frame captured `captured_at` into the
 /// session: the milliseconds since the session began, as `MAIN_INIT`
@@ -231,7 +439,7 @@ impl Streams {
             return Ok(None);
         }
         let config = H264Config::new(width, height, self.frame_rate);
-        let target_bps = config.bitrate_bps;
+        let cap = target_bitrate_bps(width, height, self.frame_rate);
         let encoder = H264Encoder::new(config)
             .with_context(|| format!("creating an H.264 encoder for {rect}"))?;
         let id = self.next_id;
@@ -241,7 +449,10 @@ impl Streams {
             id,
             rect,
             encoder: Box::new(encoder),
-            target_bps,
+            rate: RateControl::new(cap),
+            max_frame_rate: self.frame_rate as f32,
+            started: now,
+            frame_times: VecDeque::new(),
             unique_id: self.caps.reports.then(rand::random),
             last_report: None,
             last_change: now,
@@ -300,6 +511,15 @@ impl Streams {
     }
 }
 
+/// What [`Stream::encode`] produced.
+#[derive(Debug)]
+pub struct Encoded {
+    /// The frame, or `None` if the encoder skipped it.
+    pub frame: Option<H264Frame>,
+    /// The encoder's new frame rate, if [`Stream::pace`] changed it.
+    pub frame_rate: Option<f32>,
+}
+
 /// One live stream: its id, its rectangle on the primary surface, its
 /// encoder, and what its client last reported.
 pub struct Stream {
@@ -310,9 +530,14 @@ pub struct Stream {
     /// out of the display channel's futures, whose every copy a debug
     /// build keeps on the stack.
     encoder: Box<H264Encoder>,
-    /// The bitrate the stream aims for, in bits a second. It starts at
-    /// the encoder's own.
-    target_bps: u32,
+    /// The bitrate it aims for.
+    rate: RateControl,
+    /// The frame rate the encoder was built for: the most
+    /// [`Stream::pace`] tells it.
+    max_frame_rate: f32,
+    started: Instant,
+    /// When each frame within [`FRAME_RATE_WINDOW`] was encoded.
+    frame_times: VecDeque<Instant>,
     /// The `unique_id` its reports carry, if they were asked for.
     unique_id: Option<u32>,
     last_report: Option<StreamReport>,
@@ -329,7 +554,8 @@ impl std::fmt::Debug for Stream {
         f.debug_struct("Stream")
             .field("id", &self.id)
             .field("rect", &self.rect)
-            .field("target_bps", &self.target_bps)
+            .field("rate", &self.rate)
+            .field("frame_rate", &self.encoder.frame_rate())
             .field("unique_id", &self.unique_id)
             .field("last_report", &self.last_report)
             .field("last_change", &self.last_change)
@@ -350,7 +576,59 @@ impl Stream {
 
     /// The bitrate the stream aims for, in bits a second.
     pub fn target_bps(&self) -> u32 {
-        self.target_bps
+        self.rate.target()
+    }
+
+    /// The most the stream may aim for, in bits a second.
+    pub fn cap_bps(&self) -> u32 {
+        self.rate.cap()
+    }
+
+    /// The frame rate the encoder budgets each frame by.
+    pub fn frame_rate(&self) -> f32 {
+        self.encoder.frame_rate()
+    }
+
+    /// Account for `event` at `now` with [`RateControl::adjust`], and
+    /// tell the encoder of any change, which is returned.
+    pub fn rate_event(&mut self, event: RateEvent, now: Instant) -> Result<Option<RateChange>> {
+        let change = self.rate.adjust(event, now);
+        if let Some(change) = change {
+            self.encoder
+                .set_bitrate(change.to)
+                .context("changing the stream's bitrate")?;
+        }
+        Ok(change)
+    }
+
+    /// Record that a frame is about to be encoded at `now`, and keep the
+    /// encoder's frame rate near the rate frames have come at over the
+    /// last [`FRAME_RATE_WINDOW`]. The rate is measured once the stream is
+    /// that old, kept between 1 and the configured rate, and passed on
+    /// only when it has moved more than [`FRAME_RATE_HYSTERESIS_PERCENT`]
+    /// from the encoder's. Returns the new rate when it changes.
+    pub fn pace(&mut self, now: Instant) -> Result<Option<f32>> {
+        while self
+            .frame_times
+            .front()
+            .is_some_and(|&at| now.saturating_duration_since(at) >= FRAME_RATE_WINDOW)
+        {
+            self.frame_times.pop_front();
+        }
+        self.frame_times.push_back(now);
+        if now.saturating_duration_since(self.started) < FRAME_RATE_WINDOW {
+            return Ok(None);
+        }
+        let measured = (self.frame_times.len() as f32 / FRAME_RATE_WINDOW.as_secs_f32())
+            .clamp(1.0, self.max_frame_rate.max(1.0));
+        let current = self.encoder.frame_rate();
+        if (measured - current).abs() * 100.0 <= current * FRAME_RATE_HYSTERESIS_PERCENT {
+            return Ok(None);
+        }
+        self.encoder
+            .set_frame_rate(measured)
+            .context("changing the stream's frame rate")?;
+        Ok(Some(measured))
     }
 
     /// The `unique_id` its reports carry, if they were asked for.
@@ -393,10 +671,15 @@ impl Stream {
         self.last_change + STREAM_QUIET
     }
 
-    /// Count a frame that was due while the client's ack window was
-    /// full, and so was never captured.
-    pub fn server_drop(&mut self) {
+    /// Count a frame that was due at `now` while the client's ack window
+    /// was full, and so was never captured, and account for it with
+    /// [`Stream::rate_event`]. Damage was pending on the stream, so it
+    /// counts as a change too: a stream the client cannot keep up with
+    /// is not a still one.
+    pub fn server_drop(&mut self, now: Instant) -> Result<Option<RateChange>> {
         self.server_drops = self.server_drops.saturating_add(1);
+        self.last_change = now;
+        self.rate_event(RateEvent::ServerDrop, now)
     }
 
     /// How many frames were due while the client's ack window was full.
@@ -450,12 +733,13 @@ impl Stream {
         StreamDestroy { id: self.id }
     }
 
-    /// Encode `pixels`, a capture of the stream's rectangle. Returns
-    /// `None` when the encoder skipped the frame to hold its bitrate, and
-    /// nothing is to be sent. CPU-bound, so the display channel runs it
-    /// on the blocking pool. Fails unless `pixels` is exactly the
-    /// rectangle's size, or if the encoder fails.
-    pub fn encode(&mut self, pixels: &Frame) -> Result<Option<H264Frame>> {
+    /// Encode `pixels`, a capture of the stream's rectangle, at `now`,
+    /// first keeping the encoder's frame rate near the stream's with
+    /// [`Stream::pace`]. The frame is `None` when the encoder skipped it
+    /// to hold its bitrate, and nothing is to be sent. CPU-bound, so the
+    /// display channel runs it on the blocking pool. Fails unless `pixels`
+    /// is exactly the rectangle's size, or if the encoder fails.
+    pub fn encode(&mut self, pixels: &Frame, now: Instant) -> Result<Encoded> {
         ensure!(
             pixels.size() == self.rect.size(),
             "a {} capture is not the {} stream's size",
@@ -469,7 +753,11 @@ impl Stream {
             pixels.stride(),
         )
         .context("a capture the encoder cannot read")?;
-        self.encoder.encode(&image)
+        let frame_rate = self.pace(now)?;
+        Ok(Encoded {
+            frame: self.encoder.encode(&image)?,
+            frame_rate,
+        })
     }
 }
 
@@ -807,7 +1095,11 @@ mod tests {
         streams.start(rect, SIZE, Instant::now()).unwrap().unwrap();
         let mut stream = streams.take().unwrap();
         let pixels = padded_frame(rect.size(), 0x40);
-        let frame = stream.encode(&pixels).unwrap().expect("the first frame");
+        let frame = stream
+            .encode(&pixels, Instant::now())
+            .unwrap()
+            .frame
+            .expect("the first frame");
         assert!(frame.keyframe);
 
         let mut decoder = shakenfist_spice_compression::for_stream(
@@ -830,13 +1122,16 @@ mod tests {
             .unwrap();
         let mut stream = streams.take().unwrap();
         let err = stream
-            .encode(&padded_frame(
-                Size {
-                    width: 66,
-                    height: 64,
-                },
-                0,
-            ))
+            .encode(
+                &padded_frame(
+                    Size {
+                        width: 66,
+                        height: 64,
+                    },
+                    0,
+                ),
+                Instant::now(),
+            )
             .unwrap_err();
         assert!(err.to_string().contains("is not the"), "{err}");
     }
@@ -887,10 +1182,13 @@ mod tests {
         stream.changed(later);
         assert_eq!(stream.quiet_at(), later + STREAM_QUIET);
 
+        // A server drop counts as a change.
         assert_eq!(stream.server_drops(), 0);
-        stream.server_drop();
-        stream.server_drop();
+        let drop = later + Duration::from_millis(100);
+        stream.server_drop(drop).unwrap();
+        stream.server_drop(drop).unwrap();
         assert_eq!(stream.server_drops(), 2);
+        assert_eq!(stream.quiet_at(), drop + STREAM_QUIET);
     }
 
     #[test]
@@ -905,5 +1203,253 @@ mod tests {
         streams.disable();
         assert!(!streams.enabled());
         assert!(!self::streams(StreamCaps::default()).enabled());
+    }
+
+    /// A cap above the floor, and well clear of it.
+    const CAP: u32 = 4_000_000;
+
+    fn rated(frames: u32, drops: u32, last_frame_delay_ms: i32) -> RateEvent {
+        RateEvent::Report {
+            frames,
+            drops,
+            last_frame_delay_ms,
+        }
+    }
+
+    /// A report of five frames, none late, with plenty of headroom.
+    fn clean() -> RateEvent {
+        rated(5, 0, 60)
+    }
+
+    fn change(from: u32, to: u32, reason: RateReason) -> Option<RateChange> {
+        Some(RateChange { from, to, reason })
+    }
+
+    #[test]
+    fn a_stream_starts_at_and_is_capped_by_the_default_bitrate() {
+        let mut streams = streams(BOTH);
+        let rect = Rectangle::new(0, 0, 1920, 1080);
+        let size = Size {
+            width: 1920,
+            height: 1080,
+        };
+        let stream = streams.start(rect, size, Instant::now()).unwrap().unwrap();
+        let expected = target_bitrate_bps(1920, 1080, 30);
+        assert_eq!(expected, 6_220_800);
+        assert_eq!(
+            (stream.target_bps(), stream.cap_bps()),
+            (expected, expected)
+        );
+        assert_eq!(stream.encoder.bitrate_bps(), expected);
+        assert_eq!(stream.frame_rate(), 30.0);
+    }
+
+    #[test]
+    fn late_frames_halve_the_bitrate_down_to_the_floor() {
+        let now = Instant::now();
+        let mut rate = RateControl::new(CAP);
+        assert_eq!(rate.target(), CAP);
+        assert_eq!(
+            rate.adjust(rated(5, 1, 30), now),
+            change(CAP, CAP / 2, RateReason::Late)
+        );
+        // A late last frame alone does it too.
+        assert_eq!(
+            rate.adjust(rated(5, 0, -5), now),
+            change(CAP / 2, CAP / 4, RateReason::Late)
+        );
+        // 500 kbit/s, then 250, which the floor holds at 256.
+        rate.adjust(rated(5, 5, -100), now);
+        assert_eq!(rate.target(), 500_000);
+        assert_eq!(
+            rate.adjust(rated(5, 5, -100), now),
+            change(500_000, MIN_STREAM_BITRATE_BPS, RateReason::Late)
+        );
+        assert_eq!(rate.adjust(rated(5, 5, -100), now), None);
+        assert_eq!(rate.target(), MIN_STREAM_BITRATE_BPS);
+    }
+
+    #[test]
+    fn little_headroom_cuts_the_bitrate_by_a_quarter() {
+        let now = Instant::now();
+        let mut rate = RateControl::new(CAP);
+        assert_eq!(
+            rate.adjust(rated(5, 0, 19), now),
+            change(CAP, CAP * 3 / 4, RateReason::LowHeadroom)
+        );
+        // Exactly the threshold is enough headroom.
+        assert_eq!(rate.adjust(rated(5, 0, 20), now), None);
+        // And the floor holds here too.
+        for _ in 0..20 {
+            rate.adjust(rated(5, 0, 0), now);
+        }
+        assert_eq!(rate.target(), MIN_STREAM_BITRATE_BPS);
+    }
+
+    #[test]
+    fn two_seconds_of_clean_reports_raise_it_a_tenth_up_to_the_cap() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut rate = RateControl::new(CAP);
+        // At the cap, clean reports change nothing.
+        for ms in (0..5000).step_by(250) {
+            assert_eq!(rate.adjust(clean(), at(ms)), None);
+        }
+
+        rate.adjust(rated(5, 1, 30), at(5000));
+        assert_eq!(rate.target(), 2_000_000);
+        // The run starts with the first clean report, and needs 2 s.
+        assert_eq!(rate.adjust(clean(), at(5100)), None);
+        assert_eq!(rate.adjust(clean(), at(7099)), None);
+        assert_eq!(
+            rate.adjust(clean(), at(7100)),
+            change(2_000_000, 2_200_000, RateReason::Clean)
+        );
+        // The next raise needs 2 s more.
+        assert_eq!(rate.adjust(clean(), at(8000)), None);
+        assert_eq!(rate.adjust(clean(), at(9099)), None);
+        assert_eq!(
+            rate.adjust(clean(), at(9100)),
+            change(2_200_000, 2_420_000, RateReason::Clean)
+        );
+        // Up to the cap, and no further.
+        let mut ms = 9100;
+        while rate.target() < CAP {
+            ms += 2000;
+            rate.adjust(clean(), at(ms));
+        }
+        assert_eq!(rate.target(), CAP);
+        assert_eq!(rate.adjust(clean(), at(ms + 2000)), None);
+        assert_eq!(rate.target(), CAP);
+    }
+
+    #[test]
+    fn a_cut_or_a_server_drop_starts_the_clean_run_again() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut rate = RateControl::new(CAP);
+        rate.adjust(rated(5, 1, 30), at(0));
+        rate.adjust(clean(), at(100));
+        rate.adjust(rated(5, 0, 10), at(1000));
+        assert_eq!(rate.target(), 1_500_000);
+        // The run began again at 1.1 s, not at 0.1 s.
+        assert_eq!(rate.adjust(clean(), at(1100)), None);
+        assert_eq!(rate.adjust(clean(), at(2500)), None);
+        rate.adjust(RateEvent::ServerDrop, at(2600));
+        assert_eq!(rate.adjust(clean(), at(3200)), None);
+        assert_eq!(rate.adjust(clean(), at(5199)), None);
+        assert_eq!(
+            rate.adjust(clean(), at(5200)),
+            change(1_500_000, 1_650_000, RateReason::Clean)
+        );
+    }
+
+    #[test]
+    fn two_server_drops_within_a_second_cut_it_by_a_quarter() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut rate = RateControl::new(CAP);
+        // One alone does nothing, nor does one a second and a half later.
+        assert_eq!(rate.adjust(RateEvent::ServerDrop, at(0)), None);
+        assert_eq!(rate.adjust(RateEvent::ServerDrop, at(1500)), None);
+        // Its pair, within the second, does.
+        assert_eq!(
+            rate.adjust(RateEvent::ServerDrop, at(2400)),
+            change(CAP, CAP * 3 / 4, RateReason::ServerDrops)
+        );
+        // A pair is used up: the next drop starts another.
+        assert_eq!(rate.adjust(RateEvent::ServerDrop, at(2410)), None);
+        assert_eq!(
+            rate.adjust(RateEvent::ServerDrop, at(2420)),
+            change(CAP * 3 / 4, CAP * 9 / 16, RateReason::ServerDrops)
+        );
+        for ms in 0..100 {
+            rate.adjust(RateEvent::ServerDrop, at(3000 + ms));
+        }
+        assert_eq!(rate.target(), MIN_STREAM_BITRATE_BPS);
+    }
+
+    #[test]
+    fn a_report_of_no_frames_changes_nothing() {
+        let now = Instant::now();
+        let mut rate = RateControl::new(CAP);
+        assert_eq!(rate.adjust(rated(0, 0, -50), now), None);
+        assert_eq!(rate.adjust(rated(0, 3, 0), now), None);
+        assert_eq!(rate.target(), CAP);
+    }
+
+    #[test]
+    fn a_change_reaches_the_encoder() {
+        let now = Instant::now();
+        let mut streams = streams(BOTH);
+        streams
+            .start(Rectangle::new(0, 0, 64, 64), SIZE, now)
+            .unwrap()
+            .unwrap();
+        let mut stream = streams.take().unwrap();
+        let cap = stream.cap_bps();
+        let report = StreamReport {
+            num_drops: 2,
+            ..report(0, 0)
+        };
+        assert_eq!(
+            stream.rate_event(RateEvent::from(&report), now).unwrap(),
+            change(cap, cap / 2, RateReason::Late)
+        );
+        assert_eq!(stream.target_bps(), cap / 2);
+        assert_eq!(stream.encoder.bitrate_bps(), cap / 2);
+    }
+
+    #[test]
+    fn the_encoder_frame_rate_follows_the_rate_frames_come_at() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut streams = streams(BOTH);
+        streams
+            .start(Rectangle::new(0, 0, 64, 64), SIZE, start)
+            .unwrap()
+            .unwrap();
+        let mut stream = streams.take().unwrap();
+        assert_eq!(stream.frame_rate(), 30.0);
+
+        // Ten frames a second: nothing changes until the stream is a
+        // second old, then the encoder is told.
+        let mut changes = Vec::new();
+        for ms in (0..1500).step_by(100) {
+            if let Some(rate) = stream.pace(at(ms)).unwrap() {
+                changes.push((ms, rate));
+            }
+        }
+        assert_eq!(changes, vec![(1000, 10.0)]);
+        assert_eq!(stream.frame_rate(), 10.0);
+        assert_eq!(stream.encoder.frame_rate(), 10.0);
+
+        // Eleven a second is within the hysteresis.
+        for ms in (1500..3000).step_by(91) {
+            assert_eq!(stream.pace(at(ms)).unwrap(), None);
+        }
+        assert_eq!(stream.frame_rate(), 10.0);
+
+        // Twenty a second is not.
+        let mut last = None;
+        for ms in (3000..4500).step_by(50) {
+            last = stream.pace(at(ms)).unwrap().or(last);
+        }
+        assert_eq!(last, Some(20.0));
+
+        // One frame in a second is held at one a second.
+        assert_eq!(stream.pace(at(10_000)).unwrap(), Some(1.0));
+
+        // Faster than configured is held at the configured rate.
+        let mut streams = self::streams(BOTH);
+        streams
+            .start(Rectangle::new(0, 0, 64, 64), SIZE, start)
+            .unwrap()
+            .unwrap();
+        let mut stream = streams.take().unwrap();
+        for ms in (0..1500).step_by(10) {
+            assert_eq!(stream.pace(at(ms)).unwrap(), None);
+        }
+        assert_eq!(stream.frame_rate(), 30.0);
     }
 }

@@ -25,10 +25,12 @@ use andris::platform::synthetic::{SQUARE_SIZE, SQUARE_TOP};
 use andris::platform::{DisplayGeometry, Frame, Rectangle, Region, Size};
 use andris::server::display::{CAPTURE_RETRY, DisplayOptions, MAX_CAPTURE_FAILURES};
 use andris::server::updates::{
-    JpegQuality, MAX_RECTS_PER_FRAME, STREAM_LATENCY_BUDGET, STREAM_QUIET,
+    CLEAN_PERIOD, JpegQuality, MAX_RECTS_PER_FRAME, MIN_STREAM_BITRATE_BPS, STREAM_LATENCY_BUDGET,
+    STREAM_QUIET,
 };
 use shakenfist_spice_compression::{
     JpegDecoder, JpegDecoderRsDecoder, VideoDecoder, decompress_spice_lz4, for_stream,
+    target_bitrate_bps,
 };
 use shakenfist_spice_protocol::constants::{
     bitmap_flags, bitmap_fmt, clip_type, image_compression, ropd, stream_flags, surface_fmt,
@@ -1077,7 +1079,9 @@ async fn a_photograph_arrives_as_jpeg_and_then_exactly() {
 
 /// Report damage that changes nothing on `area` every quarter of
 /// [`LOSSLESS`] for `spell`, asserting that nothing arrives meanwhile.
-/// Returns when the damage stopped.
+/// Returns when the last damage was reported: the server cannot have
+/// taken it any sooner, so its refresh is due no sooner than
+/// [`LOSSLESS`] after this, however late the test's own timers fire.
 async fn damage_quietly(
     server: &TestServer,
     client: &mut TestClient,
@@ -1085,11 +1089,13 @@ async fn damage_quietly(
     spell: Duration,
 ) -> Instant {
     let damaging = Instant::now();
+    let mut last = damaging;
     while damaging.elapsed() < spell {
+        last = Instant::now();
         server.platform.report_damage(area).unwrap();
         expect_quiet_for(client, LOSSLESS / 4).await;
     }
-    Instant::now()
+    last
 }
 
 #[tokio::test]
@@ -1104,8 +1110,8 @@ async fn damage_on_a_lossy_area_postpones_its_refresh() {
     expect_photo_refresh(&mut client, &mut screen, &[PHOTO]).await;
     let took = stopped.elapsed();
     assert!(
-        took >= LOSSLESS - LOSSLESS / 4,
-        "the refresh came {took:?} after the damage stopped"
+        took >= LOSSLESS,
+        "the refresh came {took:?} after the last damage"
     );
     screen.assert_shows(&server.platform.desktop().unwrap());
     expect_quiet_for(&mut client, LOSSLESS * 2).await;
@@ -1366,6 +1372,8 @@ struct Viewer {
     draws_while_streaming: Vec<Rect>,
     /// Messages received since `SET_ACK`, for the `ACK`s.
     received: u32,
+    /// Whether to send them.
+    acking: bool,
 }
 
 impl Viewer {
@@ -1395,13 +1403,14 @@ impl Viewer {
             draws: Vec::new(),
             draws_while_streaming: Vec::new(),
             received,
+            acking: true,
         }
     }
 
     /// Acknowledge `message` if it completes a window, and apply it.
     async fn take(&mut self, client: &mut TestClient, message: &ReceivedMessage) {
         self.received += 1;
-        if self.received.is_multiple_of(WINDOW) {
+        if self.acking && self.received.is_multiple_of(WINDOW) {
             client.send(display_client::ACK, &[]).await;
         }
         self.apply(message);
@@ -1968,4 +1977,144 @@ async fn a_resize_ends_every_stream_before_the_surface() {
     let mut viewer = Viewer::resume(screen, viewer.received + 5);
     let (_video, second) = stream_video(&server, &mut client, &mut viewer, VIDEO).await;
     assert_eq!(second.id, first.id + 1);
+}
+
+/// The live stream's target bitrate, as the metrics hold it; 0 for none.
+fn stream_target(server: &TestServer) -> u64 {
+    server.handle.session().unwrap().stats().stream_target_bps
+}
+
+/// The bitrate a stream over [`VIDEO`] starts at, and never exceeds:
+/// ryll's formula at the 50 frames a second of [`INTERVAL`], which the
+/// 1 Mbit/s floor holds up.
+fn video_cap() -> u64 {
+    let cap = target_bitrate_bps(VIDEO.width, VIDEO.height, 50);
+    assert_eq!(cap, 1_000_000);
+    u64::from(cap)
+}
+
+/// A report on stream `id` of five frames with `drops` late, the last
+/// with `last_frame_delay` ms to spare.
+fn report_on(id: u32, unique_id: u32, drops: u32, last_frame_delay: i32) -> StreamReport {
+    StreamReport {
+        stream_id: id,
+        unique_id,
+        start_frame_mm_time: 0,
+        end_frame_mm_time: 100,
+        num_frames: 5,
+        num_drops: drops,
+        last_frame_delay,
+        audio_delay: u32::MAX,
+    }
+}
+
+#[tokio::test]
+async fn reports_of_late_frames_cut_the_target_and_clean_ones_raise_it() {
+    let (server, _main, mut client) = open_wide(capabilities::DEFAULT_DISPLAY).await;
+    let mut viewer = Viewer::start(&server, &mut client).await;
+    let (_video, create) = stream_video(&server, &mut client, &mut viewer, VIDEO).await;
+    let (id, unique_id) = (create.id, viewer.unique_ids[&create.id]);
+    let cap = video_cap();
+    assert_eq!(stream_target(&server), cap);
+
+    // Clean reports at the cap leave it there.
+    let clean = report_on(id, unique_id, 0, 60);
+    for _ in 0..10 {
+        client
+            .send(display_client::STREAM_REPORT, &body(&clean))
+            .await;
+        viewer
+            .read_for(&mut client, Duration::from_millis(250))
+            .await;
+        assert_eq!(stream_target(&server), cap);
+    }
+
+    // Late frames halve it, down to the floor, though the last frame was
+    // in time.
+    let late = report_on(id, unique_id, 2, 30);
+    for expected in [cap / 2, u64::from(MIN_STREAM_BITRATE_BPS)] {
+        client
+            .send(display_client::STREAM_REPORT, &body(&late))
+            .await;
+        viewer
+            .read_until(&mut client, "the target falls", |_| {
+                stream_target(&server) == expected
+            })
+            .await;
+    }
+
+    // Two seconds of clean reports raise it by a tenth, and not before.
+    let floor = u64::from(MIN_STREAM_BITRATE_BPS);
+    let first = Instant::now();
+    let raised = loop {
+        client
+            .send(display_client::STREAM_REPORT, &body(&clean))
+            .await;
+        viewer
+            .read_for(&mut client, Duration::from_millis(100))
+            .await;
+        if stream_target(&server) != floor {
+            break first.elapsed();
+        }
+        assert!(first.elapsed() < Duration::from_secs(4), "it never rose");
+    };
+    assert!(
+        raised >= CLEAN_PERIOD - Duration::from_millis(100),
+        "it rose after {raised:?}"
+    );
+    assert_eq!(stream_target(&server), floor * 11 / 10);
+}
+
+#[tokio::test]
+async fn a_client_that_stops_acknowledging_cuts_the_target() {
+    let (server, _main, mut client) = open_wide(capabilities::DEFAULT_DISPLAY).await;
+    let mut viewer = Viewer::start(&server, &mut client).await;
+    let (_video, _create) = stream_video(&server, &mut client, &mut viewer, VIDEO).await;
+    let cap = video_cap();
+    assert_eq!(stream_target(&server), cap);
+
+    // The ack window fills, and frames due meanwhile are server drops.
+    viewer.acking = false;
+    viewer.read_for(&mut client, Duration::from_secs(1)).await;
+    wait_until("the target falls", || stream_target(&server) < cap).await;
+    let stats = server.handle.session().unwrap().stats();
+    assert!(stats.stream_server_drops >= 2);
+    assert_eq!(stats.streams_destroyed, 0, "the stream ended");
+}
+
+#[tokio::test]
+async fn the_metrics_count_streams_and_carry_the_target() {
+    let (server, _main, mut client) = open_wide(capabilities::DEFAULT_DISPLAY).await;
+    let mut viewer = Viewer::start(&server, &mut client).await;
+    let session = server.handle.session().unwrap();
+    let before = session.stats();
+    let (video, _create) = stream_video(&server, &mut client, &mut viewer, VIDEO).await;
+    viewer
+        .read_for(&mut client, Duration::from_millis(500))
+        .await;
+
+    let during = session.stats().since(&before);
+    assert_eq!((during.streams_created, during.streams_destroyed), (1, 0));
+    assert_eq!(during.stream_frames, viewer.frames as u64);
+    assert!(during.stream_bytes > 0);
+    assert!(during.stream_encode.count >= during.stream_frames);
+    assert_eq!(during.stream_target_bps, video_cap());
+    let line = during.summary(Duration::from_secs(1));
+    assert!(
+        line.contains("streams created=1 destroyed=0, stream frames ")
+            && line.contains("stream target 1000 kbit/s"),
+        "{line}"
+    );
+
+    drop(video);
+    viewer
+        .read_until(&mut client, "the stream ends", |viewer| {
+            !viewer.destroyed.is_empty()
+        })
+        .await;
+    let after = session.stats().since(&before);
+    assert_eq!((after.streams_created, after.streams_destroyed), (1, 1));
+    assert_eq!(after.stream_target_bps, 0);
+    let line = after.summary(Duration::from_secs(1));
+    assert!(line.contains("stream target -"), "{line}");
 }

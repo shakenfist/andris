@@ -83,7 +83,9 @@ pub use heat::{
 pub use lossy::LossyTiles;
 use shadow::Shadow;
 pub use stream::{
-    CODEC_TYPE_H264, REPORT_TIMEOUT, REPORT_WINDOW, ReportVerdict, STREAM_IDS,
+    CLEAN_PERIOD, CODEC_TYPE_H264, Encoded, FRAME_RATE_HYSTERESIS_PERCENT, FRAME_RATE_WINDOW,
+    LOW_HEADROOM, MIN_STREAM_BITRATE_BPS, RAISE_PERCENT, REPORT_TIMEOUT, REPORT_WINDOW, RateChange,
+    RateControl, RateEvent, RateReason, ReportVerdict, SERVER_DROP_WINDOW, STREAM_IDS,
     STREAM_LATENCY_BUDGET, STREAM_QUIET, Stream, StreamCaps, Streams, frames_per_second,
     multi_media_time,
 };

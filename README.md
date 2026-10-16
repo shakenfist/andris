@@ -1,14 +1,29 @@
 # Andris - A Rust SPICE Server for an Existing X11 Desktop
 
-Andris is a SPICE (Simple Protocol for Independent
-Computing Environments) server, written in Rust, that exports an
-X11 desktop which is *already running* -- for example the Xorg
-session behind an xrdp connection -- rather than starting a desktop
-of its own. It is aimed at people who reach a Linux machine's
-desktop remotely and want to do so with a SPICE client, in
-particular [ryll](https://github.com/shakenfist/ryll), optionally
-through the [kerbside](https://github.com/shakenfist/kerbside) SPICE
-proxy.
+Andris is a SPICE (Simple Protocol for Independent Computing
+Environments) server, written in Rust, for a Linux desktop that is
+*already running*. It attaches to an existing X11 display and serves
+it to a SPICE client, in particular
+[ryll](https://github.com/shakenfist/ryll), optionally through the
+[kerbside](https://github.com/shakenfist/kerbside) SPICE proxy. It is
+aimed at people who reach a Linux machine's desktop remotely, above
+all the [session behind
+xrdp](https://github.com/shakenfist/andris/blob/develop/docs/xrdp.md),
+so that RDP and SPICE can show the same desktop at once.
+
+Andris connects to the display as an ordinary X client and never
+starts a desktop of its own. It works with an X server that has a
+32-bit BGRX root window and the XTEST, XFIXES, XKEYBOARD and DAMAGE
+extensions -- Xorg, the xorgxrdp session behind xrdp, or Xvfb, for
+instance -- and [checks for
+them](https://github.com/shakenfist/andris/blob/develop/docs/running.md#exporting-an-x-display)
+before it listens. That sets it apart from its neighbours: Xspice is
+an Xorg driver that starts a new display, and QEMU's SPICE server
+shows a virtual machine's screen. Its closest relative is x11spice.
+
+Andris does not support Wayland. It needs a real X11 desktop: an
+XWayland display holds only the X applications of a Wayland session,
+not the desktop itself.
 
 Andris is a sibling of ryll: it builds on ryll's shared
 `shakenfist-spice-*` protocol and compression crates, and sends only

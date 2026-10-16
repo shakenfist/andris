@@ -22,7 +22,7 @@ use andris::platform::synthetic::{SQUARE_SIZE, SQUARE_TOP};
 use andris::platform::{Frame, Rectangle, Size};
 use andris::server::display::DisplayOptions;
 use andris::server::updates::{
-    CLEAN_PERIOD, MIN_STREAM_BITRATE_BPS, STREAM_LATENCY_BUDGET, STREAM_QUIET,
+    CLEAN_PERIOD, HOT_FRAMES, MIN_STREAM_BITRATE_BPS, STREAM_LATENCY_BUDGET, STREAM_QUIET,
 };
 use shakenfist_spice_compression::{
     JpegDecoderRsDecoder, VideoDecoder, for_stream, target_bitrate_bps,
@@ -139,6 +139,8 @@ struct Viewer {
     /// The box of every draw, and of every draw while a stream lived.
     draws: Vec<Rect>,
     draws_while_streaming: Vec<Rect>,
+    /// How many `MARK`s arrived: frames of draws.
+    marks: usize,
     /// Messages received since `SET_ACK`, for the `ACK`s.
     received: u32,
     /// Whether to send them.
@@ -171,6 +173,7 @@ impl Viewer {
             destroyed_all: 0,
             draws: Vec::new(),
             draws_while_streaming: Vec::new(),
+            marks: 0,
             received,
             acking: true,
         }
@@ -196,7 +199,10 @@ impl Viewer {
                 }
                 self.draws.push(draw.bbox);
             }
-            display_server::MARK => assert!(message.payload().is_empty()),
+            display_server::MARK => {
+                assert!(message.payload().is_empty());
+                self.marks += 1;
+            }
             display_server::STREAM_CREATE => {
                 let create = StreamCreate::decode(message.payload()).unwrap();
                 let (width, height) = (
@@ -296,7 +302,30 @@ impl Viewer {
         }
     }
 
-    /// Apply messages until `done` holds.
+    /// Apply messages until `done` holds or `wait` passes; return whether
+    /// it held. For a condition that may never hold, such as a frame the
+    /// encoder may skip.
+    async fn read_until_within(
+        &mut self,
+        client: &mut TestClient,
+        wait: Duration,
+        done: impl Fn(&Self) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + wait;
+        while !done(self) {
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            match client.recv_within(left).await {
+                Some(message) => self.take(client, &message).await,
+                None => return done(self),
+            }
+        }
+        true
+    }
+
+    /// Apply messages until `done` holds, waiting up to `WAIT`: a loaded
+    /// host makes this slower, never wrong.
     async fn read_until(
         &mut self,
         client: &mut TestClient,
@@ -433,6 +462,17 @@ impl<'a> MakeWriter<'a> for Captured {
     }
 }
 
+/// How many frames of draws a test that expects no stream watches for:
+/// twice the 20 a stream needs to start, so that a stalled host cannot
+/// pass it by sending too little to stream.
+const NO_STREAM_FRAMES: usize = 2 * HOT_FRAMES;
+
+/// How long after a stream ends its area must be exact: the lossless
+/// refresh is due at once, and the next is due a lossless delay (500 ms)
+/// later, so anything under that tells the two apart, with room for a
+/// slow host.
+const REPAIRED_WITHIN: Duration = Duration::from_millis(400);
+
 /// What andris warns once when streams are turned off.
 const STREAMS_OFF: &str = "sending no more video streams on this connection";
 
@@ -462,14 +502,18 @@ async fn a_playing_video_streams_and_its_frames_decode() {
     let budget = STREAM_LATENCY_BUDGET.as_millis() as u32;
     let mut checked = 0;
     for _ in 0..40 {
+        // Anything still on its way belongs to the step before.
+        viewer.read_for(&mut client, QUIET).await;
         let asked = session.elapsed();
         server.platform.animate(VIDEO).unwrap();
         let frames = viewer.frames;
-        viewer
-            .read_for(&mut client, Duration::from_millis(150))
+        let sent = viewer
+            .read_until_within(&mut client, Duration::from_millis(800), |viewer| {
+                viewer.frames > frames
+            })
             .await;
         let arrived = session.elapsed();
-        if viewer.frames == frames {
+        if !sent {
             // The encoder skipped it to hold its bitrate.
             continue;
         }
@@ -506,7 +550,18 @@ async fn draws_flow_beside_a_stream_and_never_inside_it() {
     let _square = Ticker::advance(&server);
     let (_video, create) = stream_video(&server, &mut client, &mut viewer, VIDEO).await;
     assert_eq!(create.dest, wire_rect(VIDEO));
-    viewer.read_for(&mut client, Duration::from_secs(1)).await;
+    let beside = |viewer: &Viewer| {
+        viewer
+            .draws_while_streaming
+            .iter()
+            .filter(|bbox| overlaps(bbox, SQUARE_PATH))
+            .count()
+    };
+    viewer
+        .read_until(&mut client, "ten draws of the square", |viewer| {
+            beside(viewer) >= 10
+        })
+        .await;
 
     let inside: Vec<&Rect> = viewer
         .draws_while_streaming
@@ -514,12 +569,6 @@ async fn draws_flow_beside_a_stream_and_never_inside_it() {
         .filter(|bbox| overlaps(bbox, VIDEO))
         .collect();
     assert!(inside.is_empty(), "draws inside the stream: {inside:?}");
-    let beside = viewer
-        .draws_while_streaming
-        .iter()
-        .filter(|bbox| overlaps(bbox, SQUARE_PATH))
-        .count();
-    assert!(beside >= 10, "only {beside} draws of the square");
     // One stream, of the video, and it lives on.
     assert_eq!(viewer.created.len(), 1);
     assert!(viewer.destroyed.is_empty());
@@ -542,16 +591,17 @@ async fn continuous_lossless_change_never_streams() {
     let (server, _main, mut client) = open_display_on(server, capabilities::DEFAULT_DISPLAY).await;
     let mut viewer = Viewer::start(&server, &mut client).await;
     let square = Ticker::advance(&server);
+    // Watched for twice the frames a stream needs, however long they take.
+    let marks = viewer.marks;
     viewer
-        .read_for(&mut client, Duration::from_millis(1500))
+        .read_until(
+            &mut client,
+            "the square has moved enough to stream",
+            |viewer| viewer.marks >= marks + NO_STREAM_FRAMES || !viewer.created.is_empty(),
+        )
         .await;
     drop(square);
     assert!(viewer.created.is_empty());
-    assert!(
-        viewer.draws.len() >= 30,
-        "only {} draws",
-        viewer.draws.len()
-    );
 }
 
 #[tokio::test]
@@ -575,9 +625,7 @@ async fn a_still_stream_ends_and_its_area_is_repaired_at_once() {
 
     // The lossless refresh follows at once, and the client then shows
     // the desktop exactly.
-    viewer
-        .read_for(&mut client, Duration::from_millis(250))
-        .await;
+    viewer.read_for(&mut client, REPAIRED_WITHIN).await;
     viewer
         .screen
         .assert_shows(&server.platform.desktop().unwrap());
@@ -597,8 +645,11 @@ async fn a_video_that_moves_away_ends_its_stream_and_another_starts() {
     assert_eq!(second.id, first.id + 1);
 }
 
-#[tokio::test]
+/// The first stream ends because the video outgrew it: andris says so,
+/// and it cannot have gone still, since the video plays on over it.
+#[tokio::test(flavor = "current_thread")]
 async fn a_video_that_grows_past_its_stream_restarts_it() {
+    let (logs, _guard) = Captured::start(tracing::Level::INFO);
     let (server, _main, mut client) = open_wide(capabilities::DEFAULT_DISPLAY).await;
     let mut viewer = Viewer::start(&server, &mut client).await;
     let small = Rectangle::new(320, 192, 128, 128);
@@ -607,11 +658,20 @@ async fn a_video_that_grows_past_its_stream_restarts_it() {
     drop(video);
     // Three times the area, around it: it never goes still.
     let large = Rectangle::new(256, 192, 384, 192);
-    let grown = Instant::now();
     let (_video, second) = stream_video(&server, &mut client, &mut viewer, large).await;
-    assert!(grown.elapsed() < STREAM_QUIET + Duration::from_secs(1));
     assert_eq!(viewer.destroyed, vec![first.id]);
     assert_eq!(second.dest, wire_rect(large));
+    let text = logs.text();
+    let ends: Vec<&str> = text
+        .lines()
+        .filter(|line| line.contains("ending a video stream"))
+        .collect();
+    assert_eq!(ends.len(), 1, "{text}");
+    assert!(
+        ends[0].contains("a changing area has outgrown it"),
+        "{}",
+        ends[0]
+    );
 }
 
 #[tokio::test]
@@ -623,16 +683,24 @@ async fn no_stream_starts_without_both_h264_caps() {
         let (server, _main, mut client) = open_wide(caps).await;
         let mut viewer = Viewer::start(&server, &mut client).await;
         let video = Ticker::animate(&server, VIDEO);
-        viewer.read_for(&mut client, Duration::from_secs(1)).await;
+        // The video goes as draws instead: watched for twice the frames a
+        // stream needs, however long they take.
+        let drawn = |viewer: &Viewer| {
+            viewer
+                .draws
+                .iter()
+                .filter(|bbox| overlaps(bbox, VIDEO))
+                .count()
+        };
+        viewer
+            .read_until(
+                &mut client,
+                "the video has played enough to stream",
+                |viewer| drawn(viewer) >= NO_STREAM_FRAMES || !viewer.created.is_empty(),
+            )
+            .await;
         drop(video);
         assert!(viewer.created.is_empty());
-        // The video goes as draws instead.
-        let drawn = viewer
-            .draws
-            .iter()
-            .filter(|bbox| overlaps(bbox, VIDEO))
-            .count();
-        assert!(drawn >= 20, "only {drawn} draws of the video");
     }
 }
 
@@ -714,9 +782,14 @@ async fn a_client_that_cannot_decode_ends_streams_with_one_warning() {
         )
         .await;
     let draws = viewer.draws.len();
-    viewer.read_for(&mut client, Duration::from_secs(1)).await;
+    viewer
+        .read_until(
+            &mut client,
+            "the video has played enough to stream again",
+            |viewer| viewer.draws.len() >= draws + NO_STREAM_FRAMES || viewer.created.len() > 1,
+        )
+        .await;
     assert_eq!(viewer.created.len(), 1);
-    assert!(viewer.draws.len() >= draws + 20);
     let text = logs.text();
     assert_eq!(text.matches(STREAMS_OFF).count(), 1, "{text}");
 }
@@ -825,7 +898,7 @@ async fn reports_of_late_frames_cut_the_target_and_clean_ones_raise_it() {
         if stream_target(&server) != floor {
             break first.elapsed();
         }
-        assert!(first.elapsed() < Duration::from_secs(4), "it never rose");
+        assert!(first.elapsed() < support::WAIT, "it never rose");
     };
     assert!(
         raised >= CLEAN_PERIOD - Duration::from_millis(100),
@@ -858,13 +931,10 @@ async fn the_metrics_count_streams_and_carry_the_target() {
     let session = server.handle.session().unwrap();
     let before = session.stats();
     let (video, _create) = stream_video(&server, &mut client, &mut viewer, VIDEO).await;
-    viewer
-        .read_for(&mut client, Duration::from_millis(500))
-        .await;
 
     let during = session.stats().since(&before);
     assert_eq!((during.streams_created, during.streams_destroyed), (1, 0));
-    assert_eq!(during.stream_frames, viewer.frames as u64);
+    assert!(during.stream_frames > 0);
     assert!(during.stream_bytes > 0);
     assert!(during.stream_encode.count >= during.stream_frames);
     assert_eq!(during.stream_target_bps, video_cap());
@@ -883,6 +953,9 @@ async fn the_metrics_count_streams_and_carry_the_target() {
         .await;
     let after = session.stats().since(&before);
     assert_eq!((after.streams_created, after.streams_destroyed), (1, 1));
+    // Every frame counted was sent before the STREAM_DESTROY, and so has
+    // been read.
+    assert_eq!(after.stream_frames, viewer.frames as u64);
     assert_eq!(after.stream_target_bps, 0);
     let line = after.summary(Duration::from_secs(1));
     assert!(line.contains("stream target -"), "{line}");
@@ -922,9 +995,7 @@ async fn captures_that_fail_while_streaming_skip_frames_and_the_stream_carries_o
             !viewer.destroyed.is_empty()
         })
         .await;
-    viewer
-        .read_for(&mut client, Duration::from_millis(250))
-        .await;
+    viewer.read_for(&mut client, REPAIRED_WITHIN).await;
     viewer
         .screen
         .assert_shows(&server.platform.desktop().unwrap());
@@ -978,4 +1049,62 @@ async fn a_resize_with_no_stream_ever_sends_no_destroy_all() {
     server.platform.set_size(size).unwrap();
     // SURFACE_DESTROY comes first, with nothing before it.
     expect_replaced_surface(&server, &mut client, size).await;
+}
+
+/// A video up to the odd right and bottom edges of a desktop whose size
+/// is not a multiple of 64. Its stream is whole tiles, even-sided, and
+/// leaves out the last few pixels of each edge, which go as draws; no
+/// draw lands inside the stream while it lives, and the whole area is
+/// exact once it ends.
+#[tokio::test]
+async fn a_video_at_odd_edges_streams_whole_tiles_and_is_drawn_beside() {
+    // The last tile column is 3 pixels wide, and the last row 3 tall.
+    let size = Size {
+        width: 643,
+        height: 387,
+    };
+    let display = DisplayOptions {
+        frame_interval: INTERVAL,
+        ..display_options()
+    };
+    let server = TestServer::start_sized(size, display).await;
+    let (server, _main, mut client) = open_display_on(server, capabilities::DEFAULT_DISPLAY).await;
+    let mut viewer = Viewer::start(&server, &mut client).await;
+
+    let video_area = Rectangle::new(384, 192, 259, 195);
+    let (video, create) = stream_video(&server, &mut client, &mut viewer, video_area).await;
+    let stream = Rectangle::new(384, 192, 256, 192);
+    assert_eq!(create.dest, wire_rect(stream));
+    assert_eq!((create.stream_width % 2, create.stream_height % 2), (0, 0));
+    let edge = Rectangle::new(640, 192, 3, 195);
+    let beside = |viewer: &Viewer| {
+        viewer
+            .draws_while_streaming
+            .iter()
+            .filter(|bbox| overlaps(bbox, edge))
+            .count()
+    };
+    viewer
+        .read_until(&mut client, "ten draws of the edge column", |viewer| {
+            beside(viewer) >= 10
+        })
+        .await;
+    drop(video);
+    viewer
+        .read_until(&mut client, "the stream ends", |viewer| {
+            !viewer.destroyed.is_empty()
+        })
+        .await;
+
+    let inside: Vec<&Rect> = viewer
+        .draws_while_streaming
+        .iter()
+        .filter(|bbox| overlaps(bbox, stream))
+        .collect();
+    assert!(inside.is_empty(), "draws inside the stream: {inside:?}");
+
+    viewer.read_for(&mut client, REPAIRED_WITHIN).await;
+    viewer
+        .screen
+        .assert_shows(&server.platform.desktop().unwrap());
 }

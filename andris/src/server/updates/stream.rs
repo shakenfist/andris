@@ -35,19 +35,28 @@
 //! A report counts only for the live stream, and only with its
 //! `unique_id`; any other is ignored. The exception is the report that
 //! says the client cannot decode the stream (`num_frames` 0 and
-//! `num_drops` `u32::MAX`), which counts whatever its `unique_id`:
+//! `num_drops` `u32::MAX`), which also counts with a `unique_id` of 0:
 //! spice-gtk sends it zeroed, for a stream it failed to create or
 //! decode. It ends the stream, and the channel then sends no more
-//! streams, as it does after the encoder fails.
+//! streams, as it does after the encoder fails. With any other
+//! `unique_id` it is from an earlier stream with the same id (ids come
+//! round every [`STREAM_IDS`] streams), and is ignored like any other
+//! report for it. A zeroed report from an earlier stream with the same
+//! id cannot be told apart, but it would have to arrive after 64 more
+//! streams had started.
 //!
 //! # Its tiles
 //!
-//! A stream's rectangle is tile-aligned but where the surface's edge
-//! clips it, or rounding it to even dimensions leaves a row or column
-//! out. [`Stream::covered`] holds the tiles it covers wholly: damage to
-//! those goes into the stream, and damage anywhere else, a partly
-//! covered tile included, is drawn as usual. [`Stream::touched`] holds
-//! every tile it touches, which its frames leave lossy.
+//! A stream's rectangle is whole tiles, each clipped to the surface:
+//! [`Streams::start`] shrinks what it is given to the tiles it covers
+//! wholly, and where that leaves a side of odd length, which H.264
+//! cannot encode, it leaves out the last tile on that side too, which is
+//! then less than a tile at an odd surface edge. So no tile is part
+//! stream and part draws, and one set of tiles, [`Stream::tiles`],
+//! serves for everything: damage to them goes into the stream and
+//! nowhere else, its frames leave them lossy until it ends, and they
+//! are repaired and their heat forgotten when it does. Damage anywhere
+//! else is drawn as usual.
 //!
 //! # Its bitrate
 //!
@@ -96,19 +105,54 @@ use shakenfist_spice_protocol::messages::{
 use tokio::time::Instant;
 
 use super::encode::{SURFACE_ID, wire_rect};
-use crate::platform::{Frame, Rectangle, Region, Size};
+use crate::platform::{Frame, Rectangle, Region, Size, TILE};
 
 /// `SPICE_VIDEO_CODEC_TYPE_H264` (spice-protocol enums.h), which ryll's
 /// protocol crate does not name; its compression crate does, but only
 /// beside its decoders.
 pub const CODEC_TYPE_H264: u8 = 3;
 
-/// The longest side of a stream, and the longest its shorter side may
-/// be: the largest frame openh264 encodes, which ryll's `H264Encoder`
-/// refuses to be built beyond. An area larger than this is never
-/// streamed (see [`fits_encoder`]), rather than streamed in part.
+/// The longest side of a stream: the longest side of the largest frame
+/// openh264 encodes, which ryll's `H264Encoder` refuses to be built
+/// beyond. An area larger than this is never streamed (see
+/// [`fits_encoder`]), rather than streamed in part.
 pub const MAX_STREAM_LONG_SIDE: u32 = 3840;
+
+/// The longest a stream's shorter side may be: the shorter side of the
+/// largest frame openh264 encodes, as for [`MAX_STREAM_LONG_SIDE`].
 pub const MAX_STREAM_SHORT_SIDE: u32 = 2160;
+
+/// The largest rectangle of whole tiles inside `rect` on a surface of
+/// `size`, each tile clipped to the surface, with even sides as H.264
+/// needs, or `None` if there is none. Its left and top edges are on a
+/// tile boundary; its right and bottom edges are too, or are the
+/// surface's. A side that would come out odd, which only happens where
+/// it reaches an odd surface edge, loses its last tile, so the
+/// rectangle never covers part of a tile.
+pub fn whole_tiles(rect: Rectangle, size: Size) -> Option<Rectangle> {
+    let clipped = rect.clip(size)?;
+    // From `start` to `end` on an axis whose surface ends at `edge`.
+    let span = |start: u32, end: u64, edge: u32| -> Option<(u32, u32)> {
+        let first = start.div_ceil(TILE).checked_mul(TILE)?;
+        let mut last = if end >= u64::from(edge) {
+            edge
+        } else {
+            // end < edge, so it fits a u32.
+            end as u32 / TILE * TILE
+        };
+        if last > first && (last - first) % 2 == 1 {
+            last = (last - 1) / TILE * TILE;
+        }
+        if last > first {
+            Some((first, last - first))
+        } else {
+            None
+        }
+    };
+    let (x, width) = span(clipped.x, clipped.right(), size.width)?;
+    let (y, height) = span(clipped.y, clipped.bottom(), size.height)?;
+    Some(Rectangle::new(x, y, width, height))
+}
 
 /// Whether a `width` x `height` area, once rounded down to even sides,
 /// is small enough for the encoder: at most [`MAX_STREAM_LONG_SIDE`] on
@@ -444,23 +488,23 @@ impl Streams {
     }
 
     /// Start a stream over `rect` on a surface of `size` at `now`, if
-    /// [`Streams::may_start`]. The rectangle is clipped to the surface and
-    /// rounded down to even dimensions, as H.264 needs. Returns the new
-    /// stream, or `None` if none may start or nothing of `rect` is left.
+    /// [`Streams::may_start`]. The rectangle is shrunk to whole, even-sided
+    /// tiles, as [`whole_tiles`] says. Returns the new stream, or `None` if
+    /// none may start, nothing of `rect` is left, or what is left is too
+    /// large to encode.
     /// Fails if the encoder cannot be built; the caller then turns
     /// streams off with [`Streams::disable`].
     pub fn start(&mut self, rect: Rectangle, size: Size, now: Instant) -> Result<Option<&Stream>> {
         if !self.may_start() {
             return Ok(None);
         }
-        let Some(clipped) = rect.clip(size) else {
+        let Some(rect) = whole_tiles(rect, size) else {
             return Ok(None);
         };
-        let (width, height) = even_dimensions(clipped.width, clipped.height);
-        let rect = Rectangle::new(clipped.x, clipped.y, width, height);
+        let (width, height) = (rect.width, rect.height);
         // Too large an area is no stream, not a failure of the encoder:
         // streams stay on for areas that fit.
-        if rect.is_empty() || !fits_encoder(width, height) {
+        if !fits_encoder(width, height) {
             return Ok(None);
         }
         // Video, not screen content: openh264 holds a screen's bitrate by
@@ -540,10 +584,12 @@ impl Streams {
         if report.stream_id != stream.id {
             return ReportVerdict::OtherStream;
         }
-        if report.num_frames == 0 && report.num_drops == u32::MAX {
+        let ours = stream.unique_id == Some(report.unique_id);
+        if report.num_frames == 0 && report.num_drops == u32::MAX && (ours || report.unique_id == 0)
+        {
             return ReportVerdict::CannotDecode;
         }
-        if stream.unique_id != Some(report.unique_id) {
+        if !ours {
             return ReportVerdict::OtherUniqueId;
         }
         stream.last_report = Some(report);
@@ -681,24 +727,14 @@ impl Stream {
         self.last_report.as_ref()
     }
 
-    /// The tiles of a surface of `size` the stream covers wholly: damage
-    /// to them goes into the stream rather than into draws.
-    pub fn covered(&self, size: Size) -> Region {
-        let mut covered = Region::empty(size);
-        for (col, row) in self.rect.tiles() {
-            if self.rect.contains(&covered.tile_rect(col, row)) {
-                covered.insert_tile(col, row);
-            }
-        }
-        covered
-    }
-
-    /// Every tile of a surface of `size` the stream touches, wholly or
-    /// in part: its frames leave them all lossy.
-    pub fn touched(&self, size: Size) -> Region {
-        let mut touched = Region::empty(size);
-        touched.add(self.rect);
-        touched
+    /// The stream's tiles, of a surface of `size`: whole tiles, each
+    /// clipped to the surface, and the only tiles it touches. Damage to
+    /// them feeds the stream, its frames leave them lossy, and its end
+    /// repairs them; see the module's notes on its tiles.
+    pub fn tiles(&self, size: Size) -> Region {
+        let mut tiles = Region::empty(size);
+        tiles.add(self.rect);
+        tiles
     }
 
     /// Record that a frame sent at `now` changed the stream.
@@ -876,7 +912,7 @@ mod tests {
     #[test]
     fn create_draws_the_rectangle_top_down_as_h264() {
         let mut streams = streams(BOTH);
-        let rect = Rectangle::new(64, 32, 128, 96);
+        let rect = Rectangle::new(64, 64, 128, 128);
         let stream = streams.start(rect, SIZE, Instant::now()).unwrap().unwrap();
         let create = stream.create().unwrap();
         assert_eq!(
@@ -888,13 +924,13 @@ mod tests {
                 codec_type: 3,
                 stamp: 0,
                 stream_width: 128,
-                stream_height: 96,
+                stream_height: 128,
                 src_width: 128,
-                src_height: 96,
+                src_height: 128,
                 dest: Rect {
-                    top: 32,
+                    top: 64,
                     left: 64,
-                    bottom: 128,
+                    bottom: 192,
                     right: 192,
                 },
                 clip: Clip::none(),
@@ -959,29 +995,28 @@ mod tests {
     }
 
     #[test]
-    fn the_rectangle_is_clipped_and_rounded_down_to_even() {
+    fn the_rectangle_is_shrunk_to_whole_tiles_or_starts_nothing() {
         let mut streams = streams(BOTH);
         let stream = streams
-            .start(Rectangle::new(201, 99, 300, 99), SIZE, Instant::now())
+            .start(Rectangle::new(40, 30, 300, 99), SIZE, Instant::now())
             .unwrap()
             .unwrap();
-        // Clipped to 55 x 93, then rounded down.
-        assert_eq!(stream.rect(), Rectangle::new(201, 99, 54, 92));
+        // Clipped to 216 x 99, then shrunk to the tiles inside it.
+        assert_eq!(stream.rect(), Rectangle::new(64, 64, 192, 64));
         streams.end();
 
-        // Outside the surface, or a pixel wide: nothing starts.
-        assert!(
-            streams
-                .start(Rectangle::new(300, 0, 64, 64), SIZE, Instant::now())
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            streams
-                .start(Rectangle::new(0, 0, 1, 64), SIZE, Instant::now())
-                .unwrap()
-                .is_none()
-        );
+        // Outside the surface, a pixel wide, or less than a tile: nothing
+        // starts.
+        for rect in [
+            Rectangle::new(300, 0, 64, 64),
+            Rectangle::new(0, 0, 1, 64),
+            Rectangle::new(201, 99, 300, 99),
+        ] {
+            assert!(
+                streams.start(rect, SIZE, Instant::now()).unwrap().is_none(),
+                "{rect}"
+            );
+        }
     }
 
     #[test]
@@ -1078,11 +1113,13 @@ mod tests {
     }
 
     #[test]
-    fn cannot_decode_counts_whatever_its_unique_id_but_not_for_another_stream() {
+    fn cannot_decode_counts_zeroed_or_with_the_live_unique_id() {
         let mut streams = streams(BOTH);
-        streams
+        let unique_id = streams
             .start(Rectangle::new(0, 0, 64, 64), SIZE, Instant::now())
             .unwrap()
+            .unwrap()
+            .unique_id()
             .unwrap();
         assert_eq!(streams.report(cannot_decode(1)), ReportVerdict::OtherStream);
         // spice-gtk zeroes the unique_id.
@@ -1090,6 +1127,18 @@ mod tests {
             streams.report(cannot_decode(0)),
             ReportVerdict::CannotDecode
         );
+        let with = |unique_id| StreamReport {
+            unique_id,
+            ..cannot_decode(0)
+        };
+        assert_eq!(streams.report(with(unique_id)), ReportVerdict::CannotDecode);
+        // Another unique_id is an earlier stream's with the same id.
+        let stale = if unique_id == u32::MAX {
+            1
+        } else {
+            unique_id + 1
+        };
+        assert_eq!(streams.report(with(stale)), ReportVerdict::OtherUniqueId);
         // Frames, however many dropped, are not the special case.
         let dropped = StreamReport {
             num_frames: 1,
@@ -1131,7 +1180,7 @@ mod tests {
     #[test]
     fn a_padded_capture_encodes_to_a_frame_ryll_decodes() {
         let mut streams = streams(BOTH);
-        let rect = Rectangle::new(64, 64, 96, 64);
+        let rect = Rectangle::new(64, 64, 128, 64);
         streams.start(rect, SIZE, Instant::now()).unwrap().unwrap();
         let mut stream = streams.take().unwrap();
         let pixels = padded_frame(rect.size(), 0x40);
@@ -1148,7 +1197,7 @@ mod tests {
         )
         .unwrap();
         let decoded = decoder.decode(&frame.data).unwrap().unwrap();
-        assert_eq!((decoded.width, decoded.height), (96, 64));
+        assert_eq!((decoded.width, decoded.height), (128, 64));
         streams.put_back(stream).unwrap();
         assert_eq!(streams.live().unwrap().rect(), rect);
     }
@@ -1177,35 +1226,59 @@ mod tests {
     }
 
     #[test]
-    fn covered_tiles_are_the_whole_ones_and_touched_tiles_all_of_them() {
-        // A surface 301 x 200: the last tile column is 45 pixels wide and
-        // the last row 8 rows tall.
+    fn a_stream_is_whole_even_tiles() {
+        // A surface 643 x 387: its last tile column is 3 pixels wide and
+        // its last row 3 tall.
         let size = Size {
-            width: 301,
-            height: 200,
+            width: 643,
+            height: 387,
         };
+        let at = |x, y, w, h| whole_tiles(Rectangle::new(x, y, w, h), size);
+        // Tile-aligned and even: as it is.
+        assert_eq!(at(64, 64, 128, 192), Some(Rectangle::new(64, 64, 128, 192)));
+        // Shrunk to the tiles it covers wholly.
+        assert_eq!(
+            at(60, 70, 140, 200),
+            Some(Rectangle::new(64, 128, 128, 128))
+        );
+        // To the odd edges: 259 x 195 would be odd, so the 3-pixel last
+        // column and row are left out.
+        assert_eq!(
+            at(384, 192, 259, 195),
+            Some(Rectangle::new(384, 192, 256, 192))
+        );
+        // Beyond them, clipped first.
+        assert_eq!(
+            at(384, 192, 1000, 1000),
+            Some(Rectangle::new(384, 192, 256, 192))
+        );
+        // An even edge tile stays: on a 642-wide surface, 2 pixels.
+        let even = Size {
+            width: 642,
+            height: 386,
+        };
+        assert_eq!(
+            whole_tiles(Rectangle::new(512, 256, 200, 200), even),
+            Some(Rectangle::new(512, 256, 130, 130))
+        );
+        // No whole tile, or nothing left: none.
+        assert_eq!(at(1, 1, 100, 100), None);
+        assert_eq!(at(640, 0, 3, 64), None);
+        assert_eq!(at(700, 0, 64, 64), None);
+
+        // The stream's tiles are then exactly the tiles it touches, each
+        // wholly inside it.
         let mut streams = streams(BOTH);
         let stream = streams
-            .start(Rectangle::new(192, 128, 200, 100), size, Instant::now())
+            .start(Rectangle::new(384, 192, 259, 195), size, Instant::now())
             .unwrap()
             .unwrap();
-        // Clipped to 109 x 72, then rounded to 108 x 72: the surface's
-        // last column stays out of the stream, and so does the last tile
-        // column, which holds it.
-        assert_eq!(stream.rect(), Rectangle::new(192, 128, 108, 72));
-        let mut covered = Region::empty(size);
-        covered.add(Rectangle::new(192, 128, 64, 72));
-        assert_eq!(stream.covered(size), covered);
-        let mut touched = Region::empty(size);
-        touched.add(Rectangle::new(192, 128, 109, 72));
-        assert_eq!(stream.touched(size), touched);
-
-        // A tile-aligned stream covers every tile it touches.
-        streams.end();
-        let rect = Rectangle::new(64, 0, 128, 128);
-        let stream = streams.start(rect, SIZE, Instant::now()).unwrap().unwrap();
-        assert_eq!(stream.covered(SIZE), stream.touched(SIZE));
-        assert_eq!(stream.covered(SIZE).tile_count(), 4);
+        assert_eq!(stream.rect(), Rectangle::new(384, 192, 256, 192));
+        let tiles = stream.tiles(size);
+        assert_eq!(tiles.tile_count(), 4 * 3);
+        for (col, row) in tiles.tiles() {
+            assert!(stream.rect().contains(&tiles.tile_rect(col, row)));
+        }
     }
 
     #[test]
@@ -1542,11 +1615,17 @@ mod tests {
                 .is_none()
         );
         assert!(streams.enabled(), "too large an area turned streams off");
+        // The largest the encoder takes: a whole 4K surface, whose bottom
+        // edge is not on a tile boundary.
+        let uhd = Size {
+            width: 3840,
+            height: 2160,
+        };
         let stream = streams
-            .start(Rectangle::new(0, 0, 3840, 2160), size, now)
+            .start(Rectangle::full(uhd), uhd, now)
             .unwrap()
             .unwrap();
-        assert_eq!(stream.rect(), Rectangle::new(0, 0, 3840, 2160));
+        assert_eq!(stream.rect(), Rectangle::full(uhd));
     }
 
     #[test]

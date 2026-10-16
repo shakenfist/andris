@@ -70,14 +70,14 @@
 //!   [`HeatMap`]: the tiles it changed, and which of them went out
 //!   photographic. When no stream lives, the largest area the heat map
 //!   finds starts one.
-//! - **Feeding.** While a stream lives, damage to the tiles it covers
-//!   wholly is taken out of the frame's draws. If any were damaged, the
-//!   stream's rectangle is captured, brought into the shadow, and sent as
-//!   one `STREAM_DATA`, encoded on the blocking pool and stamped from the
-//!   session's clock, the one `MAIN_INIT` gave the client. Its tiles are
-//!   then lossy, due only once the stream has ended. A frame due while
-//!   the ack window is full is not captured, as for draws, and counts as
-//!   a server drop.
+//! - **Feeding.** While a stream lives, damage to its tiles (whole
+//!   tiles: no tile is part stream and part draws) is taken out of the
+//!   frame's draws. If any were damaged, the stream's rectangle is
+//!   captured, brought into the shadow, and sent as one `STREAM_DATA`,
+//!   encoded on the blocking pool and stamped from the session's clock,
+//!   the one `MAIN_INIT` gave the client. Its tiles are then lossy, due
+//!   only once the stream has ended. A frame due while the ack window is
+//!   full is not captured, as for draws, and counts as a server drop.
 //! - **Ending.** A stream ends when nothing has changed it for
 //!   [`STREAM_QUIET`], or when an area that touches it has grown past it.
 //!   Its tiles then fall due at once, so the lossless refresh repairs the
@@ -596,7 +596,7 @@ impl Display {
         let mut region = taken.clone();
         let mut streamed = false;
         if !whole && let Some(stream) = self.streams.live() {
-            for (col, row) in stream.covered(taken.size()).tiles() {
+            for (col, row) in stream.tiles(taken.size()).tiles() {
                 streamed |= region.contains_tile(col, row);
                 region.remove_tile(col, row);
             }
@@ -877,7 +877,9 @@ impl Display {
         Ok(())
     }
 
-    /// Whether pending damage would feed the live stream.
+    /// Whether pending damage would feed the live stream: whether any
+    /// lies on its tiles, which are exactly the tiles its rectangle
+    /// touches.
     fn stream_frame_due(&self) -> bool {
         self.streams
             .live()
@@ -945,11 +947,11 @@ impl Display {
             return Ok(None);
         };
         let (rect, size) = (live.rect(), damage.size());
-        let covered = live.covered(size);
+        let tiles = live.tiles(size);
         let captured_at = self.conn.session().elapsed();
         let Some(capture) = self.capture_or_skip(Some(vec![rect])).await? else {
             let mut lost = Region::empty(size);
-            for (col, row) in covered.tiles() {
+            for (col, row) in tiles.tiles() {
                 if damage.contains_tile(col, row) {
                     lost.insert_tile(col, row);
                 }
@@ -998,7 +1000,7 @@ impl Display {
         let counters = self.conn.session().counters();
         counters.stream_encode_done(started.elapsed());
         let held = now + STREAM_QUIET + self.ctx.display.lossless_delay;
-        self.lossy.mark(&stream.touched(size), held);
+        self.lossy.mark(&stream.tiles(size), held);
         stream.changed(now);
         if let Ok(Encoded {
             frame_rate: Some(rate),
@@ -1071,9 +1073,9 @@ impl Display {
         );
         self.conn.session().counters().stream_destroyed();
         if let Some(size) = self.surface {
-            let touched = stream.touched(size);
-            self.lossy.make_due(&touched, Instant::now());
-            self.heat.forget(&touched);
+            let tiles = stream.tiles(size);
+            self.lossy.make_due(&tiles, Instant::now());
+            self.heat.forget(&tiles);
         }
         self.send_msg(DisplayOpcode::StreamDestroy, &stream.destroy())
             .await

@@ -373,7 +373,7 @@ its conventions in its `AGENTS.md`.
 | 7 | high | opus | none | Complete | End-to-end checks: `make e2e` and one `make e2e-xrdp` check. See brief 7. |
 | 8 | medium | sonnet | none | Complete | Documentation. See brief 8. |
 | 9 | medium | management | none | Not started | Operator acceptance on `:10`, with a video. See brief 9. |
-| 10 | medium | management | none | Complete | Push audit, pull request, queue. See brief 10. |
+| 10 | medium | management | none | In progress | Push audit, pull request, queue. See brief 10. |
 
 Steps 1 and 2 may run in parallel, but step 2's encoder API waits for
 step 1's bitrate finding. Step 3 needs step 2's ryll pull request
@@ -802,9 +802,20 @@ Declined, with reasons:
   it grows.
 - **Type hints in the e2e scripts.** No andris script has them, and
   there is no mypy setup.
-- **Timing-bound integration tests.** They are bounded lower limits
-  with roughly 2× margin, or a 1.5 s ceiling on a 1 s timeout; none
-  flaked in repeated runs.
+- **Timing-bound integration tests**, at first: they had roughly 2×
+  margin and had not flaked. Andris#21's review round then saw three
+  fail with the host at load 19, so they now read until a condition
+  holds, and a test expecting no stream watches for twice the frames a
+  stream needs; the stream suite passes under a 16-core busy loop.
 - **The encoder-internal failure path** has no integration test: it
   cannot be reached without a fault-injection hook in production
   code. It shares its handling with "cannot decode", which is tested.
+
+### Andris#21 review
+
+The review found that a stream's partly covered edge tiles were drawn
+into the live stream on every frame and could be refreshed into it.
+Streams are now whole tiles, shrunk to the tiles they cover wholly, so
+one set of tiles serves every purpose. A "cannot decode" report now
+needs a zeroed or matching `unique_id`. The per-frame heat rescan was
+declined: about a millisecond at 4K, with the history capped.

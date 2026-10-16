@@ -76,18 +76,12 @@ pub use encode::{
     JpegQuality, SURFACE_ID, looks_photographic,
 };
 use encode::{encode_draw, split};
-pub use heat::{
-    Candidate, Choice, HOT_FRAMES, HOT_MAX_GAP, HOT_WINDOW, HeatMap, MAX_TILE_CHANGES,
-    MIN_PHOTOGRAPHIC_PERCENT, MIN_STREAM_SIDE, OUTGROWN_FACTOR, choose,
-};
+pub use heat::{Candidate, Choice, HOT_FRAMES, HeatMap, choose};
 pub use lossy::LossyTiles;
 use shadow::Shadow;
 pub use stream::{
-    CLEAN_PERIOD, CODEC_TYPE_H264, Encoded, FRAME_RATE_HYSTERESIS_PERCENT, FRAME_RATE_WINDOW,
-    LOW_HEADROOM, MAX_STREAM_LONG_SIDE, MAX_STREAM_SHORT_SIDE, MIN_STREAM_BITRATE_BPS,
-    RAISE_PERCENT, REPORT_TIMEOUT, REPORT_WINDOW, RateChange, RateControl, RateEvent, RateReason,
-    ReportVerdict, SERVER_DROP_WINDOW, STREAM_IDS, STREAM_LATENCY_BUDGET, STREAM_QUIET, Stream,
-    StreamCaps, Streams, fits_encoder, frames_per_second, multi_media_time,
+    CLEAN_PERIOD, Encoded, MIN_STREAM_BITRATE_BPS, RateChange, RateEvent, RateReason,
+    ReportVerdict, STREAM_LATENCY_BUDGET, STREAM_QUIET, Stream, StreamCaps, Streams,
 };
 
 use crate::platform::{Capture, Rectangle, Region, Size};

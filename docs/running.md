@@ -354,6 +354,9 @@ fifth of those changes went out as JPEG, so it looks photographic.
 The region must be at least 128 pixels each way, and at most 3840 by
 2160, either way round, which is the most the encoder takes; a larger
 one stays on JPEG draws whole, rather than being streamed in part.
+A stream is made of whole 64-pixel tiles with even sides, so where a
+video reaches an edge of the desktop whose size is odd, the last few
+pixels along that edge go as draws.
 Text, a scrolling terminal or a progress bar changes as often but
 compresses well, goes as LZ4, and never streams; neither does anything
 when JPEG is off (see above), since a client that asked for exact

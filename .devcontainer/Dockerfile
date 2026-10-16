@@ -6,10 +6,13 @@ FROM mcr.microsoft.com/devcontainers/base:debian
 # Build tools:
 #   - cmake: Build dependency for aws-lc-sys (via tokio-rustls, through
 #     shakenfist-spice-protocol)
+#   - nasm: openh264's assembly; without it the openh264 crate silently
+#     skips its SIMD code, and a 1080p encode takes about 2.7x as long
 RUN apt-get update && apt-get install -y \
     build-essential \
     pkg-config \
     cmake \
+    nasm \
     && rm -rf /var/lib/apt/lists/*
 
 # A headless X server, to test the X11 backend against, and the X

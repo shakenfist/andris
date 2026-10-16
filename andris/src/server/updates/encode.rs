@@ -173,7 +173,7 @@ pub(super) fn split(rect: Rectangle, max_bytes: usize) -> impl Iterator<Item = R
 }
 
 /// A rectangle in SPICE's wire form.
-fn wire_rect(rect: Rectangle) -> Result<Rect> {
+pub(super) fn wire_rect(rect: Rectangle) -> Result<Rect> {
     let as_i32 = |v: u64| i32::try_from(v).context("a coordinate does not fit in an i32");
     Ok(Rect {
         top: as_i32(u64::from(rect.y))?,

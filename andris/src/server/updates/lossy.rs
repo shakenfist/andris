@@ -138,6 +138,38 @@ impl LossyTiles {
         self.find_next_due();
     }
 
+    /// Mark every tile of `region` lossy, due at `due`, as a video stream
+    /// does for the tiles its frames cover: they are due only once the
+    /// stream has ended, not `delay` after each frame. A region of
+    /// another size marks nothing.
+    pub fn mark(&mut self, region: &Region, due: Instant) {
+        if region.size() != self.size() {
+            return;
+        }
+        for (col, row) in region.tiles() {
+            self.set(col, row, Some(due));
+        }
+        self.find_next_due();
+    }
+
+    /// Make every lossy tile of `region` due at `now`, as when the stream
+    /// over it ends: the next refresh sends them losslessly. Exact tiles
+    /// stay exact, and a region of another size changes nothing.
+    pub fn make_due(&mut self, region: &Region, now: Instant) {
+        if region.size() != self.size() || self.is_empty() {
+            return;
+        }
+        let columns = self.lossy.grid().0;
+        for (col, row) in region.tiles() {
+            if self.lossy.contains_tile(col, row)
+                && let Some(due) = self.due.get_mut(index(columns, col, row))
+            {
+                *due = Some(now);
+            }
+        }
+        self.find_next_due();
+    }
+
     /// Mark every tile of `region` exact, as once a refresh has sent it
     /// losslessly. A region of another size clears nothing.
     pub fn clear(&mut self, region: &Region) {
@@ -362,5 +394,31 @@ mod tests {
             assert_eq!(lossy.next_due(), slow, "step {step}");
             assert_eq!(lossy.is_empty(), lossy.region().is_empty());
         }
+    }
+
+    #[test]
+    fn a_marked_region_is_lossy_until_made_due() {
+        let delay = Duration::from_millis(500);
+        let start = Instant::now();
+        let held = start + Duration::from_secs(10);
+        let mut lossy = LossyTiles::new(delay);
+        lossy.reset(SIZE);
+        let streamed = region(SIZE, &[rect(64, 0, 128, 128)]);
+        lossy.mark(&streamed, held);
+        assert_eq!(lossy.region(), streamed);
+        assert_eq!(lossy.next_due(), Some(held));
+        assert!(lossy.due(start + delay).is_empty());
+
+        // Made due, the marked tiles fall due at once; an exact tile in the
+        // region stays exact.
+        lossy.make_due(&region(SIZE, &[rect(0, 0, 128, 64)]), start);
+        assert_eq!(lossy.next_due(), Some(start));
+        assert_eq!(lossy.due(start), region(SIZE, &[rect(64, 0, 64, 64)]));
+        assert_eq!(lossy.region(), streamed);
+
+        // Of another size, both do nothing.
+        lossy.mark(&Region::full(size(64, 64)), start);
+        lossy.make_due(&Region::full(size(64, 64)), start);
+        assert_eq!(lossy.region(), streamed);
     }
 }

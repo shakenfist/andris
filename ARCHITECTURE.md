@@ -22,8 +22,8 @@ SPICE.
 | Session registry | `server/session.rs` | Holds the one session served at a time. A main-channel link that authenticates begins a session and cancels the previous one; secondary channels must name the session's id. The session carries the mouse mode and a cancel signal every channel task races against, and holds one channel of each type: a new link of a type replaces the old channel |
 | Channel framing | `server/channel.rs`, `opcodes.rs` | Mini-header message framing, the messages every channel shares, and the ack window. Each channel sends only variants of its own opcode enum |
 | Main channel | `server/main_channel.rs`, `server/agent.rs` | `INIT`, the channel list, mouse mode and pings. `agent.rs` plays the guest agent on the main channel, since andris runs inside the desktop it exports: agent flow control, the clipboard (`CLIPBOARD` as UTF-8 text, both ways) and monitors config, which becomes a resize request to the platform |
-| Display channel | `server/display.rs`, `stats.rs` | The primary surface; the loop that turns damage into frames under the frame-rate cap and the ack window; the scrub; the lossless refresh of JPEG areas; the client's compression preference; and the per-session metrics |
-| Updates | `server/updates/` | Keeps a shadow of what the client was last sent, compares each capture with it in 64x64 tiles, merges the changed tiles into at most 32 rectangles, splits any over 4 MiB, and encodes each from the shadow as JPEG (photographic areas, when the client leaves the choice to the server), LZ4 or an uncompressed bitmap |
+| Display channel | `server/display.rs`, `stats.rs` | The primary surface; the loop that turns damage into frames under the frame-rate cap and the ack window; the scrub; the lossless refresh of JPEG areas; the video stream's lifecycle; the client's compression preference; and the per-session metrics |
+| Updates | `server/updates/` | Keeps a shadow of what the client was last sent, compares each capture with it in 64x64 tiles, merges the changed tiles into at most 32 rectangles, splits any over 4 MiB, and encodes each from the shadow as JPEG (photographic areas, when the client leaves the choice to the server), LZ4 or an uncompressed bitmap. Its heat map finds the area that keeps changing like a photograph, and its stream module owns the H.264 stream for that area: the frames, the encoder and its rate control |
 | Inputs channel | `server/inputs.rs`, `keymap.rs` | Decodes set-1 scancodes to evdev codes, tracks lock keys, applies pointer events according to the mouse mode |
 | Cursor channel | `server/cursor.rs` | Sends each cursor shape the platform reports as an alpha cursor |
 | Platform traits | `platform/mod.rs`, `damage.rs` | `DisplayGeometry`, `ScreenSource`, `InputSink`, `CursorSource`, `DisplayControl` (resize the desktop, or refuse) and `Clipboard` (the desktop's clipboard text), bundled as a `Platform`. They use no SPICE types, and keys cross them as Linux evdev codes. `ScreenSource` captures rectangles or the whole desktop, and hands each subscriber the damage reported since it last took some, as a region of 64x64 tiles |
@@ -72,6 +72,22 @@ that went out as JPEG once they have been still for a while, so a still
 screen ends up exact. A capture of a new size re-creates the surface
 first. [`docs/running.md`](docs/running.md) describes what an operator
 sees of all this.
+
+**The stream path.** Each frame the display channel sends also feeds the
+heat map (`server/updates/heat.rs`), which records per tile when it
+changed and whether it went out as JPEG. A cluster of tiles that has
+changed in 20 frames without a long gap, partly as JPEG, becomes a
+stream (`server/updates/stream.rs`) if the client has the H.264
+capabilities. While it lives, damage inside its
+rectangle is not encoded as draws: the whole rectangle is captured
+into the shadow and sent as one H.264 `STREAM_DATA`, the encoding run
+on the blocking pool, while damage outside takes the path above.
+The client's reports and the ack window adjust the bitrate. After a
+second without change, or when the changing area outgrows the
+rectangle, the stream is destroyed and its tiles are due at once for
+the lossless refresh, so the area is exact again.
+[Video streams](docs/running.md#video-streams) gives the rules and
+numbers.
 
 ### How a key reaches the X server
 
@@ -136,12 +152,14 @@ built.
 - **Pixels, not draw ops.** Capture is pixel reads, sent as
   `DRAW_COPY` images, with no QXL draw-op emulation. Damage says
   where to look, and comparing with what the client was last sent
-  says what to send. Video streams are yet to come.
+  says what to send. An area that keeps changing like a video is the
+  exception: it goes as an H.264 stream.
 - **Platform seams.** Capture, input injection, the cursor, display
   control and the clipboard sit behind traits, with an X11
   implementation and a synthetic one, so that a Wayland backend can be
   added later without restructuring. Audio is yet to be added.
-- **Ryll is the reference client.** Images are LZ4 or uncompressed;
-  other SPICE clients work only where they support those encodings.
+- **Ryll is the reference client.** Images are JPEG, LZ4 or
+  uncompressed, and video streams are H.264; other SPICE clients work
+  only where they support those encodings.
 - **One client at a time.** A new connection replaces the old one.
 - **Linux only.** A single binary crate with a module per backend.

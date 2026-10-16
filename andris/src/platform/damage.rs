@@ -566,6 +566,17 @@ impl DamageSubscription {
         Ok(added)
     }
 
+    /// Whether any pending damage touches `rect`, leaving it pending: for
+    /// a consumer that cannot take damage yet and wants to know what it
+    /// would cover. A poisoned lock counts as touching, so that
+    /// [`DamageSubscription::take`] reports it.
+    pub fn touches(&self, rect: Rectangle) -> bool {
+        self.shared.pending().map_or(true, |pending| {
+            rect.tiles()
+                .any(|(col, row)| pending.region.contains_tile(col, row))
+        })
+    }
+
     /// Whether damage is pending or the desktop is gone. A poisoned lock
     /// counts as ready, so that [`DamageSubscription::take`] reports it.
     fn ready(&self) -> bool {
@@ -1266,5 +1277,20 @@ mod tests {
         }
         assert_eq!(hub.hub().unwrap().subscribers.len(), 2);
         drop(kept);
+    }
+
+    #[test]
+    fn touches_peeks_without_taking() {
+        let hub = DamageHub::new(SIZE);
+        let subscription = hub.subscribe().unwrap();
+        // A new subscription has the whole desktop pending.
+        subscription.take().unwrap();
+        assert!(!subscription.touches(rect(0, 0, 64, 64)));
+        hub.damage(&[rect(70, 10, 1, 1)]).unwrap();
+        assert!(subscription.touches(rect(0, 0, 65, 64)));
+        assert!(!subscription.touches(rect(0, 0, 64, 64)));
+        assert!(!subscription.touches(rect(128, 0, 64, 64)));
+        // Still pending.
+        assert_eq!(subscription.take().unwrap().tile_count(), 1);
     }
 }

@@ -12,6 +12,12 @@
 //! snapshots ([`StatsSnapshot::since`]), and one more for the whole
 //! session when it ends. Nothing is logged for an interval in which no
 //! frame was sent ([`StatsSnapshot::has_frames`]).
+//!
+//! Video streams have counters of their own, not a slot among the draw
+//! encodings: a stream frame is not a `DRAW_COPY`, has no image type,
+//! and is not refreshed losslessly, and what matters about it (how many
+//! streams came and went, what bitrate they aimed for) has no meaning
+//! for a draw. The draw counters stay exactly the draws.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -176,6 +182,14 @@ pub struct Stats {
     scrub_tiles: AtomicU64,
     ack_lag: Timing,
     ping: Timing,
+    streams_created: AtomicU64,
+    streams_destroyed: AtomicU64,
+    stream_frames: AtomicU64,
+    stream_bytes: AtomicU64,
+    stream_encode: Timing,
+    stream_server_drops: AtomicU64,
+    /// A gauge, not a counter: the live stream's target, or 0.
+    stream_target_bps: AtomicU64,
 }
 
 impl Stats {
@@ -240,6 +254,40 @@ impl Stats {
         self.ping.record(rtt);
     }
 
+    /// Count a video stream started, aiming for `target_bps`.
+    pub fn stream_created(&self, target_bps: u32) {
+        self.streams_created.fetch_add(1, RELAXED);
+        self.stream_target(target_bps);
+    }
+
+    /// Count a video stream ended. No stream is live afterwards.
+    pub fn stream_destroyed(&self) {
+        self.streams_destroyed.fetch_add(1, RELAXED);
+        self.stream_target(0);
+    }
+
+    /// Count one `STREAM_DATA` whose frame was `bytes` long.
+    pub fn stream_frame_sent(&self, bytes: u64) {
+        self.stream_frames.fetch_add(1, RELAXED);
+        self.stream_bytes.fetch_add(bytes, RELAXED);
+    }
+
+    /// Record the time capturing a stream's frame into the shadow and
+    /// encoding it took.
+    pub fn stream_encode_done(&self, took: Duration) {
+        self.stream_encode.record(took);
+    }
+
+    /// Count a stream frame not captured because the ack window was full.
+    pub fn stream_server_drop(&self) {
+        self.stream_server_drops.fetch_add(1, RELAXED);
+    }
+
+    /// Record the live stream's target bitrate, or 0 for none.
+    pub fn stream_target(&self, bps: u32) {
+        self.stream_target_bps.store(u64::from(bps), RELAXED);
+    }
+
     /// Read every metric. The reads are independent, so a snapshot taken
     /// while channels run may be a message or two out of step.
     pub fn snapshot(&self) -> StatsSnapshot {
@@ -267,6 +315,13 @@ impl Stats {
             scrub_tiles: self.scrub_tiles.load(RELAXED),
             ack_lag: self.ack_lag.read(),
             ping: self.ping.read(),
+            streams_created: self.streams_created.load(RELAXED),
+            streams_destroyed: self.streams_destroyed.load(RELAXED),
+            stream_frames: self.stream_frames.load(RELAXED),
+            stream_bytes: self.stream_bytes.load(RELAXED),
+            stream_encode: self.stream_encode.read(),
+            stream_server_drops: self.stream_server_drops.load(RELAXED),
+            stream_target_bps: self.stream_target_bps.load(RELAXED),
         }
     }
 }
@@ -314,6 +369,21 @@ pub struct StatsSnapshot {
     pub ack_lag: TimingSnapshot,
     /// `PING` round trips.
     pub ping: TimingSnapshot,
+    /// Video streams started.
+    pub streams_created: u64,
+    /// Video streams ended, every way they end.
+    pub streams_destroyed: u64,
+    /// `STREAM_DATA`s sent.
+    pub stream_frames: u64,
+    /// Their frames, in bytes.
+    pub stream_bytes: u64,
+    /// Bringing a stream's capture into the shadow and encoding it.
+    pub stream_encode: TimingSnapshot,
+    /// Stream frames not captured because the ack window was full.
+    pub stream_server_drops: u64,
+    /// The live stream's target bitrate, in bits a second, or 0 if no
+    /// stream is live. A gauge: [`StatsSnapshot::since`] keeps it.
+    pub stream_target_bps: u64,
 }
 
 impl StatsSnapshot {
@@ -327,31 +397,38 @@ impl StatsSnapshot {
         self.main_bytes + self.display_bytes + self.inputs_bytes + self.cursor_bytes
     }
 
-    /// Whether any frame or refresh was sent: what the periodic log line
-    /// waits for.
+    /// Whether any frame, refresh or stream frame was sent: what the
+    /// periodic log line waits for.
     pub fn has_frames(&self) -> bool {
-        self.frames + self.refreshes > 0
+        self.frames + self.refreshes + self.stream_frames > 0
     }
 
     /// What happened since `prev`, an earlier snapshot of the same
     /// session. Counters and totals are differences; the latest ack lag
-    /// and ping are this snapshot's.
+    /// and ping, and the stream's target, are this snapshot's.
     pub fn since(&self, prev: &Self) -> Self {
         // Every field is named once: a field added to the struct and not
         // here is a missing field in the struct expression below.
         macro_rules! since {
-            (counters: $($counter:ident),*; timings: $($timing:ident),*) => {
+            (
+                counters: $($counter:ident),*;
+                timings: $($timing:ident),*;
+                gauges: $($gauge:ident),*
+            ) => {
                 Self {
                     $($counter: self.$counter.saturating_sub(prev.$counter),)*
                     $($timing: self.$timing.since(&prev.$timing),)*
+                    $($gauge: self.$gauge,)*
                 }
             };
         }
         since!(
             counters: frames, refreshes, lz4_draws, bitmap_draws, jpeg_draws, lz4_bytes,
                 bitmap_bytes, jpeg_bytes, main_bytes, display_bytes, inputs_bytes, cursor_bytes,
-                captured_area, changed_area, scrub_tiles;
-            timings: capture, encode, ack_lag, ping
+                captured_area, changed_area, scrub_tiles, streams_created, streams_destroyed,
+                stream_frames, stream_bytes, stream_server_drops;
+            timings: capture, encode, ack_lag, ping, stream_encode;
+            gauges: stream_target_bps
         )
     }
 
@@ -367,10 +444,16 @@ impl StatsSnapshot {
         } else {
             '-'.to_string()
         };
+        let target = if self.stream_target_bps > 0 {
+            format!("{} kbit/s", self.stream_target_bps / 1000)
+        } else {
+            '-'.to_string()
+        };
         format!(
             "{:.1} fps ({} refreshes), draws lz4={} bitmap={} jpeg={}, display {:.0} kbit/s, \
              capture {} ms, encode {} ms, ack lag {} ms, ping {} ms, scrub tiles {}, \
-             changed {} of captured",
+             changed {} of captured, streams created={} destroyed={}, stream frames {} at \
+             {:.0} kbit/s, stream encode {} ms, server drops {}, stream target {}",
             (self.frames + self.refreshes) as f64 / secs,
             self.refreshes,
             self.lz4_draws,
@@ -383,6 +466,13 @@ impl StatsSnapshot {
             ms(self.ping.latest()),
             self.scrub_tiles,
             changed,
+            self.streams_created,
+            self.streams_destroyed,
+            self.stream_frames,
+            self.stream_bytes as f64 * 8.0 / 1000.0 / secs,
+            self.stream_encode.mean_ms(),
+            self.stream_server_drops,
+            target,
         )
     }
 }
@@ -425,6 +515,44 @@ mod tests {
         stats.ack_lag(Duration::from_millis(6));
         stats.ping_round_trip(Duration::from_micros(500));
         stats.snapshot()
+    }
+
+    /// A session with one live stream that sent two frames.
+    fn streaming() -> StatsSnapshot {
+        let stats = Stats::default();
+        stats.stream_created(2_000_000);
+        stats.stream_frame_sent(10_000);
+        stats.stream_frame_sent(15_000);
+        stats.stream_encode_done(Duration::from_millis(2));
+        stats.stream_encode_done(Duration::from_millis(4));
+        stats.stream_server_drop();
+        stats.stream_target(1_500_000);
+        stats.snapshot()
+    }
+
+    #[test]
+    fn stream_counters_count_and_the_target_is_a_gauge() {
+        let stats = Stats::default();
+        stats.stream_created(2_000_000);
+        stats.stream_frame_sent(100);
+        let first = stats.snapshot();
+        assert_eq!(
+            (first.streams_created, first.stream_target_bps),
+            (1, 2_000_000)
+        );
+        assert!(first.has_frames(), "stream frames alone count as frames");
+        stats.stream_frame_sent(50);
+        stats.stream_target(1_000_000);
+        let delta = stats.snapshot().since(&first);
+        assert_eq!((delta.stream_frames, delta.stream_bytes), (1, 50));
+        assert_eq!(delta.streams_created, 0);
+        // The target is the latest, not a difference.
+        assert_eq!(delta.stream_target_bps, 1_000_000);
+        stats.stream_destroyed();
+        let last = stats.snapshot();
+        assert_eq!((last.streams_destroyed, last.stream_target_bps), (1, 0));
+        // No draws: stream frames are not draws.
+        assert_eq!(last.draws(), 0);
     }
 
     #[test]
@@ -499,7 +627,16 @@ mod tests {
             line,
             "1.0 fps (0 refreshes), draws lz4=1 bitmap=0 jpeg=0, display 100 kbit/s, \
              capture 2.0 ms, encode 4.0 ms, ack lag 6.0 ms, ping 0.5 ms, scrub tiles 0, \
-             changed 25.0% of captured"
+             changed 25.0% of captured, streams created=0 destroyed=0, stream frames 0 at \
+             0 kbit/s, stream encode - ms, server drops 0, stream target -"
+        );
+        let line = streaming().summary(Duration::from_secs(2));
+        assert!(
+            line.ends_with(
+                "streams created=1 destroyed=0, stream frames 2 at 100 kbit/s, \
+                 stream encode 3.0 ms, server drops 1, stream target 1500 kbit/s"
+            ),
+            "{line}"
         );
         // With nothing measured the means are dashes.
         let line = StatsSnapshot::default().summary(Duration::from_secs(10));

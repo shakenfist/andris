@@ -21,13 +21,20 @@
 # desktop is silent for two seconds once it has settled, that a small
 # change arrives as few draws, that clipboard text crosses both ways
 # through andris's agent, small, over one agent chunk and over the INCR
-# threshold, and that a resize from ryll within Xvfb's -screen size is
-# applied while one above it is refused, logged once. This script then
+# threshold, that a resize from ryll within Xvfb's -screen size is applied
+# while one above it is refused, logged once, and that a moving picture
+# from scripts/e2e-video.py becomes one H.264 stream that decodes, ends
+# when the picture stops, and leaves the area exact. This script then
 # checks ryll's log for all four channels, since nothing else uses the
-# cursor channel. Then ryll is
-# stopped with SIGINT and andris with SIGTERM, as systemd stops it; both
-# must exit 0, and andris's log must say SIGTERM stopped it and hold the
-# session-end metrics line.
+# cursor channel, and stops ryll with SIGINT; the session-end metrics line
+# must count the stream.
+#
+# A second ryll, started with --no-h264, then sees the same picture: the
+# driver checks that no stream is created, and once that ryll is stopped,
+# andris's session-end line for its session must count JPEG draws and no
+# stream. Then andris is stopped with SIGTERM, as systemd stops it; both
+# rylls and andris must exit 0, and andris's log must say SIGTERM stopped
+# it.
 #
 # Last, a second andris is started against the same display, and Xvfb is
 # killed under it. That andris must exit 1 within GONE_BOUND seconds,
@@ -161,7 +168,7 @@ cleanup() {
         { wait "${pids[$name]}"; } 2>/dev/null || true
     done
     if ! $passed; then
-        for name in x11-test "${names[@]}" drive; do
+        for name in x11-test "${names[@]}" drive drive-no-h264 video video-no-h264; do
             if [ -f "$work/$name.log" ]; then
                 echo "===== $name.log ====="
                 cat "$work/$name.log"
@@ -203,8 +210,10 @@ wait_until "$KEYLOGGER_BOUND" keylogger "keylogger mapped" grep -qx READY "$work
 ticket=$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')
 (umask 077 && printf '%s\n' "$ticket" >"$work/ticket")
 
-# 5. Andris.
-start andris env RUST_LOG=info NO_COLOR=1 "$ANDRIS" --platform x11 --display "$X_DISPLAY" \
+# 5. Andris. The display channel logs at debug, for the stream reports
+# and bitrate changes the driver summarises.
+start andris env RUST_LOG=info,andris::server::display=debug NO_COLOR=1 "$ANDRIS" --platform x11 \
+    --display "$X_DISPLAY" \
     --listen "127.0.0.1:$PORT" --ticket-file "$work/ticket"
 wait_until "$ANDRIS_BOUND" andris "andris listening on $PORT" grep -q "plain listener ready" "$work/andris.log"
 say "andris is $(sed 's/\x1b\[[0-9;]*m//g' "$work/andris.log" | grep -o 'capturing the screen with [A-Za-z-]*' | head -n1 || true)"
@@ -219,7 +228,7 @@ start ryll env NO_COLOR=1 "$RYLL" --headless --file "$work/andris.vv" --control-
 # if a process it depends on exits.
 rc=0
 python3 "$here/e2e-drive.py" --socket "$sock" --keylog "$work/keylogger.log" --display "$X_DISPLAY" \
-    --andris-log "$work/andris.log" --ryll-log "$work/ryll.log" \
+    --andris-log "$work/andris.log" --ryll-log "$work/ryll.log" --work "$work" \
     --watch "andris=${pids[andris]}" --watch "ryll=${pids[ryll]}" --watch "keylogger=${pids[keylogger]}" \
     >"$work/drive.log" 2>&1 || rc=$?
 cat "$work/drive.log"
@@ -252,20 +261,59 @@ for name in "${names[@]}"; do
     fi
 done
 
-# 8. Stop everything but Xvfb, clients first. Andris is stopped as
-# systemd stops a unit, with SIGTERM.
+# The newest session-end metrics line in andris's log.
+last_session_end() {
+    sed 's/\x1b\[[0-9;]*m//g' "$work/andris.log" | grep 'session ends after' | tail -n1
+}
+
+# 8. Stop ryll, which ends its session. Its metrics must count the
+# stream the driver saw.
 stop ryll INT
+wait_until "$STOP_BOUND" andris "the first session's metrics line" \
+    sh -c "sed 's/\x1b\[[0-9;]*m//g' '$work/andris.log' | grep -c 'session ends after' | grep -qx 1"
+line=$(last_session_end)
+if ! echo "$line" | grep 'streams created=1 destroyed=1,' >/dev/null; then
+    say "FAIL: the first session's metrics do not count one stream created and destroyed: $line"
+    exit 1
+fi
+say "the first session's metrics: ${line#*: }"
+
+# 9. A ryll without H.264, and the same picture: no stream, JPEG draws.
+start ryll-no-h264 env NO_COLOR=1 "$RYLL" --headless --file "$work/andris.vv" \
+    --control-socket "$work/ryll-no-h264.sock" --verbose --no-h264
+rc=0
+python3 "$here/e2e-drive.py" --socket "$work/ryll-no-h264.sock" --display "$X_DISPLAY" \
+    --andris-log "$work/andris.log" --ryll-log "$work/ryll-no-h264.log" --work "$work" --no-stream \
+    --watch "andris=${pids[andris]}" --watch "ryll-no-h264=${pids[ryll-no-h264]}" \
+    >"$work/drive-no-h264.log" 2>&1 || rc=$?
+cat "$work/drive-no-h264.log"
+if [ "$rc" -ne 0 ]; then
+    say "FAIL: the --no-h264 driver exited $rc"
+    exit 1
+fi
+stop ryll-no-h264 INT
+wait_until "$STOP_BOUND" andris "the second session's metrics line" \
+    sh -c "sed 's/\x1b\[[0-9;]*m//g' '$work/andris.log' | grep -c 'session ends after' | grep -qx 2"
+line=$(last_session_end)
+if ! echo "$line" | grep 'streams created=0 ' >/dev/null || ! echo "$line" | grep 'jpeg=[1-9]' >/dev/null; then
+    say "FAIL: the --no-h264 session's metrics do not show JPEG draws and no stream: $line"
+    exit 1
+fi
+say "the --no-h264 session's metrics: ${line#*: }"
+
+# 10. Stop the rest but Xvfb. Andris is stopped as systemd stops a unit,
+# with SIGTERM.
 stop andris TERM
 stop keylogger TERM any
 
-# 9. Andris must not have logged an error. Colour is off, but strip any
+# 11. Andris must not have logged an error. Colour is off, but strip any
 # escape codes anyway so the match cannot be split by one.
 if sed 's/\x1b\[[0-9;]*m//g' "$work/andris.log" | grep ' ERROR ' >/dev/null; then
     say "FAIL: andris logged an ERROR"
     exit 1
 fi
 
-# 10. Ending the session, which stopping ryll did, logs the metrics.
+# 12. Ending a session, which stopping each ryll did, logs the metrics.
 if ! sed 's/\x1b\[[0-9;]*m//g' "$work/andris.log" | grep 'session ends after .*kB written in all' >/dev/null; then
     say "FAIL: andris never logged the session-end metrics line"
     exit 1
@@ -278,7 +326,7 @@ if ! sed 's/\x1b\[[0-9;]*m//g' "$work/andris.log" | grep 'SIGTERM: shutting down
 fi
 say "andris logged that SIGTERM stopped it"
 
-# 11. The desktop going away: a second andris on the same display, and
+# 13. The desktop going away: a second andris on the same display, and
 # Xvfb killed under it.
 start andris-gone env RUST_LOG=info NO_COLOR=1 "$ANDRIS" --platform x11 --display "$X_DISPLAY" \
     --listen "127.0.0.1:$PORT" --ticket-file "$work/ticket"

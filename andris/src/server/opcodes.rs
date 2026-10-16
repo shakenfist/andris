@@ -110,6 +110,16 @@ server_opcodes! {
         SurfaceCreate = display_server::SURFACE_CREATE,
         SurfaceDestroy = display_server::SURFACE_DESTROY,
         MonitorsConfig = display_server::MONITORS_CONFIG,
+        /// A video stream begins; see `server::updates::stream`.
+        StreamCreate = display_server::STREAM_CREATE,
+        /// One frame of a video stream.
+        StreamData = display_server::STREAM_DATA,
+        /// A video stream ends.
+        StreamDestroy = display_server::STREAM_DESTROY,
+        /// Every video stream ends, before the surface they are on goes.
+        StreamDestroyAll = display_server::STREAM_DESTROY_ALL,
+        /// Asks the client to report on a video stream.
+        StreamActivateReport = display_server::STREAM_ACTIVATE_REPORT,
     }
 }
 

@@ -363,17 +363,17 @@ its conventions in its `AGENTS.md`.
 
 | Step | Effort | Model | Isolation | Status | Brief for sub-agent |
 |------|--------|-------|-----------|--------|---------------------|
-| 0 | low | management | none | In progress | Commit the phase 7 close-out and this plan; create the ryll worktree. See brief 0. |
-| 1 | high | opus | none | Not started | Spike: openh264 in andris's image with nasm, bitrate changes, `Send`, and the e2e picture source. Gated. See brief 1. |
-| 2 | high | opus | none | Not started | Ryll: move the H.264 encoder, advertise H.264, fix the stride, add `stats`. Ryll PR. See brief 2. |
-| 3 | medium | sonnet | none | Not started | Andris: bump the ryll pin, add nasm to the image. See brief 3. |
-| 4 | high | opus | none | Not started | The stream lifecycle on the display channel: caps, opcodes, encoder, create/data/destroy, reports parsed. See brief 4. |
-| 5 | high | opus | none | Not started | Detection, the frame path inside a stream, teardown and lossless repair. See brief 5. |
-| 6 | high | opus | none | Not started | Rate control from reports and server drops; metrics fields. See brief 6. |
-| 7 | high | opus | none | Not started | End-to-end checks: `make e2e` and one `make e2e-xrdp` check. See brief 7. |
-| 8 | medium | sonnet | none | Not started | Documentation. See brief 8. |
+| 0 | low | management | none | Complete | Commit the phase 7 close-out and this plan; create the ryll worktree. See brief 0. |
+| 1 | high | opus | none | Complete | Spike: openh264 in andris's image with nasm, bitrate changes, `Send`, and the e2e picture source. Gated. See brief 1. |
+| 2 | high | opus | none | Complete | Ryll: move the H.264 encoder, advertise H.264, fix the stride, add `stats`. Ryll PR. See brief 2. |
+| 3 | medium | sonnet | none | Complete | Andris: bump the ryll pin, add nasm to the image. See brief 3. |
+| 4 | high | opus | none | Complete | The stream lifecycle on the display channel: caps, opcodes, encoder, create/data/destroy, reports parsed. See brief 4. |
+| 5 | high | opus | none | Complete | Detection, the frame path inside a stream, teardown and lossless repair. See brief 5. |
+| 6 | high | opus | none | Complete | Rate control from reports and server drops; metrics fields. See brief 6. |
+| 7 | high | opus | none | Complete | End-to-end checks: `make e2e` and one `make e2e-xrdp` check. See brief 7. |
+| 8 | medium | sonnet | none | Complete | Documentation. See brief 8. |
 | 9 | medium | management | none | Not started | Operator acceptance on `:10`, with a video. See brief 9. |
-| 10 | medium | management | none | Not started | Push audit, pull request, queue. See brief 10. |
+| 10 | medium | management | none | In progress | Push audit, pull request, queue. See brief 10. |
 
 Steps 1 and 2 may run in parallel, but step 2's encoder API waits for
 step 1's bitrate finding. Step 3 needs step 2's ryll pull request
@@ -671,8 +671,151 @@ open the pull request when the operator asks.
 
 Filled in as the steps complete.
 
+### Step 1: spike
+
+Measured in the `andris-dev` image on a Ryzen 7 8845HS, with other
+builds running (two runs agreed within about 5%). The content was
+drifting gradients with ±12 per-channel noise changing each frame, at
+ryll's bitrate formula for 30 fps. Times are median / p95 ms per frame,
+including BGRA to I420:
+
+| Size | nasm, 1 slice | nasm, 4 slices | no nasm, 1 slice | Bytes/frame |
+|------|---------------|----------------|------------------|-------------|
+| 320×240 | 0.66 / 0.79 | 0.33 / 0.56 | 1.90 / 2.49 | 3164 |
+| 640×360 | 1.69 / 2.21 | 0.93 / 1.69 | 5.03 / 6.60 | 4165 |
+| 1280×720 | 6.62 / 9.12 | 3.46 / 6.10 | 18.8 / 25.6 | 11524 |
+| 1920×1080 | 15.8 / 21.1 | 7.20 / 12.5 | 42.8 / 57.4 | 25898 |
+
+- **The frame budget.** Single-sliced 1080p with nasm exceeds half of
+  a 33 ms frame at p95, which the risk table said would cap the stream
+  area. Four slices (`SM_FIXEDSLCNUM_SLICE`, set through the raw
+  `ENCODER_OPTION_SVC_ENCODE_PARAM_EXT`) bring it to 12.5 ms at p95,
+  for 0–4% more bytes, so the encoder uses slices instead and the area
+  is not capped. `num_threads(0)` alone does nothing, because the crate
+  forces a single slice.
+- **Conversion.** `YUVBuffer::read_bgra8` takes 0.8 ms at 1080p; ryll's
+  per-pixel `from_rgb_source` takes 12.7 ms. The moved encoder uses the
+  former.
+- **Bitrate changes in place**, through `raw_api().set_option` with
+  `ENCODER_OPTION_BITRATE`; output follows within 1–5 frames. A raise
+  above the creation rate must first lift `ENCODER_OPTION_MAX_BITRATE`
+  on `SPATIAL_LAYER_0` (on `SPATIAL_LAYER_ALL` it returns success and
+  does nothing). Options apply only after the first encode. No
+  re-creation is needed.
+- **Two traps.** `ScreenContentRealTime` silently clamps the default
+  QP range to 26–35, so targets above about 2.4 Mbit/s at 640×360 and
+  low targets are both unreachable; an explicit `QpRange` with a
+  minimum of 12 or more fixes it. Bitrate mode budgets each frame as
+  target ÷ frame rate, ignoring timestamps, so rate control must keep
+  `ENCODER_OPTION_FRAME_RATE` at the observed frame rate.
+- **Other answers.** `Encoder` is `Send` and `Sync`. A skipped frame
+  is `FrameType::Skip` with no bytes. Ryll's `video::for_stream(3, …)`
+  decoded every frame of every case. The nasm build's script output
+  has no "Failed to compile NASM files"; the no-nasm build's does,
+  visible only under `cargo -vv`.
+- **Picture source.** A python-xlib script holds 25.0 fps over
+  320×240 for about 4% of a core, and Xvfb reports 25 repaints a
+  second over the area, with none once frozen. It is kept for step 7.
+
 ## Back brief
 
 Before executing any step of this plan, please back brief the operator
 as to your understanding of the plan and how the work you intend to do
 aligns with that plan.
+
+### Step 2: ryll
+
+Ryll's half merged as ryll#552 (`a157ced`), in four commits: the
+stream crop fix, H.264 advertised after MJPEG with `--no-h264`, the
+control socket's `stats` verb (protocol 1.4, closing ryll#512), and
+the encoder's move into `shakenfist-spice-compression` with the API
+the spike called for. Two choices departed from the brief:
+
+- **Ryll's own output stays at one slice.** Its WebRTC encoder uses
+  the moved encoder through a thin adapter, and browsers have not been
+  tried with multi-slice frames. Andris gets four.
+- **The spice-streaming-agent exception.** spice-server offers a
+  streaming agent every codec the client has caps for, ignoring the
+  client's order, so such a guest may now choose H.264 and hit
+  ryll#398. The operator accepted this on 2026-10-16; `--no-h264` is
+  the workaround (ryll#547).
+
+The PR merged before its review round was pushed, so that round went
+to ryll#554. Gaps found along the way are ryll#543 to ryll#551.
+
+### Steps 3 to 8: andris
+
+- **Step 3** pinned ryll at `a157ced` and added nasm; a release build
+  assembles openh264's SIMD objects.
+- **Step 4** added the stream lifecycle. A "cannot decode" report is
+  honoured whatever its `unique_id`, because spice-gtk sends it zeroed.
+- **Step 5** added the heat map, the frame path and teardown. A
+  stream's tiles stay lossy, due after it would end, so the lossless
+  refresh never paints into a live stream; teardown makes them due at
+  once and forgets their heat, so the area needs 20 fresh frames to
+  stream again.
+- **Step 6** added rate control and metrics. Stream frames have their
+  own metrics block rather than an `ENCODINGS` slot, since they have
+  no image type and are not lossy draws.
+- **Step 7** added `scripts/e2e-video.py`, the e2e video and
+  `--no-h264` checks, and X12. Ryll's reports showed 76–80 ms of the
+  80 ms budget left and no late frames, so decision 6 holds on
+  loopback.
+- **Step 8** documented all of it.
+
+**A finding that changed ryll a second time.** Step 7's e2e streamed
+at 8 fps: openh264's `ScreenContentRealTime` usage, in bitrate mode,
+holds P-frames at the bottom of the QP range and meets the target only
+by skipping frames (24 of 76 sent). `CameraVideoRealTime` fits each
+frame to the target at the full rate. Ryll#557 (`49072fc`) added
+`H264Content`, andris's streams ask for `Video`, and the frame-rate
+hysteresis dropped from 20% to 10%. The e2e stream now decodes 73
+frames where it decoded 25. Ryll#557 first failed `cargo deny` on a
+yanked `zip` 9.0.2 in ryll's lockfile, which ryll#558 fixed; v0.2.0
+shipped with that `zip` and without `H264Content`, so ryll v0.2.1 is
+needed before operator acceptance can use a released ryll.
+
+### Step 10: push audit
+
+Wave 1 (pre-commit, `make lint`, `make test`) passed after a rebase
+onto develop. Wave 2 found nothing critical, high or medium. Taken:
+
+- **Tests:** capture failures while streaming (the stream rides them
+  out with one warning, as draws do, rather than turning streams off:
+  an xrdp resize causes runs of them); short, empty and over-long
+  stream reports; extreme report values; a resize with no stream ever.
+- **Security (low):** an area larger than the encoder's 3840×2160 is
+  no longer chosen as a stream, rather than failing the encoder and
+  turning streams off. `put_back` over a live stream is an error, and
+  each tile's heat history is capped at 120 changes.
+- **Code quality:** the video tests moved to `tests/stream.rs`.
+- **Docs:** what a client without `STREAM_REPORT` gets, the size
+  limit, and a plan reference out of the Dockerfile.
+
+Declined, with reasons:
+
+- **The local `CODEC_TYPE_H264`.** Ryll's constant is behind its
+  decoder feature, which andris's build must not enable; ryll#555
+  tracks moving it to the protocol crate.
+- **Splitting `display.rs`** (1,187 lines). It is under the 1,500
+  lines that want a stated reason; the stream methods are the seam if
+  it grows.
+- **Type hints in the e2e scripts.** No andris script has them, and
+  there is no mypy setup.
+- **Timing-bound integration tests**, at first: they had roughly 2×
+  margin and had not flaked. Andris#21's review round then saw three
+  fail with the host at load 19, so they now read until a condition
+  holds, and a test expecting no stream watches for twice the frames a
+  stream needs; the stream suite passes under a 16-core busy loop.
+- **The encoder-internal failure path** has no integration test: it
+  cannot be reached without a fault-injection hook in production
+  code. It shares its handling with "cannot decode", which is tested.
+
+### Andris#21 review
+
+The review found that a stream's partly covered edge tiles were drawn
+into the live stream on every frame and could be refreshed into it.
+Streams are now whole tiles, shrunk to the tiles they cover wholly, so
+one set of tiles serves every purpose. A "cannot decode" report now
+needs a zeroed or matching `unique_id`. The per-frame heat rescan was
+declined: about a millisecond at 4K, with the history capped.

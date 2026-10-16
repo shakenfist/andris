@@ -272,7 +272,8 @@ losslessly once they have gone half a second without changing. That
 refresh is a frame of its own, followed by a `MARK`, and waits for the
 frame rate cap and for a slow client like any frame. A still screen
 therefore always ends up exact, while an area that keeps changing,
-such as a video, stays JPEG for as long as it changes.
+such as a video, stays JPEG for as long as it changes, unless the
+client can take it as a [video stream](#video-streams).
 
 **Keys.** Keys are typed by position, not by character. The client's
 scancodes become evdev key codes, and those become whichever
@@ -343,11 +344,92 @@ for the connection, not one for each request. RandR is optional:
 without it, or without RandR 1.2, andris still serves the desktop and
 refuses every resize in the same way.
 
+### Video streams
+
+An area that keeps changing like a video can go to the client as an
+H.264 stream rather than as a JPEG for every frame. Andris starts one
+when a region of the desktop has changed in at least 20 frames within
+two seconds, with no gap over 200 ms between changes, and at least a
+fifth of those changes went out as JPEG, so it looks photographic.
+The region must be at least 128 pixels each way, and at most 3840 by
+2160, either way round, which is the most the encoder takes; a larger
+one stays on JPEG draws whole, rather than being streamed in part.
+A stream is made of whole 64-pixel tiles with even sides, so where a
+video reaches an edge of the desktop whose size is odd, the last few
+pixels along that edge go as draws.
+Text, a scrolling terminal or a progress bar changes as often but
+compresses well, goes as LZ4, and never streams; neither does anything
+when JPEG is off (see above), since a client that asked for exact
+pixels gets them.
+There is at most one stream on a connection, the largest such region.
+
+Inside the stream's rectangle, each frame that changes any of it goes
+out as one stream frame of the whole rectangle, in place of draws.
+Everything else on the desktop is drawn as usual. A stream ends after
+a second without a change in its rectangle, or when the changing area
+grows to more than twice its size (a video window enlarged or moved),
+and detection then starts afresh. A resize of the desktop ends it too.
+When it ends, the stream's area is sent again losslessly at once, so
+that text near a paused video, or the paused picture, is exact in
+about a second.
+
+A client gets streams only if it advertises both the `MULTI_CODEC` and
+`CODEC_H264` display capabilities; andris encodes only H.264, so the
+client's codec preference order changes nothing. Any other client gets
+JPEG draws, as above. Ryll advertises H.264 after MJPEG, and
+`--no-h264` turns that off; a ryll older than that change
+([ryll#552](https://github.com/shakenfist/ryll/pull/552)) gets JPEG
+draws. A client that reports it cannot decode a stream, or an encoder
+failure, ends the stream and stops any more on that connection, with
+one warning.
+
+Andris tunes the encoder for video and gives it a bitrate budget for
+the stream's size and frame rate. It asks the client for a report
+every five frames, and lowers the budget quickly when the client says
+frames are late or arriving with little time to spare, or when the ack
+window is full (a server drop) twice in a second. It raises it by a
+tenth after two seconds of clean reports, never above its starting
+budget or below 256 kbit/s. It also keeps the encoder's frame-rate
+budget near the rate it really sends at, since a stream sends frames
+only when its area changes. When the encoder skips a frame to hold the
+budget, nothing is sent for it. A client without the `STREAM_REPORT`
+display capability still gets streams, but is never asked for reports,
+so only server drops lower its budget, and nothing raises it.
+
+Each frame is timestamped 80 ms after it was captured, which is the
+latency budget: a client counts a frame late only when sending it took
+longer. A client that presents frames at their timestamp, such as
+spice-gtk and remote-viewer, therefore shows a stream up to 80 ms
+behind the desktop. Ryll paints frames as they arrive and pays
+nothing.
+
+Andris logs at info when a stream starts, with its rectangle and the
+bitrate it aims for, and when it ends, with why:
+
+```
+starting a video stream session=1 stream=0 rect=320x256+64+64 target_kbps=1000
+ending a video stream session=1 stream=0 why=it has been still
+```
+
+The reasons are `it has been still`, `a changing area has outgrown it`,
+`the client cannot decode it` and `encoding failed`, with the error.
+At debug, the display channel also logs each client report and each
+bitrate change. The [metrics](#metrics) line counts streams.
+
+**Patents.** The H.264 encoder is Cisco's openh264, whose code is
+BSD-2-Clause. Andris builds it from source, as ryll does, and a build
+from source carries none of Cisco's patent licence, which covers only
+Cisco's own binary downloaded onto the user's machine. Whether
+andris's packages ship the compiled encoder is undecided. This is a
+statement of the position, not legal advice; if H.264 patents matter
+to you, check them for your use.
+
 ### Not supported
 
 - Clipboard images and the `PRIMARY` selection, and any resize the X
   server refuses.
-- No video streams: the desktop is always sent as images.
+- Video streams for clients without H.264, and more than one stream
+  at a time.
 - No audio.
 - One client at a time.
 
@@ -375,7 +457,7 @@ Nothing is logged for an interval in which no frame or refresh was sent, so an
 idle desktop is silent. A line reads:
 
 ```
-metrics: 12.4 fps (1 refreshes), draws lz4=118 bitmap=0 jpeg=6, display 842 kbit/s, capture 1.8 ms, encode 3.2 ms, ack lag 4.1 ms, ping 0.6 ms, scrub tiles 0, changed 31.5% of captured
+metrics: 12.4 fps (1 refreshes), draws lz4=118 bitmap=0 jpeg=6, display 842 kbit/s, capture 1.8 ms, encode 3.2 ms, ack lag 4.1 ms, ping 0.6 ms, scrub tiles 0, changed 31.5% of captured, streams created=0 destroyed=0, stream frames 0 at 0 kbit/s, stream encode - ms, server drops 0, stream target -
 ```
 
 - `fps` is frames per second over the interval, and `refreshes` how
@@ -394,6 +476,17 @@ metrics: 12.4 fps (1 refreshes), draws lz4=118 bitmap=0 jpeg=6, display 842 kbit
 - `changed` is the share of captured pixels that had actually
   changed; a low figure means damage reports are coarser than the
   real changes.
+- `streams created` and `destroyed` count [video streams](#video-streams)
+  started and ended in the interval. `stream frames` is how many
+  stream frames were sent, and `at` what `kbit/s`; they are not draws,
+  nor counted in `fps`.
+- `stream encode` is the mean milliseconds to capture and encode a
+  stream frame.
+- `server drops` is how many stream frames were skipped because the
+  client had too much unacknowledged.
+- `stream target` is the live stream's target bitrate, or `-` with
+  none. Many creations and destructions in one interval mean streams
+  are flapping.
 
 A `-` means there was nothing to average in the interval.
 
@@ -414,10 +507,12 @@ line and the startup log:
   slow, such as under software rendering. A large `encode` means a lot
   of pixels are changing, or a lot are being sent as JPEG.
 - A high `fps` that sits at the cap (about 30 at the default) is a
-  desktop that never stops changing, such as a video. Raising
+  desktop that never stops changing, such as a video that is not
+  streaming (see [Video streams](#video-streams)). Raising
   `--frame-interval-ms` lowers the frame rate, and so the CPU use, at
   the price of smoothness; `--jpeg-quality 0` removes JPEG's encode
-  cost.
+  cost, and with it any streaming. A video that streams costs the H.264
+  encode instead, shown as `stream encode`.
 - A steadily nonzero `scrub tiles` means the X server is missing
   damage, so the scrub is doing real work; a `changed` figure that is
   low means damage reports are coarse and most of each capture is

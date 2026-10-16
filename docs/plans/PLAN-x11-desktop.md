@@ -601,6 +601,12 @@ file) and keep its status in step with the Execution table.
   which SPICE avoids.
 - Video streams for clients without H.264, as MJPEG. An MJPEG stream
   would cost about what JPEG draws do now, so phase 8 left it out.
+- Growing a video stream that covers only part of a video. Phase 8's
+  operator acceptance saw a stream hold the lower half of a resumed
+  video for 23 s, likely because the whole video is 1.83 times its
+  area and a stream is replaced only by a cluster more than twice its
+  size; the upper half went as JPEG at up to 38 Mbit/s meanwhile. A
+  cluster that contains the stream could replace it whatever its size.
 - VA-API H.264 encode; multi-monitor; the record channel
   (microphone); usbredir and webdav; several simultaneous viewers.
 - Kerbside L2 inspection reusing the phase 2 wire types.

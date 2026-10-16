@@ -372,8 +372,8 @@ its conventions in its `AGENTS.md`.
 | 6 | high | opus | none | Complete | Rate control from reports and server drops; metrics fields. See brief 6. |
 | 7 | high | opus | none | Complete | End-to-end checks: `make e2e` and one `make e2e-xrdp` check. See brief 7. |
 | 8 | medium | sonnet | none | Complete | Documentation. See brief 8. |
-| 9 | medium | management | none | Not started | Operator acceptance on `:10`, with a video. See brief 9. |
-| 10 | medium | management | none | In progress | Push audit, pull request, queue. See brief 10. |
+| 9 | medium | management | none | Complete | Operator acceptance on `:10`, with a video. See brief 9. |
+| 10 | medium | management | none | Complete | Push audit, pull request, queue. See brief 10. |
 
 Steps 1 and 2 may run in parallel, but step 2's encoder API waits for
 step 1's bitrate finding. Step 3 needs step 2's ryll pull request
@@ -667,6 +667,12 @@ open the pull request when the operator asks.
   carries the patent question to phase 10, and every ryll gap found
   has an issue.
 
+## Back brief
+
+Before executing any step of this plan, please back brief the operator
+as to your understanding of the plan and how the work you intend to do
+aligns with that plan.
+
 ## Result
 
 Filled in as the steps complete.
@@ -716,12 +722,6 @@ including BGRA to I420:
 - **Picture source.** A python-xlib script holds 25.0 fps over
   320×240 for about 4% of a core, and Xvfb reports 25 repaints a
   second over the area, with none once frozen. It is kept for step 7.
-
-## Back brief
-
-Before executing any step of this plan, please back brief the operator
-as to your understanding of the plan and how the work you intend to do
-aligns with that plan.
 
 ### Step 2: ryll
 
@@ -819,3 +819,38 @@ Streams are now whole tiles, shrunk to the tiles they cover wholly, so
 one set of tiles serves every purpose. A "cannot decode" report now
 needs a zeroed or matching `unique_id`. The per-frame heat rescan was
 declined: about a millisecond at 4K, with the history capped.
+
+### Step 9: operator acceptance
+
+On 2026-10-17, on `:10` (2266×1352), with the Mac's ryll built from
+develop (it carries ryll#552 and ryll#557; v0.2.1 is not yet out) and
+andris built from develop at `c2fe8a7`. The operator played a video in
+a browser, paused it, typed in a terminal, then resumed the video.
+Andris's log, read through `journalctl`, gave the numbers. Every check
+passed, and playback looked smooth to the operator.
+
+- **Playback.** The video was already playing when ryll connected.
+  Three streams were made and ended as "outgrown" within three
+  seconds, as the hot area grew to the whole video; the fourth,
+  1152×704, then ran for about three minutes.
+- **No flapping.** That stream ran throughout with no other created or
+  destroyed, no server drops, and the target steady at 2433 kbit/s. It
+  sent about 27 fps at 1.1–2.4 Mbit/s, encoding a frame in 2.3–3.4 ms.
+- **Pause.** The stream ended as "it has been still" when the video
+  was paused, and the operator saw the area sharp afterwards.
+- **Typing.** For the 28 minutes after the pause, with typing in a
+  terminal and two clipboard pastes, no stream was made, and ack lag
+  stayed at 1–3 ms.
+- **Edge tiles cost little.** A stream covers only whole tiles, so the
+  video's partly covered edge tiles go as draws on every frame. While
+  the stream ran, the display channel's bytes beside the stream were
+  0.5–1.3 Mbit/s, about what the idle desktop sends.
+
+One finding, recorded in the master plan's Future work: **when the
+video was resumed, a stream covered only half of it.** Five streams
+came and went in 43 s; one, 1152×384, covered the video's lower half
+for 23 s while the upper half went as JPEG and LZ4 draws, at 15–38
+Mbit/s beside a stream of about 1 Mbit/s. The likely cause: the whole
+video is 1.83 times that stream's area, short of `OUTGROWN_FACTOR`'s
+2, so a cluster covering it could not replace the stream. Playback still looked right; it cost
+bandwidth, not correctness.

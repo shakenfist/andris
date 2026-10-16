@@ -742,3 +742,35 @@ the spike called for. Two choices departed from the brief:
 
 The PR merged before its review round was pushed, so that round went
 to ryll#554. Gaps found along the way are ryll#543 to ryll#551.
+
+### Steps 3 to 8: andris
+
+- **Step 3** pinned ryll at `a157ced` and added nasm; a release build
+  assembles openh264's SIMD objects.
+- **Step 4** added the stream lifecycle. A "cannot decode" report is
+  honoured whatever its `unique_id`, because spice-gtk sends it zeroed.
+- **Step 5** added the heat map, the frame path and teardown. A
+  stream's tiles stay lossy, due after it would end, so the lossless
+  refresh never paints into a live stream; teardown makes them due at
+  once and forgets their heat, so the area needs 20 fresh frames to
+  stream again.
+- **Step 6** added rate control and metrics. Stream frames have their
+  own metrics block rather than an `ENCODINGS` slot, since they have
+  no image type and are not lossy draws.
+- **Step 7** added `scripts/e2e-video.py`, the e2e video and
+  `--no-h264` checks, and X12. Ryll's reports showed 76–80 ms of the
+  80 ms budget left and no late frames, so decision 6 holds on
+  loopback.
+- **Step 8** documented all of it.
+
+**A finding that changed ryll a second time.** Step 7's e2e streamed
+at 8 fps: openh264's `ScreenContentRealTime` usage, in bitrate mode,
+holds P-frames at the bottom of the QP range and meets the target only
+by skipping frames (24 of 76 sent). `CameraVideoRealTime` fits each
+frame to the target at the full rate. Ryll#557 (`49072fc`) added
+`H264Content`, andris's streams ask for `Video`, and the frame-rate
+hysteresis dropped from 20% to 10%. The e2e stream now decodes 73
+frames where it decoded 25. Ryll#557 first failed `cargo deny` on a
+yanked `zip` 9.0.2 in ryll's lockfile, which ryll#558 fixed; v0.2.0
+shipped with that `zip` and without `H264Content`, so ryll v0.2.1 is
+needed before operator acceptance can use a released ryll.

@@ -593,6 +593,14 @@ file) and keep its status in step with the Execution table.
   into their own repository. The trigger is phase 4 merging: at
   that point andris is the third real consumer, beside ryll and
   kerbside, and the shared surface is known.
+- Several simultaneous video streams on one display channel. Phase 8
+  allows one, the largest qualifying area, which suits one video on a
+  desktop and keeps rate control and teardown simple.
+- Whole-screen H.264, as xrdp and gnome-remote-desktop do. It is a
+  different design from streaming photographic areas, and blurs text,
+  which SPICE avoids.
+- Video streams for clients without H.264, as MJPEG. An MJPEG stream
+  would cost about what JPEG draws do now, so phase 8 left it out.
 - VA-API H.264 encode; multi-monitor; the record channel
   (microphone); usbredir and webdav; several simultaneous viewers.
 - Kerbside L2 inspection reusing the phase 2 wire types.

@@ -16,9 +16,12 @@ Docker. Nothing else is needed on the host, and in particular no
 Rust toolchain: every cargo invocation runs inside a devcontainer
 built from
 [`.devcontainer/Dockerfile`](https://github.com/shakenfist/andris/blob/develop/.devcontainer/Dockerfile)
-(Debian with a C toolchain, `pkg-config`, and stable Rust with
-rustfmt and clippy). Run `make` targets as an ordinary user in the
-docker group; the container runs as your uid and gid.
+(Debian with a C toolchain, `pkg-config`, `nasm` and stable Rust with
+rustfmt and clippy). `nasm` is for openh264, which andris builds from
+source for its H.264 encoder: without it the crate silently skips its
+assembly, and a 1080p frame takes about 2.7 times as long to encode.
+Run `make` targets as an ordinary user in the docker group; the
+container runs as your uid and gid.
 
 ## Make targets
 
@@ -90,10 +93,27 @@ ryll's control socket:
   ryll as a new surface; two sizes larger than Xvfb's `-screen` size
   are refused, andris logs the refusal once, and the surface keeps its
   size. The resize checks read andris's log, and ryll's, whose debug
-  lines record each agent reply.
+  lines record each agent reply;
+- **video**: [`scripts/e2e-video.py`](https://github.com/shakenfist/andris/blob/develop/scripts/e2e-video.py)
+  paints a moving 320x240 photographic pattern at about 25 frames a
+  second beside a static text area. Within 15 seconds ryll's `stats`
+  show one H.264 stream decoding frames, which keeps decoding for
+  three more seconds with no decode failure and no second stream, and
+  andris logs a stream rectangle that covers the video and not the
+  text. When the picture stops, the stream must be destroyed within two
+  seconds, and within two more a screenshot of the area must match the
+  picture's last frame exactly, which shows the lossless repair.
+  Andris runs with debug logging for its display channel so the driver
+  can summarise the client's stream reports and the bitrate changes.
+
+After ryll stops, andris's session-end metrics line must count one
+stream created and destroyed. A second ryll, started with `--no-h264`,
+then watches the same picture for five seconds: it must see no stream
+created, and andris's session-end line for it must count JPEG draws
+and no stream.
 
 It also checks ryll's log for all four channels, and stops ryll with
-SIGINT and andris with SIGTERM; both must exit 0. Last, it starts a
+SIGINT and andris with SIGTERM; all three must exit 0. Last, it starts a
 second andris against the same display and kills Xvfb under it: that
 andris must exit 1 within ten seconds, logging that the desktop has
 gone and why. It fails if the first andris logs an `ERROR`, and prints
@@ -141,6 +161,10 @@ checks, after a smoke test, that:
 - a resize from ryll is refused, since xorgxrdp does not let clients
   resize it: andris logs it once, ryll keeps the session's size, and an
   RDP resize afterwards still reaches ryll;
+- a moving picture played in the session (X12), which xorgxrdp also
+  sends to FreeRDP, becomes one H.264 stream that ryll decodes with no
+  failure and is destroyed once the picture stops, while FreeRDP stays
+  connected and logs no error;
 - ending the session makes andris exit with status 1.
 
 Every clipboard check copies text not used before, because FreeRDP

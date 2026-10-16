@@ -77,17 +77,17 @@ pub use encode::{
 };
 use encode::{encode_draw, split};
 pub use heat::{
-    Candidate, Choice, HOT_FRAMES, HOT_MAX_GAP, HOT_WINDOW, HeatMap, MIN_PHOTOGRAPHIC_PERCENT,
-    MIN_STREAM_SIDE, OUTGROWN_FACTOR, choose,
+    Candidate, Choice, HOT_FRAMES, HOT_MAX_GAP, HOT_WINDOW, HeatMap, MAX_TILE_CHANGES,
+    MIN_PHOTOGRAPHIC_PERCENT, MIN_STREAM_SIDE, OUTGROWN_FACTOR, choose,
 };
 pub use lossy::LossyTiles;
 use shadow::Shadow;
 pub use stream::{
     CLEAN_PERIOD, CODEC_TYPE_H264, Encoded, FRAME_RATE_HYSTERESIS_PERCENT, FRAME_RATE_WINDOW,
-    LOW_HEADROOM, MIN_STREAM_BITRATE_BPS, RAISE_PERCENT, REPORT_TIMEOUT, REPORT_WINDOW, RateChange,
-    RateControl, RateEvent, RateReason, ReportVerdict, SERVER_DROP_WINDOW, STREAM_IDS,
-    STREAM_LATENCY_BUDGET, STREAM_QUIET, Stream, StreamCaps, Streams, frames_per_second,
-    multi_media_time,
+    LOW_HEADROOM, MAX_STREAM_LONG_SIDE, MAX_STREAM_SHORT_SIDE, MIN_STREAM_BITRATE_BPS,
+    RAISE_PERCENT, REPORT_TIMEOUT, REPORT_WINDOW, RateChange, RateControl, RateEvent, RateReason,
+    ReportVerdict, SERVER_DROP_WINDOW, STREAM_IDS, STREAM_LATENCY_BUDGET, STREAM_QUIET, Stream,
+    StreamCaps, Streams, fits_encoder, frames_per_second, multi_media_time,
 };
 
 use crate::platform::{Capture, Rectangle, Region, Size};

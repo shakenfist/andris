@@ -10,6 +10,8 @@
 // allow-unwrap-in-tests covers only #[test] functions themselves.
 #![allow(clippy::unwrap_used)]
 
+pub mod display;
+
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;

@@ -351,10 +351,13 @@ H.264 stream rather than as a JPEG for every frame. Andris starts one
 when a region of the desktop has changed in at least 20 frames within
 two seconds, with no gap over 200 ms between changes, and at least a
 fifth of those changes went out as JPEG, so it looks photographic.
-The region must be at least 128 pixels each way. Text, a scrolling
-terminal or a progress bar changes as often but compresses well, goes
-as LZ4, and never streams; neither does anything when JPEG is off
-(see above), since a client that asked for exact pixels gets them.
+The region must be at least 128 pixels each way, and at most 3840 by
+2160, either way round, which is the most the encoder takes; a larger
+one stays on JPEG draws whole, rather than being streamed in part.
+Text, a scrolling terminal or a progress bar changes as often but
+compresses well, goes as LZ4, and never streams; neither does anything
+when JPEG is off (see above), since a client that asked for exact
+pixels gets them.
 There is at most one stream on a connection, the largest such region.
 
 Inside the stream's rectangle, each frame that changes any of it goes
@@ -386,7 +389,9 @@ tenth after two seconds of clean reports, never above its starting
 budget or below 256 kbit/s. It also keeps the encoder's frame-rate
 budget near the rate it really sends at, since a stream sends frames
 only when its area changes. When the encoder skips a frame to hold the
-budget, nothing is sent for it.
+budget, nothing is sent for it. A client without the `STREAM_REPORT`
+display capability still gets streams, but is never asked for reports,
+so only server drops lower its budget, and nothing raises it.
 
 Each frame is timestamped 80 ms after it was captured, which is the
 latency budget: a client counts a frame late only when sending it took

@@ -8,7 +8,6 @@ FROM mcr.microsoft.com/devcontainers/base:debian
 #     shakenfist-spice-protocol)
 #   - nasm: openh264's assembly; without it the openh264 crate silently
 #     skips its SIMD code, and a 1080p encode takes about 2.7x as long
-#     (phase 8 spike)
 RUN apt-get update && apt-get install -y \
     build-essential \
     pkg-config \

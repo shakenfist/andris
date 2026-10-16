@@ -30,14 +30,19 @@
 //! never gets a stream, which is deliberate: it asked for exact pixels.
 //!
 //! [`choose`] then decides, for one channel's one stream: the largest
-//! candidate starts a stream, and while one lives, a candidate that
-//! outgrows it ends it.
+//! candidate the encoder can take starts a stream, and while one lives,
+//! a candidate that outgrows it ends it.
+//!
+//! Each tile keeps at most [`MAX_TILE_CHANGES`] changes, so its history
+//! stays bounded whatever the frame interval.
 
 use std::collections::VecDeque;
 use std::time::Duration;
 
 use tokio::time::Instant;
 
+use super::stream::fits_encoder;
+use crate::config::MIN_FRAME_INTERVAL_MS;
 use crate::platform::{Rectangle, Region, Size, TILE};
 
 /// How many frames must change a tile, within [`HOT_WINDOW`], for it to
@@ -64,6 +69,14 @@ pub const MIN_PHOTOGRAPHIC_PERCENT: usize = 20;
 /// spice-server's 96 pixels, so that a single busy tile, such as a
 /// spinner, never streams.
 pub const MIN_STREAM_SIDE: u32 = 2 * TILE;
+
+/// The most changes a tile keeps: as many frames as fit in
+/// [`HOT_WINDOW`] at the shortest `--frame-interval-ms`, and a hot run
+/// more. A tile changes at most once a frame, so this only binds when
+/// frames come faster than the command line allows, as in tests, and
+/// keeps a tile's history bounded whatever the frame interval.
+pub const MAX_TILE_CHANGES: usize =
+    (HOT_WINDOW.as_millis() / MIN_FRAME_INTERVAL_MS as u128) as usize + HOT_FRAMES;
 
 /// How many times its own area a live stream's cluster may grow to
 /// before the stream ends, so that detection can start afresh over the
@@ -100,14 +113,18 @@ pub enum Choice {
 /// What the display channel should do, given this frame's `candidates`
 /// and the `live` stream's rectangle, if one lives.
 ///
-/// Without a stream, the largest candidate starts one. With one, a
-/// candidate that touches it and is more than [`OUTGROWN_FACTOR`] times
-/// its area ends it; any other candidate waits until it has ended, since
-/// a channel has one stream at a time.
+/// Without a stream, the largest candidate the encoder can take
+/// ([`fits_encoder`]) starts one: a larger area is left to the draws
+/// whole, rather than streamed in part with the rest of it drawn. With a
+/// stream, a candidate that touches it and is more than
+/// [`OUTGROWN_FACTOR`] times its area ends it, however large; any other
+/// candidate waits until it has ended, since a channel has one stream
+/// at a time.
 pub fn choose(candidates: &[Candidate], live: Option<Rectangle>) -> Choice {
     match live {
         None => candidates
             .iter()
+            .filter(|candidate| fits_encoder(candidate.rect.width, candidate.rect.height))
             .max_by_key(|candidate| candidate.rect.area())
             .map_or(Choice::Stay, |candidate| Choice::Start(candidate.rect)),
         Some(stream) => {
@@ -169,6 +186,9 @@ impl HeatMap {
                 .front()
                 .is_some_and(|first| now.saturating_duration_since(first.at) > HOT_WINDOW)
             {
+                changes.pop_front();
+            }
+            if changes.len() >= MAX_TILE_CHANGES {
                 changes.pop_front();
             }
             changes.push_back(Change {
@@ -520,5 +540,51 @@ mod tests {
         }
         heat.forget(&other);
         assert!(heat.candidates(start + FRAME * 29).is_empty());
+    }
+
+    #[test]
+    fn a_tile_keeps_a_bounded_history_however_fast_frames_come() {
+        // A frame every millisecond, ten times the command line's fastest
+        // rate, for longer than the window.
+        let mut heat = HeatMap::new(SIZE);
+        let changed = region(&[VIDEO]);
+        let start = Instant::now();
+        let mut at = start;
+        for frame in 0..3000u32 {
+            at = start + Duration::from_millis(u64::from(frame));
+            heat.record(at, &changed, &changed);
+        }
+        assert_eq!(MAX_TILE_CHANGES, 120);
+        assert!(
+            heat.tiles
+                .iter()
+                .all(|changes| changes.len() <= MAX_TILE_CHANGES)
+        );
+        // Still hot.
+        assert_eq!(heat.candidates(at).len(), 1);
+    }
+
+    #[test]
+    fn an_area_too_large_to_encode_starts_no_stream() {
+        let candidate = |rect| Candidate { rect };
+        let huge = Rectangle::new(0, 256, 5120, 256);
+        let small = Rectangle::new(0, 0, 256, 256);
+        // The largest that fits wins; a larger one is left to the draws.
+        assert_eq!(
+            choose(&[candidate(huge), candidate(small)], None),
+            Choice::Start(small)
+        );
+        assert_eq!(choose(&[candidate(huge)], None), Choice::Stay);
+        // The encoder's largest frame fits, either way round.
+        let largest = Rectangle::new(0, 0, 3840, 2160);
+        assert_eq!(choose(&[candidate(largest)], None), Choice::Start(largest));
+        let portrait = Rectangle::new(0, 0, 2160, 3840);
+        assert_eq!(
+            choose(&[candidate(portrait)], None),
+            Choice::Start(portrait)
+        );
+        // But a live stream it outgrows still ends.
+        let stream = Rectangle::new(0, 256, 1024, 256);
+        assert_eq!(choose(&[candidate(huge)], Some(stream)), Choice::End);
     }
 }

@@ -987,12 +987,12 @@ impl Display {
         let (changed, frame) = match result {
             Ok(result) => result,
             Err(e) => {
-                self.streams.put_back(stream);
+                self.streams.put_back(stream)?;
                 return Err(e.context("bringing the shadow up to date with a stream's capture"));
             }
         };
         let Some(frame) = frame else {
-            self.streams.put_back(stream);
+            self.streams.put_back(stream)?;
             return Ok(None);
         };
         let counters = self.conn.session().counters();
@@ -1015,7 +1015,7 @@ impl Display {
         match frame.map(|encoded| encoded.frame) {
             Ok(Some(frame)) => {
                 let data = stream.data(frame, captured_at);
-                self.streams.put_back(stream);
+                self.streams.put_back(stream)?;
                 self.conn
                     .session()
                     .counters()
@@ -1028,7 +1028,7 @@ impl Display {
                     stream = stream.id(),
                     "the encoder skipped a frame to hold its bitrate"
                 );
-                self.streams.put_back(stream);
+                self.streams.put_back(stream)?;
             }
             Err(e) => {
                 self.disable_streams(Some(stream), &format!("encoding failed: {e:#}"))

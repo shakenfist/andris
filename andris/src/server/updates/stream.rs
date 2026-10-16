@@ -103,6 +103,21 @@ use crate::platform::{Frame, Rectangle, Region, Size};
 /// beside its decoders.
 pub const CODEC_TYPE_H264: u8 = 3;
 
+/// The longest side of a stream, and the longest its shorter side may
+/// be: the largest frame openh264 encodes, which ryll's `H264Encoder`
+/// refuses to be built beyond. An area larger than this is never
+/// streamed (see [`fits_encoder`]), rather than streamed in part.
+pub const MAX_STREAM_LONG_SIDE: u32 = 3840;
+pub const MAX_STREAM_SHORT_SIDE: u32 = 2160;
+
+/// Whether a `width` x `height` area, once rounded down to even sides,
+/// is small enough for the encoder: at most [`MAX_STREAM_LONG_SIDE`] on
+/// its longer side and [`MAX_STREAM_SHORT_SIDE`] on its shorter.
+pub fn fits_encoder(width: u32, height: u32) -> bool {
+    let (width, height) = even_dimensions(width, height);
+    width.max(height) <= MAX_STREAM_LONG_SIDE && width.min(height) <= MAX_STREAM_SHORT_SIDE
+}
+
 /// How many stream ids there are: ids cycle through 0 to 63.
 pub const STREAM_IDS: u32 = 64;
 
@@ -443,7 +458,9 @@ impl Streams {
         };
         let (width, height) = even_dimensions(clipped.width, clipped.height);
         let rect = Rectangle::new(clipped.x, clipped.y, width, height);
-        if rect.is_empty() {
+        // Too large an area is no stream, not a failure of the encoder:
+        // streams stay on for areas that fit.
+        if rect.is_empty() || !fits_encoder(width, height) {
             return Ok(None);
         }
         // Video, not screen content: openh264 holds a screen's bitrate by
@@ -482,10 +499,18 @@ impl Streams {
         self.live.take()
     }
 
-    /// Return a stream [`Streams::take`] took out.
-    pub fn put_back(&mut self, stream: Stream) {
-        debug_assert!(self.live.is_none(), "a stream was put back over another");
+    /// Return a stream [`Streams::take`] took out. Fails if another
+    /// stream has gone live meanwhile, which would be a bug: the caller
+    /// closes the channel rather than lose track of either.
+    pub fn put_back(&mut self, stream: Stream) -> Result<()> {
+        ensure!(
+            self.live.is_none(),
+            "stream {} was put back over live stream {}",
+            stream.id,
+            self.live.as_ref().map_or(0, |live| live.id)
+        );
         self.live = Some(stream);
+        Ok(())
     }
 
     /// End the live stream, returning it for its `STREAM_DESTROY`.
@@ -1124,7 +1149,7 @@ mod tests {
         .unwrap();
         let decoded = decoder.decode(&frame.data).unwrap().unwrap();
         assert_eq!((decoded.width, decoded.height), (96, 64));
-        streams.put_back(stream);
+        streams.put_back(stream).unwrap();
         assert_eq!(streams.live().unwrap().rect(), rect);
     }
 
@@ -1492,5 +1517,87 @@ mod tests {
         let config = stream.encoder.config();
         assert_eq!(config.content, H264Content::Video);
         assert!(config.skip_frames);
+    }
+
+    #[test]
+    fn an_area_too_large_to_encode_is_no_stream_and_leaves_streams_on() {
+        assert!(fits_encoder(3840, 2160));
+        assert!(fits_encoder(2160, 3840));
+        // Rounded down to even first.
+        assert!(fits_encoder(3841, 2161));
+        assert!(!fits_encoder(3842, 2160));
+        assert!(!fits_encoder(3840, 2162));
+        assert!(!fits_encoder(2162, 2162));
+
+        let size = Size {
+            width: 5120,
+            height: 2880,
+        };
+        let mut streams = streams(BOTH);
+        let now = Instant::now();
+        assert!(
+            streams
+                .start(Rectangle::new(0, 0, 4096, 256), size, now)
+                .unwrap()
+                .is_none()
+        );
+        assert!(streams.enabled(), "too large an area turned streams off");
+        let stream = streams
+            .start(Rectangle::new(0, 0, 3840, 2160), size, now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stream.rect(), Rectangle::new(0, 0, 3840, 2160));
+    }
+
+    #[test]
+    fn a_stream_put_back_over_a_live_one_is_an_error() {
+        let now = Instant::now();
+        let mut streams = streams(BOTH);
+        streams
+            .start(Rectangle::new(0, 0, 64, 64), SIZE, now)
+            .unwrap()
+            .unwrap();
+        let first = streams.take().unwrap();
+        streams
+            .start(Rectangle::new(64, 0, 64, 64), SIZE, now)
+            .unwrap()
+            .unwrap();
+        let err = streams.put_back(first).unwrap_err();
+        assert!(
+            err.to_string().contains("put back over live stream 1"),
+            "{err}"
+        );
+        assert_eq!(streams.live().unwrap().id(), 1);
+    }
+
+    #[test]
+    fn extreme_reports_are_late_frames() {
+        let now = Instant::now();
+        // The latest a frame can be.
+        let latest = StreamReport {
+            last_frame_delay: i32::MIN,
+            ..report(0, 0)
+        };
+        let mut rate = RateControl::new(CAP);
+        assert_eq!(
+            rate.adjust(RateEvent::from(&latest), now),
+            change(CAP, CAP / 2, RateReason::Late)
+        );
+        // More drops than frames is nonsense, but drops all the same.
+        let nonsense = StreamReport {
+            num_frames: 5,
+            num_drops: 9,
+            last_frame_delay: 60,
+            ..report(0, 0)
+        };
+        assert_eq!(
+            rate.adjust(RateEvent::from(&nonsense), now),
+            change(CAP / 2, CAP / 4, RateReason::Late)
+        );
+        assert_eq!(
+            RateEvent::from(&nonsense),
+            rated(5, 9, 60),
+            "the report's fields are taken as they are"
+        );
     }
 }

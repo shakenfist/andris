@@ -373,7 +373,7 @@ its conventions in its `AGENTS.md`.
 | 7 | high | opus | none | Complete | End-to-end checks: `make e2e` and one `make e2e-xrdp` check. See brief 7. |
 | 8 | medium | sonnet | none | Complete | Documentation. See brief 8. |
 | 9 | medium | management | none | Not started | Operator acceptance on `:10`, with a video. See brief 9. |
-| 10 | medium | management | none | Not started | Push audit, pull request, queue. See brief 10. |
+| 10 | medium | management | none | Complete | Push audit, pull request, queue. See brief 10. |
 
 Steps 1 and 2 may run in parallel, but step 2's encoder API waits for
 step 1's bitrate finding. Step 3 needs step 2's ryll pull request
@@ -774,3 +774,37 @@ frames where it decoded 25. Ryll#557 first failed `cargo deny` on a
 yanked `zip` 9.0.2 in ryll's lockfile, which ryll#558 fixed; v0.2.0
 shipped with that `zip` and without `H264Content`, so ryll v0.2.1 is
 needed before operator acceptance can use a released ryll.
+
+### Step 10: push audit
+
+Wave 1 (pre-commit, `make lint`, `make test`) passed after a rebase
+onto develop. Wave 2 found nothing critical, high or medium. Taken:
+
+- **Tests:** capture failures while streaming (the stream rides them
+  out with one warning, as draws do, rather than turning streams off:
+  an xrdp resize causes runs of them); short, empty and over-long
+  stream reports; extreme report values; a resize with no stream ever.
+- **Security (low):** an area larger than the encoder's 3840×2160 is
+  no longer chosen as a stream, rather than failing the encoder and
+  turning streams off. `put_back` over a live stream is an error, and
+  each tile's heat history is capped at 120 changes.
+- **Code quality:** the video tests moved to `tests/stream.rs`.
+- **Docs:** what a client without `STREAM_REPORT` gets, the size
+  limit, and a plan reference out of the Dockerfile.
+
+Declined, with reasons:
+
+- **The local `CODEC_TYPE_H264`.** Ryll's constant is behind its
+  decoder feature, which andris's build must not enable; ryll#555
+  tracks moving it to the protocol crate.
+- **Splitting `display.rs`** (1,187 lines). It is under the 1,500
+  lines that want a stated reason; the stream methods are the seam if
+  it grows.
+- **Type hints in the e2e scripts.** No andris script has them, and
+  there is no mypy setup.
+- **Timing-bound integration tests.** They are bounded lower limits
+  with roughly 2× margin, or a 1.5 s ceiling on a 1 s timeout; none
+  flaked in repeated runs.
+- **The encoder-internal failure path** has no integration test: it
+  cannot be reached without a fault-injection hook in production
+  code. It shares its handling with "cannot decode", which is tested.

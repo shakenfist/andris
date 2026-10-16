@@ -1,14 +1,24 @@
 # Andris - A Rust SPICE Server for an Existing X11 Desktop
 
-Andris is a SPICE (Simple Protocol for Independent
-Computing Environments) server, written in Rust, that exports an
-X11 desktop which is *already running* -- for example the Xorg
-session behind an xrdp connection -- rather than starting a desktop
-of its own. It is aimed at people who reach a Linux machine's
-desktop remotely and want to do so with a SPICE client, in
+Andris shares a Linux desktop that is *already running* over SPICE
+(Simple Protocol for Independent Computing Environments). It attaches
+to an existing X11 display and serves it to a SPICE client, in
 particular [ryll](https://github.com/shakenfist/ryll), optionally
 through the [kerbside](https://github.com/shakenfist/kerbside) SPICE
-proxy.
+proxy. It is written in Rust, and aimed at people who reach a Linux
+machine's desktop remotely and want to do so with a SPICE client.
+
+Andris connects to the display as an ordinary X client, so it works
+with any X server -- Xorg, the xorgxrdp session behind an xrdp
+connection, or Xvfb -- and it never starts a desktop of its own. That
+sets it apart from its neighbours: Xspice is an Xorg driver that
+starts a new display, and QEMU's SPICE server shows a virtual
+machine's screen. Its closest relative is x11spice. Its main use is
+the session behind xrdp, so that RDP and SPICE can show the same
+desktop at once.
+
+Andris does not support Wayland yet. Pointed at an XWayland display,
+it would see only the X applications on it, not the Wayland desktop.
 
 Andris is a sibling of ryll: it builds on ryll's shared
 `shakenfist-spice-*` protocol and compression crates, and sends only

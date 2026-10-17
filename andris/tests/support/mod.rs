@@ -14,7 +14,7 @@ pub mod display;
 
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use andris::config::Ticket;
@@ -36,8 +36,12 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
-/// The ticket every test server uses.
-pub const TICKET: &str = "andris-test-ticket";
+/// The ticket every test server in this process uses. It is random, so
+/// no test can depend on its value and none is written in the source.
+pub fn ticket() -> &'static str {
+    static TICKET: OnceLock<String> = OnceLock::new();
+    TICKET.get_or_init(|| format!("andris-test-{:016x}", rand::random::<u64>()))
+}
 
 /// How long any one wait may take. Generous, because RSA key generation
 /// in a debug build is slow, and several may run at once.
@@ -204,7 +208,7 @@ impl TestServer {
         let options = ServerOptions {
             listen: "127.0.0.1:0".parse().unwrap(),
             tls: tls_options,
-            ticket: Ticket::new(TICKET).unwrap(),
+            ticket: Ticket::new(ticket()).unwrap(),
             display,
             timeouts,
         };
@@ -265,7 +269,7 @@ impl TestServer {
             .link_with_caps(connection_id, channel_type, channel_caps)
             .await;
         assert_eq!(reply.error, SpiceError::Ok, "linking {channel_type:?}");
-        client.auth(TICKET).await.unwrap();
+        client.auth(ticket()).await.unwrap();
         client
     }
 
@@ -295,7 +299,7 @@ impl TestServer {
             .link_with_caps(connection_id, channel_type, channel_caps)
             .await;
         assert_eq!(reply.error, SpiceError::Ok, "linking {channel_type:?}");
-        client.auth(TICKET).await.unwrap();
+        client.auth(ticket()).await.unwrap();
         client
     }
 

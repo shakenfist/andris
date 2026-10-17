@@ -20,7 +20,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use support::{
-    TICKET, TestClient, TestServer, WAIT, closed_within, loopback, tcp_from, wait_until,
+    TestClient, TestServer, WAIT, closed_within, loopback, tcp_from, ticket, wait_until,
 };
 
 /// The client's `SET_ACK` must be the display and cursor channels' first
@@ -76,7 +76,7 @@ async fn ticket_prefix_is_permission_denied() {
     let server = TestServer::start().await;
     let mut client = TestClient::connect(server.addr()).await;
     client.link(0, ChannelType::Main).await;
-    let error = client.auth(&TICKET[..4]).await.unwrap_err();
+    let error = client.auth(&ticket()[..4]).await.unwrap_err();
     assert!(
         format!("{error:#}").contains("PermissionDenied"),
         "{error:#}"
@@ -208,7 +208,7 @@ async fn tls_listener_serves_links() {
     let mut client = TestClient::connect_tls(server.tls_addr(), &certificate).await;
     let reply = client.link(0, ChannelType::Main).await;
     assert_eq!(reply.error, SpiceError::Ok);
-    client.auth(TICKET).await.unwrap();
+    client.auth(ticket()).await.unwrap();
     let session = server.session_id();
 
     let mut display = TestClient::connect_tls(server.tls_addr(), &certificate).await;
@@ -216,7 +216,7 @@ async fn tls_listener_serves_links() {
         display.link(session, ChannelType::Display).await.error,
         SpiceError::Ok
     );
-    display.auth(TICKET).await.unwrap();
+    display.auth(ticket()).await.unwrap();
     expect_set_ack(&mut display).await;
 }
 
@@ -339,7 +339,7 @@ async fn one_address_holds_at_most_four_handshakes() {
     // ...while another address is served, since permits remain.
     let mut other = TestClient::connect_from(server.addr(), loopback(41)).await;
     assert_eq!(other.link(0, ChannelType::Main).await.error, SpiceError::Ok);
-    other.auth(TICKET).await.unwrap();
+    other.auth(ticket()).await.unwrap();
 
     // Once one of its handshakes ends, the address may start another.
     drop(held.pop());

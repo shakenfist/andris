@@ -19,8 +19,17 @@ FROM andris-dev
 #   - python3-xlib: the keylogger
 #   - xclip: copies to and pastes from CLIPBOARD on either display
 #   - x11-xserver-utils: xrandr, to look at and change the screen size
-# The last three are in the base image already; they are listed so that
-# this image does not depend on that.
+#   - pipewire, wireplumber: the session's sound server, and its session
+#     manager, as a Debian 13 desktop runs them
+#   - pipewire-pulse: PipeWire's PulseAudio protocol server, which andris
+#     captures through, and pacat plays into
+#   - pipewire-module-xrdp: xrdp's sink and source for PipeWire, and the
+#     script that loads them and makes them the session's defaults
+#   - dbus: dbus-run-session, the session bus PipeWire's daemons expect
+#   - pulseaudio-utils: pacat, which plays the tone, and pactl
+# python3-xlib, xclip, x11-xserver-utils and pulseaudio-utils are in the
+# base image already; they are listed so that this image does not depend
+# on that.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     xrdp \
     xorgxrdp \
@@ -30,6 +39,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-xlib \
     xclip \
     x11-xserver-utils \
+    pipewire \
+    wireplumber \
+    pipewire-pulse \
+    pipewire-module-xrdp \
+    dbus \
+    pulseaudio-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # The marker every test-bed script checks before it does anything, so that
@@ -37,4 +52,4 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN echo 'andris xrdp test bed; see scripts/xrdp-testbed/Dockerfile' >/etc/andris-xrdp-testbed
 
 # The versions, for the build log; run.sh prints them again on every run.
-RUN dpkg-query -W xrdp xorgxrdp freerdp3-x11
+RUN dpkg-query -W xrdp xorgxrdp freerdp3-x11 pipewire pipewire-module-xrdp

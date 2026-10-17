@@ -334,7 +334,7 @@ its conventions in its `AGENTS.md`.
 | 3 | low | sonnet | none | Complete | Andris: bump the ryll pin to step 2's merge (0.3.x), `H264Config::new`, and the image's audio packages. See brief 3. |
 | 4 | high | opus | none | Complete | The `AudioSource` seam: libpulse capture, the synthetic tone, and the options. See brief 4. |
 | 5 | high | opus | none | Complete | The playback channel: link and caps, `MODE`/`START`/`DATA`/`STOP`, Opus, silence, clock, drops and metrics. See brief 5. |
-| 6 | medium | opus | none | Not started | End-to-end checks: `make e2e` with a sound server and a tone, `--no-audio`, and X13 if the spike allows. See brief 6. |
+| 6 | medium | opus | none | Complete | End-to-end checks: `make e2e` with a sound server and a tone, `--no-audio`, and X13 if the spike allows. See brief 6. |
 | 7 | medium | sonnet | none | Not started | Documentation. See brief 7. |
 | 8 | medium | management | none | Not started | Operator acceptance on `:10`, with a video. See brief 8. |
 | 9 | medium | management | none | Not started | Push audit, pull request, queue. See brief 9. |
@@ -828,3 +828,33 @@ gained `libpulse-dev`, `libasound2-dev`, `pulseaudio` and
   test e2e` passed. In e2e, ryll linked playback and got `MODE` 3,
   and andris logged one warning a session for the missing sound
   server and no error.
+
+### Step 6: end-to-end checks
+
+- **`make e2e`** runs an unprivileged PulseAudio daemon with a
+  48 kHz null sink, and exports `PULSE_SERVER` for andris, `pacat`
+  and andris's PulseAudio test, which now runs there too. A 5 s tone
+  gave, on both runs: `START` after 0.10 s, 599 packets decoded with
+  no failure, `STOP` 1.01 s after `pacat` exited, and andris's metrics
+  `audio frames 599 at 28 kbit/s, opus encode 0.16 ms, audio drops 0,
+  audio starts=1 stops=1`. The bound on `STOP` is 2 s.
+- **`--no-audio`.** A second andris with `--no-audio` gave its ryll
+  no playback channel: twelve polls of `stats` over 3 s had no
+  `playback`, and ryll's log has no playback link.
+- **A feedback loop, found on the first run.** The devcontainer's
+  ALSA default is PulseAudio's plugin, so ryll played the decoded
+  tone into the null sink, andris captured it again, and the stream
+  never stopped. Every ryll in e2e now gets a `PULSE_SERVER` that
+  does not exist, so it decodes with no device. A ryll running on
+  the desktop andris captures would loop the same way; step 7's docs
+  say so.
+- **X13** passed three runs in a row. The test bed runs PipeWire,
+  WirePlumber and `pipewire-pulse` in the session, in that order,
+  under `dbus-run-session` (starting them together raced, and failed
+  once), then xrdp's loader script, which makes `xrdp-sink` the
+  default. FreeRDP connects with `/sound:sys:fake`. Each run gave
+  `START` after 0.10 s, 600 packets decoded with no failure, and
+  `STOP` 0.91–0.95 s after `pacat` exited, with FreeRDP up. A probe
+  with chansrv at trace level showed the sound reaching FreeRDP too
+  (661 wave chunks sent), which nothing gates on.
+- `make lint test e2e e2e-xrdp` passed.

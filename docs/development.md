@@ -121,9 +121,9 @@ every log on failure.
 
 It needs nothing on the host beyond Docker: Xvfb and Python are in
 the devcontainer image, and `make ryll-headless`, which `make e2e`
-depends on, builds ryll with `--no-default-features` (no GUI, audio or
-capture) at the revision `Cargo.lock` pins for
-`shakenfist-spice-protocol`. That build needs the network, installs
+depends on, builds ryll with `--no-default-features --features
+audio` (no GUI or capture, but with audio) at the revision
+`Cargo.lock` pins for `shakenfist-spice-protocol`. That build needs the network, installs
 into `ryll/<revision>/` under the cargo cache, and is skipped when the
 binary for that revision is already there. Moving the ryll pin builds
 ryll afresh.

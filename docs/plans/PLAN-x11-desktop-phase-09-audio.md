@@ -330,8 +330,8 @@ its conventions in its `AGENTS.md`.
 |------|--------|-------|-----------|--------|---------------------|
 | 0 | low | management | none | Complete | Commit the phase 8 close-out and this plan; create the ryll worktree. See brief 0. |
 | 1 | medium | opus | none | Complete | Spike: libpulse capture from a monitor, in containers under PulseAudio and PipeWire; Opus at 10 ms; ryll headless with audio; an xrdp sink module for the test bed. Gated. See brief 1. |
-| 2 | medium | opus | none | Not started | Ryll: playback wire types and constants, the renderer parsing with them, and `stats`' `playback` section. Ryll PR. See brief 2. |
-| 3 | low | sonnet | none | Not started | Andris: bump the ryll pin to step 2's merge (0.3.x), `H264Config::new`, and the image's audio packages. See brief 3. |
+| 2 | medium | opus | none | Complete | Ryll: playback wire types and constants, the renderer parsing with them, and `stats`' `playback` section. Ryll PR. See brief 2. |
+| 3 | low | sonnet | none | Complete | Andris: bump the ryll pin to step 2's merge (0.3.x), `H264Config::new`, and the image's audio packages. See brief 3. |
 | 4 | high | opus | none | Not started | The `AudioSource` seam: libpulse capture, the synthetic tone, and the options. See brief 4. |
 | 5 | high | opus | none | Not started | The playback channel: link and caps, `MODE`/`START`/`DATA`/`STOP`, Opus, silence, clock, drops and metrics. See brief 5. |
 | 6 | medium | opus | none | Not started | End-to-end checks: `make e2e` with a sound server and a tone, `--no-audio`, and X13 if the spike allows. See brief 6. |
@@ -739,3 +739,33 @@ packaged in Debian 13. `pipewire-module-xrdp` 0.2-2 is, with
   default monitor with FreeRDP connected. Step 6 adds the packages
   above to the test bed, starts the daemons in `startwm.sh`, and
   runs the loader script.
+
+### Step 2: ryll
+
+Ryll's half merged as ryll#578 (`38c51ef`), at version 0.3.0:
+
+- **Wire types.** `shakenfist-spice-protocol` gained
+  `capabilities::PLAYBACK_*` as masks, the `audio_data_mode` and
+  `audio_fmt` modules, and `PlaybackStart`, `PlaybackMode`,
+  `PlaybackPacket` (with a borrowing `PlaybackPacketRef`),
+  `PlaybackVolume`, `PlaybackMute` and `PlaybackLatency`. The fuzz
+  target reads them all.
+- **The renderer** parses with them, with no change in behaviour.
+- **`stats`** gained `playback` (control protocol 1.6). It is present
+  only while a playback channel is linked: the review found the flag
+  that gates it never cleared, so a guard now clears it when the
+  channel ends.
+- **Issues** from the survey and spike: ryll#575 (no A/V sync),
+  ryll#576 (no bound on the ring's drift) and ryll#577 (decoding Opus
+  with libopus, which would cost a tenth of `opus-decoder`'s 1.35 ms a
+  frame).
+
+### Step 3: the pin
+
+Andris pins ryll at `38c51ef`, with requirements of 0.3.0. Only the
+two ryll crates moved in `Cargo.lock`. The stream encoder's config is
+built with `H264Config::new` and then adjusted, since ryll#559 made it
+`#[non_exhaustive]`; nothing else in 0.3.0 broke andris. The image
+gained `libpulse-dev`, `libasound2-dev`, `pulseaudio` and
+`pulseaudio-utils`, and `make ryll-headless` builds with
+`--features audio`. `make lint test e2e` passed.

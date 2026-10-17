@@ -235,8 +235,9 @@ lint-fix: fetch
 		$(ANDRIS_IMAGE) \
 		sh -c "cargo fmt --all && cargo clippy --fix --frozen --allow-dirty --allow-no-vcs --workspace --all-targets -- -D warnings"
 
-# Build ryll's slim headless client (no GUI, audio or capture) at the
-# revision Cargo.lock pins, for `make e2e`. Skipped when that revision's
+# Build ryll's slim headless client (no GUI or capture, but with audio,
+# so its playback channel opens) at the revision Cargo.lock pins, for
+# `make e2e`. Skipped when that revision's
 # binary already exists. Installed into <rev>.tmp, the only directory the
 # build container sees, and renamed into place on the host only once
 # complete, so an interrupted build is never mistaken for a finished one.
@@ -258,7 +259,8 @@ ryll-headless: ensure-cache
 		$(DOCKER_RUN_RYLL) \
 			$(ANDRIS_IMAGE) \
 			cargo install --locked --git https://github.com/shakenfist/ryll \
-				--rev $(RYLL_REV) --no-default-features ryll \
+				--rev $(RYLL_REV) --no-default-features \
+				--features audio ryll \
 				--root /build/ryll && \
 		rm -rf "$(RYLL_DIR)/$(RYLL_REV).tmp/cargo-home" "$(RYLL_DIR)/$(RYLL_REV)" && \
 		mv "$(RYLL_DIR)/$(RYLL_REV).tmp" "$(RYLL_DIR)/$(RYLL_REV)" && \

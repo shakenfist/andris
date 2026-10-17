@@ -511,10 +511,9 @@ impl Streams {
         // encoding at its lowest QP and skipping frames, which plays a
         // 25 fps video at about 7 fps. A stream's area is photographic by
         // the heat map's choice. Skipping stays on, for real overload.
-        let config = H264Config {
-            content: H264Content::Video,
-            ..H264Config::new(width, height, self.frame_rate)
-        };
+        // H264Config is non-exhaustive, so it is built then adjusted.
+        let mut config = H264Config::new(width, height, self.frame_rate);
+        config.content = H264Content::Video;
         let cap = target_bitrate_bps(width, height, self.frame_rate);
         let encoder = H264Encoder::new(config)
             .with_context(|| format!("creating an H.264 encoder for {rect}"))?;

@@ -8,11 +8,16 @@ FROM mcr.microsoft.com/devcontainers/base:debian
 #     shakenfist-spice-protocol)
 #   - nasm: openh264's assembly; without it the openh264 crate silently
 #     skips its SIMD code, and a 1080p encode takes about 2.7x as long
+#   - libpulse-dev: libpulse, for andris's audio capture
+#   - libasound2-dev: ALSA, for ryll's cpal when ryll-headless is built
+#     with audio; also provides libasound.so.2 at run time
 RUN apt-get update && apt-get install -y \
     build-essential \
     pkg-config \
     cmake \
     nasm \
+    libpulse-dev \
+    libasound2-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # A headless X server, to test the X11 backend against, and the X
@@ -25,9 +30,12 @@ RUN apt-get update && apt-get install -y \
 #   - xclip: copies to and pastes from the X clipboard, for the clipboard
 #     tests in andris/tests/x11.rs
 #   - x11-xserver-utils: xrandr, to look at and change the screen size
-# Ryll's slim headless build (`make ryll-headless`) needs nothing beyond
-# the build tools above: cmake already serves aws-lc-sys, and its opus
-# and openh264 crates build from bundled source.
+#   - pulseaudio: a sound server, for the audio tests
+#   - pulseaudio-utils: pacat, to play and record on it in those tests
+# Ryll's headless build (`make ryll-headless`) needs nothing beyond the
+# build tools above: cmake already serves aws-lc-sys, its opus and
+# openh264 crates build from bundled source, and libasound2-dev serves
+# its audio.
 RUN apt-get update && apt-get install -y \
     xvfb \
     xauth \
@@ -35,6 +43,8 @@ RUN apt-get update && apt-get install -y \
     python3-xlib \
     xclip \
     x11-xserver-utils \
+    pulseaudio \
+    pulseaudio-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Create a shared build directory that any user can use

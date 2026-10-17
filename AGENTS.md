@@ -9,8 +9,8 @@ this file points you there rather than restating it.
 Andris is a Linux-only SPICE *server*, written in Rust, that
 exports an existing X11 desktop (such as an xrdp session's Xorg
 server) to SPICE clients. It serves the main, display, inputs, cursor
-and playback channels to one client at a time; what it does not yet do, and
-what it is meant to become, is in the master plan,
+and playback channels to one client at a time; what it does not yet
+do, and what it is meant to become, is in the master plan,
 [`docs/plans/PLAN-x11-desktop.md`](docs/plans/PLAN-x11-desktop.md).
 
 Describe what exists. Every document outside `docs/plans/` states

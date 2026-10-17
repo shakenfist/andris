@@ -356,6 +356,9 @@ async fn a_second_of_silence_stops_the_stream_and_sound_starts_it_again() {
 
     let (loud_time, loud_at) = last_loud.unwrap();
     let (stop_time, stop_at) = stop.unwrap();
+    // The exact times below hold only if no frame was dropped; a loaded
+    // machine that stalls the channel shows up here instead.
+    assert_eq!(session.stats().audio_drops, 0, "frames were dropped");
     // The tone sounded for 30 frames from the first START.
     assert_eq!(loud_time, starts[0] + 290);
     // STOP follows the 99 silent frames after the tone: a second of

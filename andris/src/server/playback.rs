@@ -83,6 +83,12 @@
 //! for frames, so it does not spin. Capture is tried again when the
 //! client next links the channel. Closing the channel drops the receiver,
 //! which stops capture.
+//!
+//! The encoder is different: if libopus cannot be set up, or fails to
+//! encode a frame, the playback channel closes, though the session stays
+//! up. Capture failing is a condition of the desktop, and the channel
+//! waits it out; an encoder failing points at a bug here, so the channel
+//! does not carry on as if it had not.
 
 use std::time::{Duration, Instant};
 
@@ -453,7 +459,8 @@ pub async fn run(ctx: ChannelContext, mut conn: ChannelConn<PlaybackOpcode>) -> 
         time: multimedia_time(session.started(), Instant::now()),
         mode: mode.wire(),
     };
-    conn.send_msg(PlaybackOpcode::Mode, &announce).await?;
+    // Made before MODE, so a client is never told of a mode it will not
+    // get.
     let codec = Codec::new(mode).inspect_err(|e| {
         warn!(
             session = id,
@@ -461,6 +468,7 @@ pub async fn run(ctx: ChannelContext, mut conn: ChannelConn<PlaybackOpcode>) -> 
             "the playback channel cannot encode; closing it"
         );
     })?;
+    conn.send_msg(PlaybackOpcode::Mode, &announce).await?;
 
     let mut capture = open_capture(&ctx);
     info!(

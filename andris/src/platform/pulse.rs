@@ -229,16 +229,28 @@ impl PulseSource {
 
         let mut stamps = MonotonicStamps::default();
         let mut bytes = [0; AUDIO_FRAME_BYTES];
+        let mut latency_failed = false;
         while !sender.is_closed() {
             stream
                 .read(&mut bytes)
                 .context("reading from the sound server")?;
             let read_at = Instant::now();
-            let latency = Duration::from(
-                stream
-                    .get_latency()
-                    .context("reading the capture latency from the sound server")?,
-            );
+            // The latency only moves the stamp earlier, and the stamps
+            // never go backwards, so a failed read costs a stamp a little
+            // late rather than the capture.
+            let latency = match stream.get_latency() {
+                Ok(latency) => Duration::from(latency),
+                Err(e) => {
+                    if !latency_failed {
+                        latency_failed = true;
+                        debug!(
+                            error = %e,
+                            "the sound server did not report the capture latency; stamping without it"
+                        );
+                    }
+                    Duration::ZERO
+                }
+            };
             let frame = AudioFrame::from_le_bytes(stamps.stamp(read_at, latency), &bytes)?;
             if !sender.send(frame) {
                 break;

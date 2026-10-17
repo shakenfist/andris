@@ -408,7 +408,8 @@ stop keylogger TERM any
 # 13. Neither andris may have logged an error. Colour is off, but strip
 # any escape codes anyway so the match cannot be split by one. With the
 # sound server up, the first must also have captured sound in every
-# session: andris warns once a session when it cannot.
+# session: andris warns each time a client links the playback channel
+# and it cannot.
 for name in andris andris-no-audio; do
     if sed 's/\x1b\[[0-9;]*m//g' "$work/$name.log" | grep ' ERROR ' >/dev/null; then
         say "FAIL: $name logged an ERROR"

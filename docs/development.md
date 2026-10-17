@@ -138,9 +138,9 @@ captures. Nothing here touches the host's sound server.
 A second andris, started with `--no-audio` on another port, must give
 a third ryll no playback channel: its `stats` never has a `playback`
 section, and ryll's log lists no playback channel and links none.
-Andris warns once a session when it cannot capture sound, so the
-script also fails if the first andris logged that warning, or an
-`ERROR`.
+Andris warns each time a client links the playback channel and it
+cannot capture sound, so the script also fails if the first andris
+logged that warning, or an `ERROR`.
 
 It also checks ryll's log for all five channels, and stops ryll with
 SIGINT and andris with SIGTERM; all three must exit 0. Last, it starts a

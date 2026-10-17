@@ -336,7 +336,7 @@ its conventions in its `AGENTS.md`.
 | 5 | high | opus | none | Complete | The playback channel: link and caps, `MODE`/`START`/`DATA`/`STOP`, Opus, silence, clock, drops and metrics. See brief 5. |
 | 6 | medium | opus | none | Complete | End-to-end checks: `make e2e` with a sound server and a tone, `--no-audio`, and X13 if the spike allows. See brief 6. |
 | 7 | medium | sonnet | none | Complete | Documentation. See brief 7. |
-| 8 | medium | management | none | Not started | Operator acceptance on `:10`, with a video. See brief 8. |
+| 8 | medium | management | none | Complete | Operator acceptance on `:10`, with a video. See brief 8. |
 | 9 | medium | management | none | Not started | Push audit, pull request, queue. See brief 9. |
 
 Step 2 may start once step 1's Opus and libpulse answers are in.
@@ -872,3 +872,27 @@ server, and a ryll in a test gets an unreachable `PULSE_SERVER`. The
 master plan's Future work gained volume and mute forwarding,
 following a new default sink, and `VD_AGENT_AUDIO_VOLUME_SYNC`. The
 sentence on a real card's mute waits for step 8.
+
+### Step 8: operator acceptance
+
+On 2026-10-18, on `:10`, with the operator's Mac running ryll
+v0.3.0. The first attempt played no sound because the installed
+binary was still phase 8's; installing this branch's release build
+fixed it. Andris logged `playback channel open mode="opus"
+capture_opened=true` and captured from `@DEFAULT_MONITOR@`.
+
+- **Sound.** Browser video played with sound on the Mac.
+- **Steady.** Sound played from 08:33:39 to 08:47:29, about 14
+  minutes across two videos. Every 10 s interval while playing sent
+  1000 frames (999 to 1001), at 105 kbit/s with 0.18 ms of Opus
+  encode, and no interval dropped a frame. Video ran at 24.5 to 29
+  fps alongside. The operator heard no gaps.
+- **Sync.** The operator noticed no lip sync problem, and called the
+  video playback the best of any SPICE server and client pairing
+  tested so far. Ryll does not sync to playback times (ryll#575), so
+  this is a judgement, not a measurement.
+- **Pause.** Pausing gave a `STOP` and playing a `START`, as did the
+  gap between the two videos.
+- **Local mute.** Muting the host's own output, PipeWire on an HDA
+  card, silenced the Mac. The monitor follows mute here, as a null
+  sink's does and unlike the xrdp sink's. Volume was not checked.

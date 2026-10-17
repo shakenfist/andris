@@ -517,8 +517,10 @@ depends on the sink the monitor belongs to.
   to half, silences or halves the remote stream.
 - The xrdp sink: the monitor ignores both. The remote stream plays at
   full volume however the sink is set.
-- A real sound card: the hardware mixer may sit before or after the
-  monitor's tap, so cards vary.
+- A real sound card under PipeWire: muting it silences the remote
+  stream, as the null sink does. This was seen on an HDA card;
+  whether its volume reaches the stream was not checked, and other
+  cards may differ.
 
 **Volume and mute are not forwarded.** Andris advertises the volume
 capability but sends neither `VOLUME` nor `MUTE`, and does not apply

@@ -200,7 +200,9 @@ plan. Later steps need not redo that.
    monitor.**
    - Andris reads `@DEFAULT_MONITOR@` through libpulse's simple API
      (the `libpulse-simple-binding` crate), on its own thread, as
-     S16LE stereo at 48 kHz, asking for 10 ms fragments.
+     S16LE stereo at 48 kHz. It sets `fragsize` to 1920 bytes and
+     reads 1920 at a time, which returns exactly one 10 ms frame; left
+     unset, the spike saw deliveries 2 s apart.
    - This works against PulseAudio, against PipeWire's
      `pipewire-pulse` (the host's case, finding 1), and against an
      xrdp sink module loaded into either. A native PipeWire client
@@ -252,7 +254,9 @@ plan. Later steps need not redo that.
    - `START`'s time, and each `DATA`'s, is the session's multimedia
      time at the moment the frame was captured: the elapsed time when
      andris read it, less the capture latency libpulse reports. Times
-     never go backwards (finding 6).
+     are clamped never to go backwards (finding 6): the spike saw
+     PulseAudio's reported latency jump to about 0.7 s while a null
+     sink woke.
    - Video keeps phase 8's stamps, 80 ms ahead on the same clock. So
      spice-gtk, which sets its clock from audio, delays video to
      match what it plays. Ryll, which syncs nothing, plays each as it
@@ -260,9 +264,13 @@ plan. Later steps need not redo that.
    - Andris sends no `PLAYBACK_LATENCY`, as spice-server sends none.
 6. **Drop, never queue.**
    - Capture hands frames to the channel's task through a channel of
-     three frames (30 ms). When it is full, the oldest frame is
+     eight frames (80 ms). When it is full, the oldest frame is
      dropped and counted. This follows spice-server's "prefer losing
      samples to queueing".
+   - The plan first said three frames. The spike found the xrdp
+     sink's loader delivers four or five frames back to back every
+     42.7 ms, which three would drop on every burst; the operator
+     chose eight on 2026-10-17.
    - The playback channel has no ack window, and it sets
      `TCP_NODELAY` like andris's other channels.
    - Pacing comes from the sound server's clock. Andris sends each
@@ -285,9 +293,11 @@ plan. Later steps need not redo that.
    - Whether a monitor carries the signal before or after the sink's
      volume and mute is the spike's question (step 1). If it is after
      them, forwarding them would attenuate twice.
-   - Instead the docs say what the operator gets. If muting the local
-     speakers also silences the monitor, that matters to someone
-     working remotely on a machine with speakers, and the docs say so.
+   - Instead the docs say what the operator gets. The spike found it
+     depends on the sink: a null sink's monitor follows its volume
+     and mute, while the xrdp sink's ignores both. Step 8 finds out
+     for the host's own output, and the docs say what each means for
+     someone working remotely on a machine with speakers.
 9. **Metrics.** The metrics line gains a playback block: audio
    frames sent, kbit/s, Opus encode ms, frames dropped, starts and
    stops. Its session-end line carries the totals.
@@ -318,8 +328,8 @@ its conventions in its `AGENTS.md`.
 
 | Step | Effort | Model | Isolation | Status | Brief for sub-agent |
 |------|--------|-------|-----------|--------|---------------------|
-| 0 | low | management | none | In progress | Commit the phase 8 close-out and this plan; create the ryll worktree. See brief 0. |
-| 1 | medium | opus | none | Not started | Spike: libpulse capture from a monitor, in containers under PulseAudio and PipeWire; Opus at 10 ms; ryll headless with audio; an xrdp sink module for the test bed. Gated. See brief 1. |
+| 0 | low | management | none | Complete | Commit the phase 8 close-out and this plan; create the ryll worktree. See brief 0. |
+| 1 | medium | opus | none | Complete | Spike: libpulse capture from a monitor, in containers under PulseAudio and PipeWire; Opus at 10 ms; ryll headless with audio; an xrdp sink module for the test bed. Gated. See brief 1. |
 | 2 | medium | opus | none | Not started | Ryll: playback wire types and constants, the renderer parsing with them, and `stats`' `playback` section. Ryll PR. See brief 2. |
 | 3 | low | sonnet | none | Not started | Andris: bump the ryll pin to step 2's merge (0.3.x), `H264Config::new`, and the image's audio packages. See brief 3. |
 | 4 | high | opus | none | Not started | The `AudioSource` seam: libpulse capture, the synthetic tone, and the options. See brief 4. |
@@ -576,3 +586,156 @@ intend to do aligns with that plan.
 ## Result
 
 Filled in as the steps complete.
+
+### Step 1: spike
+
+Measured in throwaway images built from `andris-dev` (Debian 13), on
+a Ryzen 7 8845HS. The sound servers ran inside the containers as uid
+1000, never on the host's. The tone was a 440 Hz sine at half scale
+(peak 16384, RMS 11585), played with `pacat`. Capture used
+`libpulse-binding` 2.30.1 and `libpulse-simple-binding` 2.29.0,
+recording `@DEFAULT_MONITOR@` as S16LE stereo at 48 kHz with
+`fragsize` 1920:
+
+| Sink | Idle | 100% | 50% | Muted | Read cadence | Latency p50 / p95 |
+|------|------|------|-----|-------|--------------|-------------------|
+| PulseAudio 17.0 null sink | 0 | 16385 | 2049 | 0 | 10 ms | see below |
+| PipeWire 1.4.2 null sink | 0 | 16385 | 2048 | 0 | 512-frame quanta | 0.4 / 3.4 ms |
+| `xrdp-sink` (PipeWire) | 0 | 16385 | 16385 | 16385 | 42.7 ms bursts | 10 / 31 ms |
+
+Figures are peaks; RMS tracked them (11585, 1448, 0). 50% is
+pactl's cubic scale, −18 dB, so 2048 is exactly following.
+
+- **Following volume and mute depends on the sink.** A null sink's
+  monitor is after its volume and mute, under PulseAudio and
+  PipeWire alike. The xrdp sink's monitor is before them: it carried
+  the full tone at 50% and muted. A real card with a hardware mixer
+  is likely to be like the xrdp sink, since its volume is applied in
+  the codec, but nothing here measured one. Step 8 answers it for
+  the host.
+- **Idle is exact zeros** on all three sinks: no sample in any idle
+  or muted window was non-zero.
+- **Reads always fill the buffer.** `pa_simple_read` blocks until
+  the whole buffer is full; no partial read was seen. A 1920-byte
+  buffer returns exact 480-frame frames, so step 4's re-chunking is
+  reading 1920 bytes at a time. A 480-byte buffer returned four
+  reads per 10 ms, and a 7680-byte one one read per 40 ms.
+- **`fragsize` must be explicit.** Left at −1, PulseAudio delivered
+  2 s bursts, and PipeWire reported 1.6–2.0 s of latency.
+- **Delivery is bursty under PipeWire.** The null sink ran in
+  512-frame quanta, so most reads were 10.5 ms apart with a 5 ms gap
+  every few. The xrdp module's loader forces `clock.force-quantum`
+  to 2048, so four or five frames arrive back to back every 42.7 ms.
+- **The reported latency is right while something plays.** A
+  loopback test played onsets through a low-latency stream and timed
+  them into capture. Onset to capture was 15.0 ms against 19.7 ms of
+  reported playback latency under PulseAudio, and 14.6 against
+  14.6 ms under PipeWire; capture itself reported 0–6 ms. On the
+  xrdp sink capture reported up to 40 ms, the forced quantum.
+- **A PulseAudio null sink is slow to wake.** With nothing else
+  playing, the first read could take 2.0 s, and capture then
+  reported about 0.7 s of latency until a low-latency stream
+  connected. Those frames are silence, but a falling stamp is
+  possible when the latency rises, so step 4 must clamp times to be
+  non-decreasing. PipeWire's first read came in 5–35 ms.
+- **Running the daemons unprivileged.** PulseAudio:
+  `pulseaudio -n --daemonize=no --exit-idle-time=-1
+  --use-pid-file=no --load=module-native-protocol-unix
+  --load="module-null-sink sink_name=…"`, then
+  `pactl set-default-sink`, with `XDG_RUNTIME_DIR` a private 0700
+  directory and `HOME` writable. Its default rate is 44.1 kHz, so
+  step 6 should give the null sink `rate=48000`. PipeWire:
+  `pipewire`, `wireplumber` and `pipewire-pulse` under
+  `dbus-run-session`, then `pactl load-module module-null-sink
+  sink_name=… media.class=Audio/Sink`.
+
+**Opus.** `opus` 0.4.0 builds in `andris-dev` with nothing added: it
+uses `opusic-sys` 0.7.5, which builds libopus statically from bundled
+source with cmake (`ryll`'s Cargo.toml comment naming
+`audiopus_sys` is stale). 3000 frames of a seven-partial chord with
+tremolo and noise, stereo, `Application::Audio`, at 96 kbit/s:
+
+| Profile | Encode median / p95 | Packet min / median / max | Rate |
+|---------|---------------------|---------------------------|------|
+| release | 0.049 / 0.067 ms | 110 / 121 / 198 bytes | 96.8 kbit/s |
+| debug | 0.056 / 0.077 ms | the same | the same |
+
+- **Every packet decodes.** `opus-decoder` 0.1.1 decoded all 3200
+  packets into a 480-sample-per-channel buffer, each returning 480,
+  with no errors. It costs 1.35 ms a frame in release (2.6 ms in
+  debug), about 13% of a core.
+- **Silence** encodes to 3-byte packets. The largest packet, 198
+  bytes, is well under spice-gtk's 480.
+- **Libopus's default** is close to 96 kbit/s: spice-server's
+  `test-playback`, at the default, sent 128-byte packets.
+- **Licences.** `opus` is MIT/Apache-2.0, `opusic-sys` (and libopus)
+  BSD-3-Clause, `opus-decoder` MIT OR Apache-2.0. All are in
+  `deny.toml`'s allow list.
+
+**Ryll headless with audio.** `cargo build --release --locked -p ryll
+--no-default-features --features audio` builds from ryll's `develop`
+(92de3b8) in `andris-dev` plus `libasound2-dev`, in 69 s. The binary
+needs `libasound.so.2` at run time, which `andris-dev` lacks. Run with
+no sound device against spice-server's own `server/tests/test-playback`
+(built from the reference copy and run, not read for code):
+
+- **It decodes without spinning.** Ryll linked playback, got
+  `MODE` 3 (Opus) and `START` at 48 kHz stereo, then 132-byte `DATA`
+  every 10 ms. Its audio thread used 0.01 s of CPU in 26 s, and
+  retried the device after 1, 2, 4 and 8 s, as `playback.rs:72-90`
+  says (doubling to a 30 s cap).
+- **Decoding costs about a fifth of a core.** Ryll used 19.8% of a
+  core over 20 s (21.4% with `--verbose`), almost all in tokio
+  workers. That is mostly opus-decoder's 1.35 ms a frame. ALSA also
+  prints "Unknown PCM default" to stderr.
+
+**An xrdp sink for the test bed.** `pulseaudio-module-xrdp` is not
+packaged in Debian 13. `pipewire-module-xrdp` 0.2-2 is, with
+`libpipewire-0.3-modules-xrdp` 0.2-2+b1.
+
+- **How it loads.** An XDG autostart entry,
+  `/etc/xdg/autostart/pipewire-xrdp.desktop`, runs
+  `/usr/libexec/pipewire-module-xrdp/load_pw_modules.sh` when a
+  desktop starts. The script acts only when sesman has set
+  `XRDP_SESSION` and `XRDP_SOCKET_PATH`. It loads the module through
+  `pw-cli`, forces the 2048 quantum, and makes `xrdp-sink` and
+  `xrdp-source` the defaults with `pactl`.
+- **It works in the test bed.** A derived test-bed image added
+  `pipewire`, `pipewire-pulse`, `wireplumber`,
+  `pipewire-module-xrdp`, `pulseaudio-utils` and `dbus`. The
+  session's `startwm.sh` started the three daemons under
+  `dbus-run-session` and ran the script itself, since the test bed
+  has no desktop to run autostart entries. With FreeRDP connected,
+  `xrdp-sink` was the default, its monitor read the tone as in the
+  table above, and FreeRDP stayed up.
+- **Not established:** that the sound reached FreeRDP. It ran with
+  `/sound:sys:fake`; chansrv logged the format exchange (PCM and
+  Opus) and training, with or without `/sound`, but no wave data at
+  the log level used.
+
+**The decisions.**
+
+- **Decision 2 stands.** The simple API works unchanged against
+  PulseAudio, PipeWire and the xrdp sink. Step 4 must set `fragsize`
+  explicitly, read 1920 bytes at a time, and clamp stamps.
+- **Decision 3 stands.** Encoding is under 0.1 ms a frame, so step 5
+  encodes inline, not on `spawn_blocking`.
+- **Decision 4 stands.** Idle monitors give exact zeros, so the ±8
+  threshold has margin. A null sink's mute also reads as silence
+  and so stops the stream.
+- **Decision 5 stands**, with the clamp above. The reported latency
+  matched the loopback within 5 ms.
+- **Decision 6 changes.** A channel of three frames is smaller than
+  the xrdp loader's bursts of four or five. The operator chose eight
+  (80 ms), still dropping the oldest when full, and decision 6 now
+  says so.
+- **Decision 8 stands, and its docs change.** Whether the remote
+  stream follows local volume and mute depends on the sink: yes for
+  a software-volume sink such as a null sink, no for the xrdp sink.
+  Forwarding `VOLUME` would attenuate twice on the first and be
+  correct on the second, so leaving it out remains the safe choice.
+  Step 7 says so, with step 8's answer for the host.
+- **X13 stands.** The module is packaged and gives a readable
+  default monitor with FreeRDP connected. Step 6 adds the packages
+  above to the test bed, starts the daemons in `startwm.sh`, and
+  runs the loader script.

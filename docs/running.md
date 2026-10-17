@@ -43,6 +43,8 @@ andris --ticket-file PATH [options]
 | `--tls-key PATH` | none | The TLS private key, as PEM |
 | `--frame-interval-ms MS` | `33` | The shortest time between two frames, a cap on the frame rate (33 is about 30 frames a second); at least 20. It is a cap, not a timer: see [What a client gets](#what-a-client-gets) |
 | `--jpeg-quality QUALITY` | `85` | The JPEG quality, 1 to 100, for areas that look photographic; `0` never sends JPEG (see [What a client gets](#what-a-client-gets)) |
+| `--no-audio` | off | Capture no sound, and offer clients no playback channel (see [Audio](#audio)) |
+| `--audio-source NAME` | `@DEFAULT_MONITOR@` | The PulseAudio source to capture the desktop's sound from; used by `--platform x11`, and refused with `--no-audio` and with `--platform synthetic` |
 
 `andris --help` prints the same list. Logs go to stderr at `info`
 level; set `RUST_LOG` (for example `RUST_LOG=andris=debug`) to
@@ -213,7 +215,7 @@ session already has replaces, and closes, the old channel.
 
 ## What a client gets
 
-A connection opens four channels, and ryll opens all four:
+A connection opens five channels, and ryll opens all five:
 
 | Channel | What andris sends or does |
 |---------|---------------------------|
@@ -221,6 +223,7 @@ A connection opens four channels, and ryll opens all four:
 | display | The desktop as images (below) |
 | inputs | Applies the client's keys and pointer events to the desktop, and reports the desktop's lock-key state |
 | cursor | The pointer's shape as it changes, as an alpha cursor |
+| playback | The desktop's sound, as Opus or raw PCM (see [Audio](#audio)); absent with `--no-audio` |
 
 **Display.** Andris sends the first frame whole. After that it
 captures only the parts of the desktop the platform reports as
@@ -430,7 +433,8 @@ to you, check them for your use.
   server refuses.
 - Video streams for clients without H.264, and more than one stream
   at a time.
-- No audio.
+- The desktop's volume and mute (see [Audio](#audio)), the client's
+  volume, and a microphone.
 - One client at a time.
 
 ### Known client gaps
@@ -449,15 +453,106 @@ Ryll's protocol crate also does not yet name the inputs channel's
 `KEY_SCANCODE` capability, so andris defines the constant itself
 ([ryll#503](https://github.com/shakenfist/ryll/issues/503)).
 
+## Audio
+
+Andris sends the desktop's sound to the client on the playback
+channel. A client that links the channel hears whatever the desktop
+plays.
+
+**What is captured.** Andris records the monitor of the session's
+default sink, which carries whatever that sink plays, over the
+PulseAudio protocol. PipeWire's `pipewire-pulse` serves the same
+protocol, so one code path covers PulseAudio and PipeWire, and an
+xrdp sink module loaded into either (see
+[xrdp.md](xrdp.md#sound)). `--audio-source NAME` names another
+PulseAudio source instead, such as `xrdp-sink.monitor`; list them with
+`pactl list short sources`. `--no-audio` captures nothing and leaves
+the playback channel out of the channel list, and a client that asks
+for it anyway is refused.
+
+Andris resolves the default sink when the playback channel links. If
+the default sink changes during a session, andris keeps the monitor
+it opened until the client's playback channel reconnects.
+
+Capture runs only while a client's playback channel is open. With
+nobody listening, andris does not hold the sound server or keep a sink
+awake.
+
+**Codecs.** Sound is 48 kHz stereo in frames of 10 ms. A client that
+advertises the Opus capability gets Opus at 96 kbit/s. Any other
+client gets raw 16-bit PCM. Andris chooses once, when the channel
+links.
+
+**Silence.** A monitor delivers digital silence when nothing plays.
+Andris sends `STOP` after one second in which every sample is within
+8 of zero, and `START`, then that frame, as soon as sound returns. An
+idle desktop costs the client nothing, and a client such as
+spice-gtk gets a real stop. A paused or muted source is silence, so it
+stops the stream too.
+
+**Latency and sync.** Andris stamps audio and video with one clock,
+the session's elapsed time. Video is stamped 80 ms ahead. spice-gtk
+(`remote-viewer`) sets its clock from the audio it plays, and so
+delays video to match it. Ryll plays audio and shows video as each
+arrives, with no sync between them
+([ryll#575](https://github.com/shakenfist/ryll/issues/575)), and does
+not bound how far its playback ring can drift
+([ryll#576](https://github.com/shakenfist/ryll/issues/576)). Andris
+paces nothing itself: it sends each frame as the sound server delivers
+it.
+
+**A slow client loses sound rather than gaining latency.** Capture
+hands frames to the channel through a queue of eight, 80 ms. When the
+queue is full andris drops the oldest frame and counts it. The
+playback socket also limits how much unsent data it holds, so a
+stalled client does not make the kernel buffer seconds of sound that
+would play late. The client's own receive buffer is out of andris's
+reach.
+
+**Muting the local speakers.** What it does to the remote stream
+depends on the sink the monitor belongs to.
+
+- A null sink, or any sink that applies volume in software: the
+  monitor follows the sink's volume and mute. Muting it, or turning it
+  to half, silences or halves the remote stream.
+- The xrdp sink: the monitor ignores both. The remote stream plays at
+  full volume however the sink is set.
+- A real sound card: the hardware mixer may sit before or after the
+  monitor's tap, so cards vary.
+
+**Volume and mute are not forwarded.** Andris advertises the volume
+capability but sends neither `VOLUME` nor `MUTE`, and does not apply
+the client's volume to the desktop. The client plays at its own
+volume.
+
+**Without a sound server.** Andris needs `libpulse0` at run time. If
+it cannot reach a sound server, or the source is gone, it logs one
+warning for the session and carries on: the playback channel stays
+linked and silent, every other channel works, and capture is tried
+again each time a client links the channel. Where PulseAudio is
+installed and none is running, libpulse may start a daemon of its
+own. Set `PULSE_SERVER` to name a server, or use `--no-audio`, if that
+is not wanted.
+
+**Feedback.** A SPICE client running on the desktop andris captures
+plays the sound back into the sink andris records, which sends it to
+the client again, and so on without end. Run the client elsewhere, or
+give it no sound server of its own. `make e2e` points ryll at an
+unreachable `PULSE_SERVER` for this reason.
+
+The [metrics](#metrics) line counts audio frames, their bitrate, how
+long Opus took to encode them, how many were dropped, and how many
+times the stream started and stopped.
+
 ## Metrics
 
 While a client is receiving frames, andris logs one line at info every
 10 seconds, and one more when the session ends, for the whole session.
-Nothing is logged for an interval in which no frame or refresh was sent, so an
-idle desktop is silent. A line reads:
+Nothing is logged for an interval in which no frame, refresh, stream
+frame or audio frame was sent, so an idle desktop is silent. A line reads:
 
 ```
-metrics: 12.4 fps (1 refreshes), draws lz4=118 bitmap=0 jpeg=6, display 842 kbit/s, capture 1.8 ms, encode 3.2 ms, ack lag 4.1 ms, ping 0.6 ms, scrub tiles 0, changed 31.5% of captured, streams created=0 destroyed=0, stream frames 0 at 0 kbit/s, stream encode - ms, server drops 0, stream target -
+metrics: 12.4 fps (1 refreshes), draws lz4=118 bitmap=0 jpeg=6, display 842 kbit/s, capture 1.8 ms, encode 3.2 ms, ack lag 4.1 ms, ping 0.6 ms, scrub tiles 0, changed 31.5% of captured, streams created=0 destroyed=0, stream frames 0 at 0 kbit/s, stream encode - ms, server drops 0, stream target -, audio frames 0 at 0 kbit/s, opus encode - ms, audio drops 0, audio starts=0 stops=0
 ```
 
 - `fps` is frames per second over the interval, and `refreshes` how
@@ -487,6 +582,14 @@ metrics: 12.4 fps (1 refreshes), draws lz4=118 bitmap=0 jpeg=6, display 842 kbit
 - `stream target` is the live stream's target bitrate, or `-` with
   none. Many creations and destructions in one interval mean streams
   are flapping.
+- `audio frames` is how many 10 ms frames the playback channel sent,
+  and `at` what `kbit/s`.
+- `opus encode` is the mean milliseconds to encode a frame; it stays
+  `-` for a client that gets raw PCM.
+- `audio drops` is how many frames capture dropped because the client
+  fell behind.
+- `audio starts` and `stops` count the `START` and `STOP` messages
+  sent; the silence rule makes them come in pairs.
 
 A `-` means there was nothing to average in the interval.
 

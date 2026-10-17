@@ -614,6 +614,17 @@ file) and keep its status in step with the Execution table.
   area and a stream is replaced only by a cluster more than twice its
   size; the upper half went as JPEG at up to 38 Mbit/s meanwhile. A
   cluster that contains the stream could replace it whatever its size.
+- Forwarding the desktop's volume and mute to clients. Andris
+  advertises the playback `VOLUME` capability but sends neither
+  `VOLUME` nor `MUTE`. Following the sink's volume needs libpulse's
+  asynchronous API, and a monitor that is taken after the sink's
+  volume (a null sink's) would be attenuated twice, so it needs the
+  sink's kind taken into account.
+- Following a change of default sink mid-session. Andris keeps the
+  monitor it opened until the client's playback channel reconnects.
+- Handling the vdagent's `VD_AGENT_AUDIO_VOLUME_SYNC`, which is how a
+  client's own volume reaches a guest. Andris's in-process agent
+  ignores it.
 - VA-API H.264 encode; multi-monitor; the record channel
   (microphone); usbredir and webdav; several simultaneous viewers.
 - Kerbside L2 inspection reusing the phase 2 wire types.

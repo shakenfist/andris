@@ -335,7 +335,7 @@ its conventions in its `AGENTS.md`.
 | 4 | high | opus | none | Complete | The `AudioSource` seam: libpulse capture, the synthetic tone, and the options. See brief 4. |
 | 5 | high | opus | none | Complete | The playback channel: link and caps, `MODE`/`START`/`DATA`/`STOP`, Opus, silence, clock, drops and metrics. See brief 5. |
 | 6 | medium | opus | none | Complete | End-to-end checks: `make e2e` with a sound server and a tone, `--no-audio`, and X13 if the spike allows. See brief 6. |
-| 7 | medium | sonnet | none | Not started | Documentation. See brief 7. |
+| 7 | medium | sonnet | none | Complete | Documentation. See brief 7. |
 | 8 | medium | management | none | Not started | Operator acceptance on `:10`, with a video. See brief 8. |
 | 9 | medium | management | none | Not started | Push audit, pull request, queue. See brief 9. |
 
@@ -858,3 +858,17 @@ gained `libpulse-dev`, `libasound2-dev`, `pulseaudio` and
   with chansrv at trace level showed the sound reaching FreeRDP too
   (661 wave chunks sent), which nothing gates on.
 - `make lint test e2e e2e-xrdp` passed.
+
+### Step 7: documentation
+
+`docs/running.md` gained an Audio section, the two options, a
+playback row in its channel table and the audio metrics fields.
+`docs/xrdp.md` gained a Sound section on `pipewire-module-xrdp`, and
+`docs/development.md` describes e2e's sound server, tone, `--no-audio`
+stage and feedback trap, and X13. `ARCHITECTURE.md` gained the
+playback channel, PulseAudio capture and a data flow for sound.
+`AGENTS.md` gained one convention: tests never reach the host's sound
+server, and a ryll in a test gets an unreachable `PULSE_SERVER`. The
+master plan's Future work gained volume and mute forwarding,
+following a new default sink, and `VD_AGENT_AUDIO_VOLUME_SYNC`. The
+sentence on a real card's mute waits for step 8.

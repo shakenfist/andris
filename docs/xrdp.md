@@ -276,6 +276,42 @@ other bridge then offers it to its own client. Text only: UTF-8 on
   client's clipboard is never stuck, but text copied just before the
   disconnect may not reach it.
 
+## Sound
+
+Andris captures the monitor of the session's default sink and sends it
+to SPICE clients (see [running.md](running.md#audio)). An xrdp session
+has no sound card, so unless something gives it a sink, there is
+nothing worth capturing. The same sink is what gives RDP clients
+sound, so one install serves both.
+
+Install the xrdp sink module for the session's sound server. On Debian
+13 with PipeWire that is `pipewire-module-xrdp`:
+
+```bash
+sudo apt install pipewire-module-xrdp
+```
+
+Its loader runs from an XDG autostart entry
+(`/etc/xdg/autostart/pipewire-xrdp.desktop`) when an xrdp session
+starts. It acts only inside a session xrdp's sesman started. It loads
+the module, then makes `xrdp-sink` and `xrdp-source` the session's
+defaults. The session must run a desktop that processes autostart
+entries, and the sound server must be up first. Debian 13 does not
+package `pulseaudio-module-xrdp`, the module for a PulseAudio
+session.
+
+With `xrdp-sink` as the default, andris records `xrdp-sink.monitor`,
+and sound played in the session reaches both clients. Check with
+`pactl get-default-sink` as the session's user. Andris looks the
+default up when a SPICE client's playback channel links, so a client
+that connected before the sink became the default hears nothing until
+it reconnects. To pin the source whatever the default is, start andris
+with `--audio-source xrdp-sink.monitor`.
+
+The xrdp sink's monitor ignores the sink's volume and mute, so the
+SPICE client hears the sound at full volume whatever the RDP client or
+the session sets.
+
 ## Trying it without a live session
 
 Everything on this page is exercised by `make e2e-xrdp`, which runs a

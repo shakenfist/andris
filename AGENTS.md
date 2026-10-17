@@ -8,8 +8,8 @@ this file points you there rather than restating it.
 
 Andris is a Linux-only SPICE *server*, written in Rust, that
 exports an existing X11 desktop (such as an xrdp session's Xorg
-server) to SPICE clients. It serves the main, display, inputs and
-cursor channels to one client at a time; what it does not yet do, and
+server) to SPICE clients. It serves the main, display, inputs, cursor
+and playback channels to one client at a time; what it does not yet do, and
 what it is meant to become, is in the master plan,
 [`docs/plans/PLAN-x11-desktop.md`](docs/plans/PLAN-x11-desktop.md).
 
@@ -87,6 +87,11 @@ locally:
 - **`make e2e` runs andris against Xvfb and ryll's headless client.**
   It needs nothing on the host beyond Docker, and runs in CI's merge
   tier.
+- **Tests never connect to the host's sound server.** Audio tests
+  run in a container with a sound server of its own (`make e2e`
+  starts one), and a ryll started there gets an unreachable
+  `PULSE_SERVER`, or it plays what andris captures back into the
+  capture and the stream never stops.
 - **Tests involving xrdp run on the test bed** (`make e2e-xrdp`,
   session on `:50`), never against a live session.
 - **Server opcodes come from the per-channel enums in

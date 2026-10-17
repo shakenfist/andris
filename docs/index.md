@@ -11,9 +11,9 @@ SPICE proxy.
 
 Andris serves the main, display, inputs, cursor and playback
 channels to one client at a time, and shares text clipboards and
-resizes the desktop through the main channel. Areas of the desktop that play video go to
-clients that support it as H.264 streams, and the desktop's sound goes
-over the playback channel. This documentation covers how to run
+resizes the desktop through the main channel. Areas of the desktop
+that play video go to clients that support it as H.264 streams, and
+the desktop's sound goes over the playback channel. This documentation covers how to run
 andris, how to build and test it, and the plans that describe what it
 is meant to become.
 
@@ -24,7 +24,7 @@ is meant to become.
   andris with kerbside
 - [Running andris alongside xrdp](xrdp.md) - The systemd user unit, what
   happens when the session ends, how RDP and SPICE input,
-  clipboard and resizing interact, and how to give both sound
+  clipboard and resizing interact, and how to give both clients sound
 - [Development](development.md) - Building, testing, pre-commit, CI
   and the merge queue
 - [Plans index](plans/index.md) - Every planning document, with its

@@ -1053,7 +1053,10 @@ def write_tone(path, seconds):
 def play_tone(work, name, prefix=()):
     """Start `pacat` playing the tone into the default sink, its output in `work`/`name`.log; return it. `prefix`
     goes before the pacat command, to run it as another user, say. With a short latency, pacat drains the stream
-    and exits once the sink has played the tone's last sample."""
+    and exits once the sink has played the tone's last sample. PULSE_SERVER must name the test's own sound
+    server, in the environment or in `prefix`: without it libpulse would find the desktop's."""
+    if not os.environ.get('PULSE_SERVER') and not any(arg.startswith('PULSE_SERVER=') for arg in prefix):
+        raise SystemExit('play_tone: PULSE_SERVER does not name a sound server; refusing to use the default one')
     path = os.path.join(work, f'{name}.raw')
     write_tone(path, TONE_SECONDS)
     command = list(prefix) + ['pacat', '--playback', '--raw', '--format=s16le', f'--rate={TONE_RATE}',

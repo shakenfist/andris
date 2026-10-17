@@ -310,7 +310,7 @@ with `--audio-source xrdp-sink.monitor`.
 
 The xrdp sink's monitor ignores the sink's volume and mute, so the
 SPICE client hears the sound at full volume whatever the RDP client or
-the session sets.
+the session sets. [Audio](running.md#audio) says what other sinks do.
 
 ## Trying it without a live session
 

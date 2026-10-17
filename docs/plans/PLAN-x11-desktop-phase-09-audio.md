@@ -337,7 +337,7 @@ its conventions in its `AGENTS.md`.
 | 6 | medium | opus | none | Complete | End-to-end checks: `make e2e` with a sound server and a tone, `--no-audio`, and X13 if the spike allows. See brief 6. |
 | 7 | medium | sonnet | none | Complete | Documentation. See brief 7. |
 | 8 | medium | management | none | Complete | Operator acceptance on `:10`, with a video. See brief 8. |
-| 9 | medium | management | none | Not started | Push audit, pull request, queue. See brief 9. |
+| 9 | medium | management | none | Complete | Push audit, pull request, queue. See brief 9. |
 
 Step 2 may start once step 1's Opus and libpulse answers are in.
 Step 3 needs step 2's ryll pull request merged. Steps 4 and 5 run in
@@ -896,3 +896,67 @@ capture_opened=true` and captured from `@DEFAULT_MONITOR@`.
 - **Local mute.** Muting the host's own output, PipeWire on an HDA
   card, silenced the Mac. The monitor follows mute here, as a null
   sink's does and unlike the xrdp sink's. Volume was not checked.
+
+### Step 9: push audit
+
+Wave 1 (pre-commit, `make lint`, `make test`) passed at 507 tests.
+Wave 2 ran its five reviewers in parallel, with the model and effort
+`PUSH-AUDIT.md` gives each. None found anything critical, high or
+medium, and none raised a blocking item. Style passed outright. After
+the fixes, `make test` passes at 511, and `make e2e` and `make
+e2e-xrdp` pass, X13 included.
+
+Taken:
+
+- **Security, low: a hung sound server leaks a thread per relink.**
+  libpulse's simple API has no timeout, so a capture blocks for as
+  long as a server hangs with its socket open. `PulseSource` now
+  counts its live captures and refuses `open` past
+  `MAX_LIVE_CAPTURES` (4), which leaves the channel silent with the
+  usual warning. Tests cover the cap, a freed slot, a panicking
+  thread, and four captures stuck on a listener that never answers.
+- **Security, low: the capture test could reach the desktop's sound
+  server.** `tests/pulse.rs` now fails, rather than finding a server
+  itself, when `ANDRIS_TEST_PULSE` is set without `PULSE_SERVER`.
+  `play_tone` in `e2e-drive.py` refuses the same way, and
+  `e2e-xrdp.sh` unsets `PULSE_SERVER` and `PULSE_COOKIE` beside
+  `DISPLAY`.
+- **Security, info: the docs said one warning per session.** A failed
+  capture warns each time a client links the channel; the docs now
+  say so.
+- **Code quality: `synthetic.rs` reached 1,601 lines.** The tone
+  moved to `platform/synthetic/tone.rs` with its tests.
+- **Tests:** playback joins the oversized-message test; client
+  messages mid-stream (`ACK_SYNC`, `ACK`, an unknown opcode, `PONG`)
+  leave `DATA` flowing in order, and `DISCONNECTING` closes the
+  channel with the session up; dropping the client while `DATA`
+  flows stops capture. Six mutations each failed the tests meant to
+  catch them.
+- **Docs:** running.md says andris needs libpulse at run time,
+  development.md lists `libpulse-dev`, ARCHITECTURE.md leaves the
+  audio numbers to running.md, xrdp.md links running.md for other
+  sinks, and two lines in index.md read better.
+
+Declined:
+
+- **Autospawn (security, info).** libpulse may start a daemon where
+  PulseAudio is installed and none runs. running.md already says so,
+  with `PULSE_SERVER` and `--no-audio` as the remedies; preventing it
+  needs libpulse's asynchronous API.
+- **The session id is checked before the ticket (security, info).**
+  This predates audio, and taking over a session's playback still
+  needs the ticket.
+- **Trimming the playback module's doc (code quality).** It is mostly
+  the reasons behind the socket limit, the encoder reset and the
+  clock.
+- **Three sine generators (code quality).** They differ in kind: the
+  tone source, a test helper, and bytes for `pacat`.
+- **A `SpiceStream` accessor for its `TcpStream` (code quality).**
+  It belongs in ryll and would remove one three-arm match here; not
+  worth a ryll release on its own.
+- **The 1.5 s silence bound in wall time (tests).** It is asserted in
+  capture time, which is deterministic; wall time would flake on a
+  loaded runner.
+- **Kerbside (docs).** Its allowlist takes playback's names from
+  ryll's `message_names::playback_server`, which names all four
+  messages andris sends, so nothing changes there.

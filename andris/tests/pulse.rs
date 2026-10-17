@@ -4,12 +4,13 @@
 //! and a source that does not exist closes the receiver.
 //!
 //! It runs only when `ANDRIS_TEST_PULSE` is set to anything non-empty,
-//! with a sound server that libpulse finds (through `XDG_RUNTIME_DIR` or
-//! `PULSE_SERVER`) whose default sink is one nothing else plays into: a
-//! PulseAudio null sink at 48 kHz, say. With it unset, as under
-//! `make test`, the test says on stderr that it is skipping, and passes
-//! without doing anything. Never point it at a desktop's own sound server:
-//! it plays a tone there.
+//! with `PULSE_SERVER` naming a sound server whose default sink is one
+//! nothing else plays into: a PulseAudio null sink at 48 kHz, say. With
+//! `ANDRIS_TEST_PULSE` unset, as under `make test`, the test says on
+//! stderr that it is skipping, and passes without doing anything. With it
+//! set and `PULSE_SERVER` unset or empty, the test fails rather than let
+//! libpulse find a server through `XDG_RUNTIME_DIR`, which would be the
+//! desktop's own: it plays a tone there.
 //!
 //! The tone is played with `pacat`, and the stream's removal is checked
 //! with `pactl`; both must be on the `PATH`.
@@ -37,18 +38,25 @@ const ARRIVAL: Duration = Duration::from_secs(10);
 /// reach the other's capture.
 static SERVER_TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Whether to run, saying so on stderr when not.
+/// Whether to run, saying so on stderr when not. Panics when asked to run
+/// without an explicit `PULSE_SERVER`.
 fn enabled() -> bool {
-    let enabled = std::env::var("ANDRIS_TEST_PULSE").is_ok_and(|value| !value.is_empty());
-    if !enabled {
+    let set = |name: &str| std::env::var(name).is_ok_and(|value| !value.is_empty());
+    if !set("ANDRIS_TEST_PULSE") {
         // Straight to stderr: libtest captures eprintln!, which would
         // hide that this passed without testing anything.
         let _ = writeln!(
             std::io::stderr(),
             "ANDRIS_TEST_PULSE is unset; SKIPPING the PulseAudio capture test"
         );
+        return false;
     }
-    enabled
+    assert!(
+        set("PULSE_SERVER"),
+        "ANDRIS_TEST_PULSE is set but PULSE_SERVER is not: name the sound server to play \
+         the test tone into, rather than letting libpulse find the desktop's own"
+    );
+    true
 }
 
 /// `pacat` playing a sine into the default sink until killed. Killed on

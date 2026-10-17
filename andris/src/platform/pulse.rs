@@ -39,11 +39,20 @@
 //!
 //! A capture that cannot connect, names a source that does not exist, or
 //! fails part way logs one warning and exits, which closes the receiver.
+//!
+//! libpulse's simple API has no timeout, so a sound server that hangs
+//! with its socket open leaves the thread blocked in a connect or a read
+//! for as long as it hangs. A client relinking the playback channel opens
+//! a capture each time, so the threads a [`PulseSource`] has live are
+//! counted, and once [`MAX_LIVE_CAPTURES`] are, `open` refuses until one
+//! exits.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use libpulse_binding::def::BufferAttr;
 use libpulse_binding::sample::{Format, Spec};
 use libpulse_binding::stream::Direction;
@@ -67,12 +76,21 @@ const APPLICATION_NAME: &str = "andris";
 /// The stream name the sound server shows for a capture.
 const STREAM_NAME: &str = "desktop audio";
 
-/// Captures a PulseAudio source. Cloning it is cheap; each
-/// [`AudioSource::open`] is a capture of its own.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The most capture threads a [`PulseSource`] may have live at once. One
+/// a session is normal; a stuck one lingers until its read returns, so a
+/// few more leave room for a client to relink past a slow wake without
+/// letting a hung sound server collect a thread and a connection per
+/// relink.
+pub const MAX_LIVE_CAPTURES: usize = 4;
+
+/// Captures a PulseAudio source. Cloning it is cheap, and a clone shares
+/// the count of live captures; each [`AudioSource::open`] is a capture of
+/// its own.
+#[derive(Debug, Clone)]
 pub struct PulseSource {
     source: String,
     server: Option<String>,
+    live: LiveCaptures,
 }
 
 impl PulseSource {
@@ -82,6 +100,7 @@ impl PulseSource {
         Self {
             source: source.into(),
             server: None,
+            live: LiveCaptures::default(),
         }
     }
 
@@ -100,14 +119,69 @@ impl PulseSource {
 }
 
 impl AudioSource for PulseSource {
+    /// Fails, as when the thread cannot be spawned, if
+    /// [`MAX_LIVE_CAPTURES`] captures are live already.
     fn open(&self) -> Result<AudioReceiver> {
+        let slot = self.live.claim().ok_or_else(|| {
+            anyhow!(
+                "{MAX_LIVE_CAPTURES} PulseAudio captures are still running, waiting on the \
+                 sound server"
+            )
+        })?;
         let (sender, receiver) = audio_queue();
         let source = self.clone();
         thread::Builder::new()
             .name("andris-pulse".to_string())
-            .spawn(move || source.capture(&sender))
+            .spawn(move || {
+                // Declared after the sender, so dropped before it, on a
+                // return or a panic: the slot is free by the time the
+                // receiver closes.
+                let sender = sender;
+                let _slot = slot;
+                source.capture(&sender);
+            })
             .context("starting the PulseAudio capture thread")?;
         Ok(receiver)
+    }
+}
+
+/// The count of a [`PulseSource`]'s live capture threads, shared by its
+/// clones.
+#[derive(Debug, Clone, Default)]
+struct LiveCaptures(Arc<AtomicUsize>);
+
+impl LiveCaptures {
+    /// Count one more capture, or `None` if [`MAX_LIVE_CAPTURES`] are
+    /// counted already. The capture is counted until the slot is dropped.
+    fn claim(&self) -> Option<CaptureSlot> {
+        let mut live = self.0.load(Ordering::Acquire);
+        loop {
+            if live >= MAX_LIVE_CAPTURES {
+                return None;
+            }
+            match self
+                .0
+                .compare_exchange_weak(live, live + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Some(CaptureSlot(Arc::clone(&self.0))),
+                Err(now) => live = now,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn count(&self) -> usize {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// One counted capture, uncounted when dropped.
+#[derive(Debug)]
+struct CaptureSlot(Arc<AtomicUsize>);
+
+impl Drop for CaptureSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -237,6 +311,63 @@ mod tests {
         // A second open tries again, and fails the same way.
         let mut again = source.open().unwrap();
         assert!(closes_within(&mut again, Duration::from_secs(10)).await);
+    }
+
+    #[test]
+    fn live_captures_are_capped_and_a_dropped_slot_is_freed() {
+        let live = LiveCaptures::default();
+        let mut slots: Vec<CaptureSlot> = (0..MAX_LIVE_CAPTURES)
+            .map(|_| live.claim().unwrap())
+            .collect();
+        assert_eq!(live.count(), MAX_LIVE_CAPTURES);
+        assert!(live.claim().is_none(), "one more than the cap");
+        assert_eq!(live.count(), MAX_LIVE_CAPTURES);
+        slots.pop();
+        assert_eq!(live.count(), MAX_LIVE_CAPTURES - 1);
+        slots.push(live.claim().unwrap());
+        assert!(live.claim().is_none());
+        // A clone shares the count.
+        assert!(live.clone().claim().is_none());
+        // A thread that panics frees its slot as it unwinds.
+        let slot = slots.pop().unwrap();
+        let panicked = thread::spawn(move || {
+            let _slot = slot;
+            panic!("a capture thread panicking");
+        })
+        .join();
+        assert!(panicked.is_err());
+        assert_eq!(live.count(), MAX_LIVE_CAPTURES - 1);
+        drop(slots);
+        assert_eq!(live.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn captures_stuck_on_a_hung_server_are_capped_until_they_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("native");
+        // A sound server that hangs: connections queue at its socket, and
+        // nothing ever answers them, so each capture waits in its connect.
+        let hung = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let source =
+            PulseSource::new(DEFAULT_SOURCE).with_server(format!("unix:{}", path.display()));
+        // Clones, as each session's playback channel holds the platform's.
+        let mut stuck: Vec<AudioReceiver> = (0..MAX_LIVE_CAPTURES)
+            .map(|_| source.clone().open().unwrap())
+            .collect();
+        let message = format!("{:#}", source.open().unwrap_err());
+        assert!(message.contains("still running"), "{message}");
+        assert_eq!(source.live.count(), MAX_LIVE_CAPTURES);
+
+        // The server goes: each capture fails, and its thread frees its
+        // slot before its receiver closes.
+        drop(hung);
+        for receiver in &mut stuck {
+            assert!(closes_within(receiver, Duration::from_secs(10)).await);
+        }
+        assert_eq!(source.live.count(), 0);
+        let mut again = source.open().unwrap();
+        assert!(closes_within(&mut again, Duration::from_secs(10)).await);
+        assert_eq!(source.live.count(), 0);
     }
 
     #[tokio::test]

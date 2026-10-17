@@ -26,10 +26,10 @@ SPICE.
 | Updates | `server/updates/` | Keeps a shadow of what the client was last sent, compares each capture with it in 64x64 tiles, merges the changed tiles into at most 32 rectangles, splits any over 4 MiB, and encodes each from the shadow as JPEG (photographic areas, when the client leaves the choice to the server), LZ4 or an uncompressed bitmap. Its heat map finds the area that keeps changing like a photograph, and its stream module owns the H.264 stream for that area: the frames, the encoder and its rate control |
 | Inputs channel | `server/inputs.rs`, `keymap.rs` | Decodes set-1 scancodes to evdev codes, tracks lock keys, applies pointer events according to the mouse mode |
 | Cursor channel | `server/cursor.rs` | Sends each cursor shape the platform reports as an alpha cursor |
-| Playback channel | `server/playback.rs` | Sends the desktop's sound: `MODE` first, then `START`, `DATA` and `STOP`, as Opus (96 kbit/s, 10 ms frames) or raw PCM by the client's capabilities. A gate that watches for digital silence starts and stops the stream. Frames are stamped on the clock the video uses. It opens capture when the channel links, and a failed capture leaves the channel linked and silent |
+| Playback channel | `server/playback.rs` | Sends the desktop's sound: `MODE` first, then `START`, `DATA` and `STOP`, as Opus or raw PCM by the client's capabilities. A gate that watches for digital silence starts and stops the stream. Frames are stamped on the clock the video uses. It opens capture when the channel links, and a failed capture leaves the channel linked and silent |
 | Platform traits | `platform/mod.rs`, `damage.rs` | `DisplayGeometry`, `ScreenSource`, `InputSink`, `CursorSource`, `DisplayControl` (resize the desktop, or refuse) and `Clipboard` (the desktop's clipboard text) and `AudioSource` (the desktop's sound, as 10 ms frames of 48 kHz stereo; absent under `--no-audio`), bundled as a `Platform`. They use no SPICE types, and keys cross them as Linux evdev codes. `ScreenSource` captures rectangles or the whole desktop, and hands each subscriber the damage reported since it last took some, as a region of 64x64 tiles |
 | PulseAudio capture | `platform/pulse.rs` | The X11 platform's `AudioSource`: records a sink's monitor (by default `@DEFAULT_MONITOR@`) over the PulseAudio protocol, which PipeWire's `pipewire-pulse` also serves, on its own thread. It stamps each frame with its capture time, never earlier than the one before, and queues eight frames, dropping the oldest when full. It needs `libpulse0` at run time |
-| Synthetic platform | `platform/synthetic.rs` | A deterministic test pattern that reports damage as it moves, an input sink that records events, one cursor shape, a resizable pattern that can be made to refuse resizes, an in-memory clipboard, and a tone that is on for two seconds and off for two; for tests, load testing and `--platform synthetic` |
+| Synthetic platform | `platform/synthetic/` | A deterministic test pattern that reports damage as it moves, an input sink that records events, one cursor shape, a resizable pattern that can be made to refuse resizes, an in-memory clipboard, and a tone that is on for two seconds and off for two; for tests, load testing and `--platform synthetic` |
 | X11 platform | `platform/x11/` | XDamage on the root window, MIT-SHM capture through a shared memfd with `GetImage` as the fallback, XTEST input, XFIXES cursor and XKB key names, each on its own connection and thread (five connections: capture, which also makes the RandR resizes, input, cursor, damage, and the clipboard, whose thread has a small timer thread that wakes it at its deadlines); the MIT-SHM mapping is andris's only `unsafe` code (`platform/x11/shm.rs`; the rest of the crate denies it), because mapping memory that other processes write into cannot be expressed in safe Rust; it is kept sound by never making a Rust reference into the mapping and copying pixels out through raw pointers, so a concurrent writer can only tear pixels; the input queue is bounded, with room kept for releases; refuses an X server it cannot read as BGRX |
 
 Around the code: `Makefile` and `.devcontainer/` run cargo in a
@@ -97,11 +97,11 @@ numbers.
    the client has the capability and raw PCM if not, sends `MODE`, and
    opens the platform's `AudioSource`.
 2. **Capture.** The PulseAudio thread reads the sink's monitor in
-   10 ms frames and pushes them, stamped, into a queue of eight. When
-   the queue is full the oldest frame is dropped.
-3. **Gate.** The channel task takes frames as they arrive. A second of
-   silent frames in a row ends the stream with `STOP`; the next frame
-   with sound begins it again with `START`.
+   fixed frames and pushes them, stamped, into a short queue. When the
+   queue is full the oldest frame is dropped.
+3. **Gate.** The channel task takes frames as they arrive. A run of
+   silent frames ends the stream with `STOP`; the next frame with
+   sound begins it again with `START`.
 4. **Send.** Each frame goes out as `DATA`, encoded or raw. There is
    no ack window and no timer: the sound server's clock paces it, and
    a client that falls behind loses frames rather than gaining delay.

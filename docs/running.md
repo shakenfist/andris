@@ -19,7 +19,8 @@ builds `target/release/andris` inside the devcontainer; `make build`
 makes a debug binary at `target/debug/andris`. See
 [development.md](development.md) for why the build runs in Docker.
 The binary is an ordinary dynamically linked executable, so copy it
-to the machine whose desktop you want to export.
+to the machine whose desktop you want to export. Besides the C
+library it needs only libpulse at run time (`libpulse0` on Debian).
 
 Ryll's `shakenfist-spice-compression` crate bundles openh264, so the
 first build also compiles it even though andris only encodes images
@@ -529,7 +530,7 @@ volume.
 
 **Without a sound server.** Andris needs `libpulse0` at run time. If
 it cannot reach a sound server, or the source is gone, it logs one
-warning for the session and carries on: the playback channel stays
+warning each time a client links the channel and carries on: the playback channel stays
 linked and silent, every other channel works, and capture is tried
 again each time a client links the channel. Where PulseAudio is
 installed and none is running, libpulse may start a daemon of its

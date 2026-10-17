@@ -10,7 +10,7 @@ mod support;
 use std::time::Duration;
 
 use andris::server::opcodes::{
-    CursorOpcode, DisplayOpcode, InputsOpcode, MainOpcode, ServerOpcode,
+    CursorOpcode, DisplayOpcode, InputsOpcode, MainOpcode, PlaybackOpcode, ServerOpcode,
 };
 use andris::server::{HandshakeTimeouts, MAX_HANDSHAKES, MAX_HANDSHAKES_PER_PEER};
 use shakenfist_spice_protocol::link::SpiceLinkMess;
@@ -487,6 +487,7 @@ async fn an_oversized_message_closes_each_channel() {
         (ChannelType::Display, DisplayOpcode::MAX_CLIENT_BODY),
         (ChannelType::Inputs, InputsOpcode::MAX_CLIENT_BODY),
         (ChannelType::Cursor, CursorOpcode::MAX_CLIENT_BODY),
+        (ChannelType::Playback, PlaybackOpcode::MAX_CLIENT_BODY),
         // Last, because closing the main channel ends the session.
         (ChannelType::Main, MainOpcode::MAX_CLIENT_BODY),
     ];

@@ -30,10 +30,11 @@ ANDRIS=${ANDRIS:-target/release/andris}
 IMAGE='andris-xrdp-testbed'
 KEY_LABEL=org.shakenfist.andris.testbed-key
 
-# Nothing here talks to an X server, and nothing is passed into the
-# container unless named below. Drop the caller's display anyway, so no
-# later change can reach the desktop this was run from.
-unset DISPLAY XAUTHORITY
+# Nothing here talks to an X server or a sound server, and nothing is
+# passed into the container unless named below. Drop the caller's
+# display and sound server anyway, so no later change can reach the
+# desktop this was run from.
+unset DISPLAY XAUTHORITY PULSE_SERVER PULSE_COOKIE
 
 here=$(cd "$(dirname "$0")" && pwd)
 checkout=$(dirname "$here")

@@ -1,7 +1,8 @@
 //! The playback channel, against an in-process andris on the synthetic
 //! platform: `MODE` first, Opus with the cap and raw PCM without, `START`
 //! on sound and `STOP` after a second of silence, multimedia times, drops
-//! under a stalled reader, `--no-audio`, and capture failing.
+//! under a stalled reader, `--no-audio`, capture failing, what the client
+//! sends, and capture stopping when the channel closes.
 //!
 //! Messages are read with ryll's playback types, and Opus packets decoded
 //! with `opus-decoder`, ryll's decoder, into a buffer of exactly one 10 ms
@@ -27,8 +28,8 @@ use andris::platform::{
 };
 use andris::server::session::Session;
 use shakenfist_spice_protocol::messages::{
-    ChannelEntry, ChannelsList, PlaybackMode, PlaybackPacket, PlaybackStart, ReceivedMessage,
-    SetAck, WireType,
+    AckSync, ChannelEntry, ChannelsList, Disconnecting, PlaybackMode, PlaybackPacket,
+    PlaybackStart, Pong, ReceivedMessage, SetAck, WireType,
 };
 use shakenfist_spice_protocol::{
     ChannelType, SpiceError, audio_data_mode, audio_fmt, capabilities, display_server, main_client,
@@ -442,6 +443,13 @@ async fn times_follow_capture_and_never_go_backwards() {
     assert_non_decreasing(&sent);
 }
 
+/// `message` as a body to send.
+fn body<T: WireType>(message: &T) -> Vec<u8> {
+    let mut out = Vec::new();
+    message.write(&mut out);
+    out
+}
+
 /// The `START` andris sends for a stream whose first frame is at `time`.
 fn start_at(time: u32) -> PlaybackStart {
     PlaybackStart {
@@ -625,4 +633,76 @@ async fn closing_the_channel_stops_capture() {
     assert!(!sender.is_closed());
     drop(playback);
     wait_until("capture is told to stop", || sender.is_closed()).await;
+}
+
+#[tokio::test]
+async fn client_messages_mid_stream_leave_data_flowing_and_disconnecting_closes_the_channel() {
+    let source = Arc::new(ManualSource::default());
+    let server = TestServer::start_with_audio(Some(source.clone())).await;
+    let (mut main, session, mut playback) = open_playback(&server, RAW_CAPS).await;
+    expect_mode(&mut playback, audio_data_mode::RAW).await;
+    let sender = source.take().await;
+    assert!(sender.send(frame_at(&session, 10, LOUD)));
+    assert_eq!(expect_start(&mut playback).await, 10);
+    assert_eq!(next(&mut playback).await.data().time, 10);
+
+    // What a client may send on any channel, and an opcode playback does
+    // not know. The PONG goes last, and is timed once it has been read,
+    // so the others have been read by then too.
+    playback
+        .send(main_client::ACK_SYNC, &body(&AckSync { generation: 1 }))
+        .await;
+    playback.send(main_client::ACK, &[]).await;
+    playback.send(60000, &[1, 2, 3]).await;
+    let pong = Pong {
+        id: 1,
+        timestamp: session.clock_ns(),
+    };
+    playback.send(main_client::PONG, &body(&pong)).await;
+    wait_until("the PONG is timed", || session.stats().ping.count == 1).await;
+
+    // DATA goes on, in order.
+    for n in 2..12 {
+        assert!(sender.send(frame_at(&session, 10 * n, LOUD)));
+        assert_eq!(next(&mut playback).await.data().time, 10 * n as u32);
+    }
+
+    // DISCONNECTING closes the channel, stopping capture, and only the
+    // channel.
+    let disconnecting = Disconnecting {
+        timestamp: 0,
+        reason: 0,
+    };
+    playback
+        .send(main_client::DISCONNECTING, &body(&disconnecting))
+        .await;
+    playback.expect_closed().await;
+    wait_until("capture is told to stop", || sender.is_closed()).await;
+    expect_session_up(&server, &mut main, session.id()).await;
+}
+
+#[tokio::test]
+async fn dropping_the_client_mid_stream_stops_capture() {
+    let source = Arc::new(ManualSource::default());
+    let server = TestServer::start_with_audio(Some(source.clone())).await;
+    let (_main, session, mut playback) = open_playback(&server, RAW_CAPS).await;
+    expect_mode(&mut playback, audio_data_mode::RAW).await;
+    let sender = source.take().await;
+    assert!(sender.send(frame_at(&session, 10, LOUD)));
+    expect_start(&mut playback).await;
+    for n in 1..5 {
+        assert_eq!(next(&mut playback).await.data().time, 10 * n);
+        assert!(sender.send(frame_at(&session, 10 * u64::from(n + 1), LOUD)));
+    }
+
+    // Sound keeps arriving after the client goes, so the channel may be
+    // writing a DATA as it notices.
+    drop(playback);
+    let mut ms = 50;
+    wait_until("capture is told to stop", || {
+        ms += 10;
+        !sender.send(frame_at(&session, ms, LOUD))
+    })
+    .await;
+    assert!(sender.is_closed());
 }

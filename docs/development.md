@@ -16,8 +16,8 @@ Docker. Nothing else is needed on the host, and in particular no
 Rust toolchain: every cargo invocation runs inside a devcontainer
 built from
 [`.devcontainer/Dockerfile`](https://github.com/shakenfist/andris/blob/develop/.devcontainer/Dockerfile)
-(Debian with a C toolchain, `pkg-config`, `nasm` and stable Rust with
-rustfmt and clippy). `nasm` is for openh264, which andris builds from
+(Debian with a C toolchain, `pkg-config`, `nasm`, `libpulse-dev` and
+stable Rust with rustfmt and clippy). `nasm` is for openh264, which andris builds from
 source for its H.264 encoder: without it the crate silently skips its
 assembly, and a 1080p frame takes about 2.7 times as long to encode.
 Run `make` targets as an ordinary user in the docker group; the

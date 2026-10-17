@@ -26,9 +26,18 @@ memmap2 = "0.9"
 # andris then needs at run time (the image's libpulse-dev provides it).
 libpulse-binding = "2.30"
 libpulse-simple-binding = "2.29"
+# The playback channel's Opus encoder, as ryll's WebRTC bridge uses. It
+# builds libopus statically from bundled source (through opusic-sys),
+# with the cmake the image already has, so andris links no system
+# libopus.
+opus = "0.4"
 # 0.8, the version shakenfist-spice-protocol uses, so that only one rand
 # is built.
 rand = "0.10"
+# 0.6, the version tokio already pulls in, for TCP_NOTSENT_LOWAT on the
+# playback channel's socket (behind its `all` feature), which tokio does
+# not expose.
+socket2 = { version = "0.6", features = ["all"] }
 # 2.6, the version rsa and rustls already pull in.
 subtle = "2.6"
 tokio = { version = "1", features = ["full"] }
@@ -55,6 +64,9 @@ shakenfist-spice-compression = { version = "0.3.0", git = "https://github.com/sh
 ] }
 
 [dev-dependencies]
+# Ryll's Opus decoder, so tests decode the playback channel's packets as
+# ryll would, into a buffer of exactly one 10 ms frame.
+opus-decoder = "0.1"
 rcgen = "0.14"
 # The paused clock (`test-util`), so the synthetic tone's pacing can be
 # tested without waiting for it. Cargo unifies these features with the

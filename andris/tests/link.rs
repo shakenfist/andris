@@ -137,7 +137,7 @@ async fn unserved_channels_are_unavailable() {
     let (_main, session) = server.open_main().await;
 
     let mut client = TestClient::connect(server.addr()).await;
-    let reply = client.link(session, ChannelType::Playback).await;
+    let reply = client.link(session, ChannelType::Record).await;
     assert_eq!(reply.error, SpiceError::ChannelUnavailable);
 
     let mut client = TestClient::connect(server.addr()).await;

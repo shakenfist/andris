@@ -333,7 +333,7 @@ its conventions in its `AGENTS.md`.
 | 2 | medium | opus | none | Complete | Ryll: playback wire types and constants, the renderer parsing with them, and `stats`' `playback` section. Ryll PR. See brief 2. |
 | 3 | low | sonnet | none | Complete | Andris: bump the ryll pin to step 2's merge (0.3.x), `H264Config::new`, and the image's audio packages. See brief 3. |
 | 4 | high | opus | none | Complete | The `AudioSource` seam: libpulse capture, the synthetic tone, and the options. See brief 4. |
-| 5 | high | opus | none | Not started | The playback channel: link and caps, `MODE`/`START`/`DATA`/`STOP`, Opus, silence, clock, drops and metrics. See brief 5. |
+| 5 | high | opus | none | Complete | The playback channel: link and caps, `MODE`/`START`/`DATA`/`STOP`, Opus, silence, clock, drops and metrics. See brief 5. |
 | 6 | medium | opus | none | Not started | End-to-end checks: `make e2e` with a sound server and a tone, `--no-audio`, and X13 if the spike allows. See brief 6. |
 | 7 | medium | sonnet | none | Not started | Documentation. See brief 7. |
 | 8 | medium | management | none | Not started | Operator acceptance on `:10`, with a video. See brief 8. |
@@ -796,3 +796,35 @@ gained `libpulse-dev`, `libasound2-dev`, `pulseaudio` and
   private PulseAudio daemon in the container.
 - **A note for step 7.** With no sound server running and
   `pulseaudio` installed, libpulse may start a daemon itself.
+
+### Step 5: the playback channel
+
+- **Listing and linking.** `CHANNELS_LIST` is display, cursor,
+  playback, inputs, without playback when there is no audio, and a
+  playback link is then refused as unavailable. The reply caps are
+  `VOLUME | OPUS`.
+- **The handler** (`server/playback.rs`) sends `MODE` first, then
+  opens capture. A gate starts stopped. Sound sends `START`, after a
+  reset of the Opus encoder (both clients make a fresh decoder at
+  `START`), and then the frame. The hundredth silent frame in a row
+  sends `STOP` in its place. A capture that fails or ends leaves the
+  channel linked and silent. Opus runs inline at 96 kbit/s.
+- **Times** are the session's elapsed milliseconds at each frame's
+  capture, wrapping as a `u32`.
+- **A stalled client.** The channel has no ack window, and its sends
+  wait while the client is stalled, so the capture queue drops its
+  oldest frames. Linux's send buffer would otherwise hold all 200
+  frames of a 2 s stall on loopback (the test failed so, with the
+  limit disabled). So the playback socket gets `TCP_NOTSENT_LOWAT` of
+  two DATA messages, which limits only unsent bytes, not what is in
+  flight. A stalled client's own receive buffer, about 128 KB or 10 s
+  of Opus, is out of andris's reach.
+- **Metrics** end with `audio frames N at X kbit/s, opus encode
+  0.05 ms, audio drops N, audio starts=N stops=N`.
+- **Silence after sound** encoded at about 117 bytes a frame, not the
+  spike's 3, so the gate does save bandwidth.
+- **Tests.** Eleven in `andris/tests/playback.rs`, decoding every
+  packet with `opus-decoder` into 10 ms, plus unit tests. `make lint
+  test e2e` passed. In e2e, ryll linked playback and got `MODE` 3,
+  and andris logged one warning a session for the missing sound
+  server and no error.

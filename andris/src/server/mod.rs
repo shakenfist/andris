@@ -5,9 +5,9 @@
 //! - [`channel`] frames messages, handles the ones every channel shares,
 //!   and keeps the ack window;
 //! - [`opcodes`] lists what each channel may send;
-//! - [`main_channel`], [`display`], [`inputs`] and [`cursor`] serve the
-//!   four channels, and [`agent`] plays the guest agent on the main
-//!   channel;
+//! - [`main_channel`], [`display`], [`inputs`], [`cursor`] and
+//!   [`playback`] serve the five channels, and [`agent`] plays the guest
+//!   agent on the main channel;
 //! - [`updates`] compares captures with what the display channel last
 //!   sent, and encodes what changed as `DRAW_COPY`s;
 //! - [`keymap`] decodes the inputs channel's set-1 scancodes to evdev
@@ -44,6 +44,7 @@ pub mod keymap;
 pub mod link;
 pub mod main_channel;
 pub mod opcodes;
+pub mod playback;
 pub mod session;
 pub mod stats;
 pub mod tls;
@@ -68,7 +69,7 @@ use channel::{ChannelConn, ChannelContext, drive};
 pub use display::DisplayOptions;
 pub use link::HandshakeTimeouts;
 use link::{HandshakeContext, Linked, ServedChannel, timed};
-use opcodes::{CursorOpcode, DisplayOpcode, InputsOpcode, MainOpcode};
+use opcodes::{CursorOpcode, DisplayOpcode, InputsOpcode, MainOpcode, PlaybackOpcode};
 use session::{Cancel, Session, SessionRegistry};
 
 /// How many connections may be in their handshake at once, across the
@@ -577,6 +578,7 @@ async fn serve(mut stream: SpiceStream, peer: SocketAddr, shared: &Shared, slot:
         key_generations: &shared.key_generations,
         wrong_tickets: &shared.wrong_tickets,
         peer,
+        playback: shared.platform.audio.is_some(),
     };
     let linked = link::handshake(&mut stream, &ctx).await;
     drop(slot);
@@ -654,6 +656,11 @@ async fn serve_channel(stream: SpiceStream, linked: Linked, shared: &Shared) {
         ServedChannel::Cursor => {
             let conn = ChannelConn::<CursorOpcode>::new(stream, session);
             drive(ctx, conn, cursor::run).await;
+        }
+        ServedChannel::Playback => {
+            playback::limit_unsent(&stream, playback::Mode::for_caps(&ctx.caps));
+            let conn = ChannelConn::<PlaybackOpcode>::new(stream, session);
+            drive(ctx, conn, playback::run).await;
         }
     }
 }

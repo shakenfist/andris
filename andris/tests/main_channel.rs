@@ -80,9 +80,11 @@ async fn ping_one_follows_init() {
 }
 
 /// Inputs comes last because ryll opens nothing listed after it; see
-/// `andris::server::main_channel::CHANNELS`.
+/// `andris::server::main_channel::CHANNELS`. The synthetic platform plays
+/// a tone, so playback is listed; tests/playback.rs checks that it is not
+/// without audio.
 #[tokio::test]
-async fn attach_channels_lists_display_cursor_and_inputs_last() {
+async fn attach_channels_lists_display_cursor_playback_and_inputs_last() {
     let server = TestServer::start().await;
     let (mut client, _) = server.open_main().await;
     skip_opening(&mut client).await;
@@ -100,6 +102,7 @@ async fn attach_channels_lists_display_cursor_and_inputs_last() {
         vec![
             entry(ChannelType::Display),
             entry(ChannelType::Cursor),
+            entry(ChannelType::Playback),
             entry(ChannelType::Inputs),
         ]
     );

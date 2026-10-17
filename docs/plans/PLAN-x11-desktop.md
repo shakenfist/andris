@@ -187,7 +187,7 @@ written with `/next-phase` as each phase comes up.
 | 6. Sharing the xrdp session | PLAN-x11-desktop-phase-06-sharing.md | Complete | andris `498a72c` (#12) |
 | 7. In-process agent: resize and clipboard | PLAN-x11-desktop-phase-07-agent.md | Complete | ryll `b298b39` (#534); andris `b7ba2dd` (#16) |
 | 8. Video streams | PLAN-x11-desktop-phase-08-video.md | Complete | ryll `a157ced` (#552), `601b9dc` (#554), `49072fc` (#557); andris `c2fe8a7` (#21), `1ecafa5` (#23) |
-| 9. Audio | Not yet written | Not started | |
+| 9. Audio | PLAN-x11-desktop-phase-09-audio.md | In progress | |
 | 10. Packaging and dogfood soak | Not yet written | Not started | |
 | 11. Human review | Not yet written | Not started | |
 | 12. Push audit | This file, below | Not started | |
@@ -460,8 +460,15 @@ stream-flap diagnostics are the instrument for tuning this. Planned in
 ### Phase 9: Audio
 
 Add a playback channel that captures the session's default sink
-monitor (the xrdp sink on the development host), encodes Opus at 48
-kHz and honours the client's volume and mute messages.
+monitor over the PulseAudio protocol, which PipeWire's
+`pipewire-pulse` also serves, and encodes Opus at 48 kHz in 10 ms
+frames. The development host runs PipeWire with no xrdp sink module,
+so its default sink is a local output; with an xrdp sink module
+installed, andris captures that sink's monitor instead. `VOLUME` and
+`MUTE` carry the desktop's settings from server to client (the client
+cannot set them); the phase plan defers forwarding them. Ryll first
+gains playback wire types in its protocol crate and a `playback`
+section in its control socket's `stats`.
 
 ### Phase 10: Packaging and dogfood soak
 

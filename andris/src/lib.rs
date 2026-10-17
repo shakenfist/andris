@@ -18,16 +18,18 @@ pub mod config;
 pub mod platform;
 pub mod server;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tracing::{error, info, warn};
 
-use config::{Config, PlatformConfig};
-use platform::synthetic::SyntheticPlatform;
+use config::{AudioConfig, Config, PlatformConfig};
+use platform::pulse::PulseSource;
+use platform::synthetic::{SyntheticPlatform, ToneSource};
 use platform::x11::X11Platform;
-use platform::{GoneSignal, Platform};
+use platform::{AudioSource, GoneSignal, Platform};
 use server::{DisplayOptions, HandshakeTimeouts, STOP_GRACE, Server, ServerHandle, ServerOptions};
 
 /// How long andris waits for connections to close once the desktop has
@@ -45,7 +47,7 @@ pub fn banner() -> String {
 /// SIGTERM, or until the desktop goes. Fails, naming why, if the desktop
 /// went.
 pub fn run(config: Config) -> Result<()> {
-    let platform = match &config.platform {
+    let mut platform = match &config.platform {
         PlatformConfig::Synthetic { size } => {
             info!("exporting a synthetic {size} desktop");
             SyntheticPlatform::new(*size)?.platform()
@@ -55,11 +57,31 @@ pub fn run(config: Config) -> Result<()> {
             X11Platform::connect(name)?.platform()
         }
     };
+    platform.audio = audio_source(&config.audio);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("starting the async runtime")?;
     runtime.block_on(serve(config, platform))
+}
+
+/// The sound source `audio` names, saying which in the log. Nothing is
+/// captured yet: capture starts when a client listens.
+fn audio_source(audio: &AudioConfig) -> Option<Arc<dyn AudioSource>> {
+    match audio {
+        AudioConfig::Off => {
+            info!("sound is off");
+            None
+        }
+        AudioConfig::Pulse { source } => {
+            info!("sound comes from PulseAudio source {source}, captured while a client listens");
+            Some(Arc::new(PulseSource::new(source.as_str())))
+        }
+        AudioConfig::Tone => {
+            info!("sound is a synthetic tone");
+            Some(Arc::new(ToneSource::default()))
+        }
+    }
 }
 
 /// Serve `platform` as `config` says, as [`run`] describes.
@@ -156,6 +178,20 @@ pub async fn serve_until(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_audio_configuration_picks_the_source() {
+        assert!(audio_source(&AudioConfig::Off).is_none());
+        // Neither starts capturing until opened, so neither needs a sound
+        // server or a runtime here.
+        assert!(audio_source(&AudioConfig::Tone).is_some());
+        assert!(
+            audio_source(&AudioConfig::Pulse {
+                source: "@DEFAULT_MONITOR@".into()
+            })
+            .is_some()
+        );
+    }
 
     #[test]
     fn banner_has_name_and_version() {

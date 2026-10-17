@@ -20,6 +20,12 @@ libc = "0.2"
 # Maps the MIT-SHM capture segment, a memfd shared with the X server, so
 # andris does not hand-roll mmap and munmap.
 memmap2 = "0.9"
+# PulseAudio's simple API, to capture the desktop's sound from a sink's
+# monitor on a thread of its own. The protocol is served by PulseAudio
+# and by PipeWire's pipewire-pulse alike. Both link libpulse0, which
+# andris then needs at run time (the image's libpulse-dev provides it).
+libpulse-binding = "2.30"
+libpulse-simple-binding = "2.29"
 # 0.8, the version shakenfist-spice-protocol uses, so that only one rand
 # is built.
 rand = "0.10"
@@ -50,6 +56,10 @@ shakenfist-spice-compression = { version = "0.3.0", git = "https://github.com/sh
 
 [dev-dependencies]
 rcgen = "0.14"
+# The paused clock (`test-util`), so the synthetic tone's pacing can be
+# tested without waiting for it. Cargo unifies these features with the
+# ones above in test builds.
+tokio = { version = "1", features = ["full", "test-util"] }
 # The LZ4 and pure-Rust JPEG decoders too, so tests can decode what the
 # encoders produced. `jpeg` also gates the video stream decoders
 # (`video::for_stream`), H.264's among them. Cargo unifies these features

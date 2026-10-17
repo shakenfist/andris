@@ -332,7 +332,7 @@ its conventions in its `AGENTS.md`.
 | 1 | medium | opus | none | Complete | Spike: libpulse capture from a monitor, in containers under PulseAudio and PipeWire; Opus at 10 ms; ryll headless with audio; an xrdp sink module for the test bed. Gated. See brief 1. |
 | 2 | medium | opus | none | Complete | Ryll: playback wire types and constants, the renderer parsing with them, and `stats`' `playback` section. Ryll PR. See brief 2. |
 | 3 | low | sonnet | none | Complete | Andris: bump the ryll pin to step 2's merge (0.3.x), `H264Config::new`, and the image's audio packages. See brief 3. |
-| 4 | high | opus | none | Not started | The `AudioSource` seam: libpulse capture, the synthetic tone, and the options. See brief 4. |
+| 4 | high | opus | none | Complete | The `AudioSource` seam: libpulse capture, the synthetic tone, and the options. See brief 4. |
 | 5 | high | opus | none | Not started | The playback channel: link and caps, `MODE`/`START`/`DATA`/`STOP`, Opus, silence, clock, drops and metrics. See brief 5. |
 | 6 | medium | opus | none | Not started | End-to-end checks: `make e2e` with a sound server and a tone, `--no-audio`, and X13 if the spike allows. See brief 6. |
 | 7 | medium | sonnet | none | Not started | Documentation. See brief 7. |
@@ -769,3 +769,30 @@ built with `H264Config::new` and then adjusted, since ryll#559 made it
 gained `libpulse-dev`, `libasound2-dev`, `pulseaudio` and
 `pulseaudio-utils`, and `make ryll-headless` builds with
 `--features audio`. `make lint test e2e` passed.
+
+### Step 4: the audio seam
+
+- **The seam.** `AudioSource::open` returns an `AudioReceiver` of
+  `AudioFrame`s, each 480 stereo samples with the `Instant` it was
+  captured. It never blocks, and dropping the receiver stops capture.
+  `Platform` gained `audio`, which `--no-audio` leaves `None`.
+- **The queue and the clamp live in the platform.** The capture
+  thread pushes into an eight-frame queue (a `Mutex<VecDeque>` and a
+  `Notify`) that drops the oldest frame and counts it, and
+  `MonotonicStamps` keeps each receiver's stamps non-decreasing and
+  never later than the read. Step 5 only converts them to multimedia
+  time; frames may share a stamp while a sink wakes.
+- **PulseAudio capture** (`platform/pulse.rs`) runs on a detached
+  thread with `fragsize` 1920, one frame a read. It checks for a
+  dropped receiver after each read, so it can outlive the receiver
+  by one read, up to about 2 s on a waking sink. Every failure is one
+  warning and a closed receiver.
+- **The synthetic tone** is 440 Hz, 2 s on and 2 s off, paced by
+  tokio's clock.
+- **Options.** `--no-audio`, and `--audio-source` (default
+  `@DEFAULT_MONITOR@`, refused with `--platform synthetic`).
+- **Tests.** 33 unit tests, and `andris/tests/pulse.rs`, gated by
+  `ANDRIS_TEST_PULSE`, which passed four runs of four against a
+  private PulseAudio daemon in the container.
+- **A note for step 7.** With no sound server running and
+  `pulseaudio` installed, libpulse may start a daemon itself.

@@ -187,7 +187,7 @@ written with `/next-phase` as each phase comes up.
 | 6. Sharing the xrdp session | PLAN-x11-desktop-phase-06-sharing.md | Complete | andris `498a72c` (#12) |
 | 7. In-process agent: resize and clipboard | PLAN-x11-desktop-phase-07-agent.md | Complete | ryll `b298b39` (#534); andris `b7ba2dd` (#16) |
 | 8. Video streams | PLAN-x11-desktop-phase-08-video.md | Complete | ryll `a157ced` (#552), `601b9dc` (#554), `49072fc` (#557); andris `c2fe8a7` (#21), `1ecafa5` (#23) |
-| 9. Audio | PLAN-x11-desktop-phase-09-audio.md | In progress | |
+| 9. Audio | PLAN-x11-desktop-phase-09-audio.md | Complete | ryll `38c51ef` (#578); andris `d8f316a` (#27) |
 | 10. Packaging and dogfood soak | Not yet written | Not started | |
 | 11. Human review | Not yet written | Not started | |
 | 12. Push audit | This file, below | Not started | |

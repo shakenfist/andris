@@ -1,0 +1,50 @@
+# The kerbside lane's changes to kerbside's demo stack (kerbside's
+# demo/docker-compose.yml). scripts/e2e-kerbside.sh passes this file
+# after the demo's own, through COMPOSE_FILE, so that the demo's
+# get-console.sh, which runs `docker compose` itself, sees the same
+# stack.
+#
+# Andris takes the place of the demo's qemu. It runs, with Xvfb,
+# PulseAudio, ryll and the driver, in a test container that joins the
+# kerbside container's network namespace, and listens on 127.0.0.1:5910
+# there: andris refuses a listener beyond loopback without TLS, and the
+# demo's backend leg is plain SPICE. So:
+#
+# - spice-target becomes a placeholder that only sleeps. The kerbside
+#   service depends on it, and compose cannot remove a service in an
+#   override. It is the andris-dev image, which `make e2e-kerbside`
+#   has already built, so nothing is pulled for it.
+# - sources.yaml is the lane's, written per run with a ticket generated
+#   per run, and names 127.0.0.1:5910.
+# - The network is internal, so nothing in the stack, and nothing in the
+#   test container, which shares kerbside's namespace, can reach beyond
+#   it. The images are built first, with the network up, since a build
+#   does not use the compose network.
+# - No port is published: ryll reaches kerbside on the loopback it
+#   shares with it, and nothing outside needs the stack.
+
+services:
+  spice-target:
+    build: !reset null
+    image: andris-dev
+    pull_policy: never
+    init: true
+    user: '65534:65534'
+    entrypoint: ['sleep', 'infinity']
+
+  kerbside:
+    environment:
+      # Loopback never goes through a proxy. A runner whose Docker
+      # injects a proxy into its containers would otherwise send the
+      # healthcheck's and get-console.sh's curls to it.
+      no_proxy: 127.0.0.1,localhost
+      NO_PROXY: 127.0.0.1,localhost
+    volumes:
+      # Replaces the demo's ./sources.yaml mount, which has the same
+      # target.
+      - ${KERBSIDE_LANE_SOURCES:?the lane's sources.yaml}:/etc/kerbside/sources.yaml:ro
+    ports: !reset []
+
+networks:
+  default:
+    internal: true

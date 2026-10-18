@@ -72,6 +72,12 @@ once a frame has arrived, ryll's `stats` have no `playback` object at any
 poll for NO_AUDIO_SPELL: ryll was offered no playback channel. scripts/e2e.sh
 also checks ryll's log for no playback link.
 
+With --kerbside, for a ryll connected through kerbside's proxy rather than
+straight to andris (scripts/e2e-kerbside.sh), it runs only the checks whose
+messages cross every channel kerbside relays: surface, frame, keys,
+clipboard, video and audio. The idle, small-change and resize checks test
+andris rather than the proxy, and are left to the direct run.
+
 Every wait gives up at once if a process named with --watch (andris, ryll,
 the keylogger) exits, rather than running out its bound.
 
@@ -1182,6 +1188,8 @@ def main():
                         help='for a ryll started with --no-h264: check only that the video never streams')
     parser.add_argument('--no-audio', action='store_true',
                         help='for an andris started with --no-audio: check only that ryll has no playback channel')
+    parser.add_argument('--kerbside', action='store_true',
+                        help='for a ryll connected through kerbside: skip the idle, small-change and resize checks')
     parser.add_argument('--watch', action='append', default=[], metavar='NAME=PID',
                         help='a process that must stay up; fail at once if it exits (repeatable)')
     args = parser.parse_args()
@@ -1210,10 +1218,12 @@ def main():
         if set(events) - set(subscribed):
             raise Failure(f'ryll would not subscribe to {events}: {subscribed}')
         send_keys(control, args.keylog, watch)
-        check_idle(control, watch)
-        check_small_change(control, surface['surface_id'], keylogger, args.height, watch)
+        if not args.kerbside:
+            check_idle(control, watch)
+            check_small_change(control, surface['surface_id'], keylogger, args.height, watch)
         check_clipboard(control, args.display, watch)
-        check_resize(control, (args.width, args.height), args.andris_log, args.ryll_log, watch)
+        if not args.kerbside:
+            check_resize(control, (args.width, args.height), args.andris_log, args.ryll_log, watch)
         check_video(control, surface['surface_id'], args.display, args.work, args.andris_log, watch)
         log(f'stream reports: {report_summary(args.andris_log)}')
         log(f'audio: {check_audio(control, args.work, watch)}')

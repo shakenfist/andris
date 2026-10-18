@@ -35,6 +35,17 @@ RYLL_REV := $(shell sed -nE '/^name = "shakenfist-spice-protocol"$$/,/^$$/ s/^so
 RYLL_DIR := $(CARGO_CACHE_DIR)/ryll
 RYLL_BIN := $(RYLL_DIR)/$(RYLL_REV)/bin/ryll
 
+# Kerbside, for `make e2e-kerbside`: the commit whose demo stack (demo/)
+# the lane runs, and the release on PyPI that commit is tagged as, which
+# the demo's image installs. Renovate does not track either. To bump
+# them, take a newer kerbside release, set KERBSIDE_VERSION to it and
+# KERBSIDE_REV to the full commit its tag v<version> names, together:
+# the fetch fails if the tag names another commit. Kerbside is fetched
+# per commit under the cargo cache, as ryll is, so CI's cache keeps it.
+KERBSIDE_REV := 2d9ee91e29095e4566b8452d50fbc1ca521ba4f8
+KERBSIDE_VERSION := 0.7.0
+KERBSIDE_ROOT := $(CARGO_CACHE_DIR)/kerbside
+
 # Detect user/group for permission-safe container builds
 UID := $(shell id -u)
 GID := $(shell id -g)
@@ -131,7 +142,8 @@ DOCKER_RUN_OFFLINE_RW := docker run --rm --network none \
 	$(DOCKER_BASE_ARGS) $(WORKSPACE_MOUNT_RW) $(CACHE_MOUNTS_RO)
 
 .PHONY: all build release clean devcontainer ensure-cache fetch lock \
-	target-dir lint lint-fix test ryll-headless e2e e2e-xrdp help
+	target-dir lint lint-fix test ryll-headless e2e e2e-xrdp \
+	kerbside-demo e2e-kerbside help
 
 all: build
 
@@ -146,6 +158,7 @@ help:
 	@echo "  make ryll-headless          - Build ryll's headless client at the pinned revision"
 	@echo "  make e2e                    - Run the end-to-end test against Xvfb and ryll"
 	@echo "  make e2e-xrdp               - Run andris against a real xrdp session, in a container"
+	@echo "  make e2e-kerbside           - Run the end-to-end checks through kerbside's demo stack"
 	@echo "  make lint                   - Run rustfmt and clippy checks"
 	@echo "  make lint-fix               - Run rustfmt and clippy with auto-fix"
 	@echo "  make clean                  - Remove build artifacts"
@@ -282,6 +295,24 @@ e2e: build ryll-headless
 		-e ANDRIS=/workspace/target/debug/andris \
 		$(ANDRIS_IMAGE) \
 		sh -c "cargo test --frozen --no-run --test x11 --test pulse && scripts/e2e.sh"
+
+# Fetch kerbside's repository at KERBSIDE_REV, for its demo stack; see
+# scripts/kerbside-lane/fetch.sh. Needs the network, and is skipped when
+# that commit is already there.
+kerbside-demo:
+	scripts/kerbside-lane/fetch.sh $(KERBSIDE_REV) $(KERBSIDE_VERSION) "$(KERBSIDE_ROOT)"
+
+# Run the end-to-end checks with ryll connected through kerbside's demo
+# stack, so that every channel crosses kerbside's allowlist; see
+# scripts/e2e-kerbside.sh. It builds the demo's images with the network
+# up, then runs the stack on an internal compose network, and the test
+# container, from the devcontainer image, in the kerbside container's
+# network namespace, with the checkout read-only as `e2e` has it. It
+# always removes the stack (`docker compose down -v`) when it ends.
+e2e-kerbside: build ryll-headless kerbside-demo
+	ANDRIS_IMAGE=$(ANDRIS_IMAGE) RYLL="$(RYLL_BIN)" ANDRIS=target/debug/andris \
+		KERBSIDE_DIR="$(KERBSIDE_ROOT)/$(KERBSIDE_REV)" KERBSIDE_VERSION=$(KERBSIDE_VERSION) \
+		scripts/e2e-kerbside.sh
 
 # Share a real xrdp session with andris, in a throwaway container built
 # from the devcontainer image, and drive it with ryll's headless client;

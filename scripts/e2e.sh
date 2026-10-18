@@ -54,10 +54,30 @@
 # is stopped, if either andris serving a session logged an ERROR, or if
 # andris could not capture sound. On failure it prints every log.
 #
+# With E2E_VIA=kerbside, scripts/e2e-kerbside.sh runs it in the network
+# namespace of kerbside's container, and ryll reaches andris through
+# kerbside's proxy. Then andris listens on PORT with the lane's ticket
+# file, and ryll is handed the lane's .vv, which kerbside minted, rather
+# than one written here. The driver runs only the checks that cross every
+# channel (frame, keys, clipboard, the H.264 stream and the tone), and the
+# five channels and the first session's metrics are checked as before.
+# The backend's own tests, the second ryll, the --no-audio andris and the
+# Xvfb kill are skipped: they test andris, not the proxy, and the direct
+# run covers them.
+#
 # Environment:
-#   RYLL    the ryll binary, built by `make ryll-headless` (required)
-#   ANDRIS  the andris binary (default target/debug/andris)
-#   CARGO   the cargo that runs the X11 backend's test (default cargo)
+#   RYLL        the ryll binary, built by `make ryll-headless` (required)
+#   ANDRIS      the andris binary (default target/debug/andris)
+#   CARGO       the cargo that runs the X11 backend's test (default cargo)
+#   PORT        the port andris listens on, on 127.0.0.1 (default 5930)
+#   E2E_VIA     `kerbside` for the run through kerbside; unset otherwise
+#   E2E_VV      with E2E_VIA=kerbside, the .vv ryll connects with
+#               (required). It sets delete-this-file=1, so ryll removes
+#               it, and its directory must be writable
+#   E2E_TICKET  with E2E_VIA=kerbside, andris's ticket file, 0600, which
+#               kerbside presents to andris (required)
+#   E2E_LOGS    if set, a directory every log is copied into at the end,
+#               pass or fail
 
 set -euo pipefail
 
@@ -66,7 +86,19 @@ ANDRIS=${ANDRIS:-target/debug/andris}
 CARGO=${CARGO:-cargo}
 X_DISPLAY=:99
 GEOMETRY=1024x768
-PORT=5930
+PORT=${PORT:-5930}
+VIA=${E2E_VIA:-direct}
+case "$VIA" in
+    direct) ;;
+    kerbside)
+        E2E_VV=${E2E_VV:?E2E_VV must name the .vv kerbside minted; run this through make e2e-kerbside}
+        E2E_TICKET=${E2E_TICKET:?E2E_TICKET must name the lane ticket; run this through make e2e-kerbside}
+        ;;
+    *)
+        echo "[e2e] E2E_VIA must be kerbside, or unset; got '$VIA'" >&2
+        exit 1
+        ;;
+esac
 # The port of the andris run with --no-audio, alongside the first.
 NO_AUDIO_PORT=5931
 # The null sink the PulseAudio daemon plays into, at the rate andris
@@ -187,6 +219,9 @@ cleanup() {
         # notice out of the output.
         { wait "${pids[$name]}"; } 2>/dev/null || true
     done
+    if [ -n "${E2E_LOGS:-}" ]; then
+        cp "$work"/*.log "$E2E_LOGS"/ 2>/dev/null || true
+    fi
     if ! $passed; then
         for name in x11-test pulse-test "${names[@]}" drive drive-no-h264 drive-no-audio video video-no-h264 tone; do
             if [ -f "$work/$name.log" ]; then
@@ -213,14 +248,18 @@ say "$("$RYLL" --version 2>&1 | head -n1 || true); $("$ANDRIS" --version 2>&1 | 
 start xvfb Xvfb "$X_DISPLAY" -screen 0 "${GEOMETRY}x24" -nolisten tcp
 wait_until "$XVFB_BOUND" xvfb "Xvfb answering on $X_DISPLAY" xdpyinfo -display "$X_DISPLAY"
 
-# 2. The X11 backend's test, while nothing else draws on the display.
-say "running the X11 backend's test"
-if ! ANDRIS_TEST_DISPLAY=$X_DISPLAY "$CARGO" test --frozen --quiet --test x11 \
-    >"$work/x11-test.log" 2>&1; then
-    say "FAIL: the X11 backend's test failed"
-    exit 1
+# 2. The X11 backend's test, while nothing else draws on the display. It
+# tests andris's backend, not the proxy, so the run through kerbside skips
+# it, as it does the capture's test below.
+if [ "$VIA" = direct ]; then
+    say "running the X11 backend's test"
+    if ! ANDRIS_TEST_DISPLAY=$X_DISPLAY "$CARGO" test --frozen --quiet --test x11 \
+        >"$work/x11-test.log" 2>&1; then
+        say "FAIL: the X11 backend's test failed"
+        exit 1
+    fi
+    say "the X11 backend's test passed"
 fi
-say "the X11 backend's test passed"
 
 # 3. The sound server, unprivileged: a PulseAudio daemon with no
 # configuration (-n), whose one sink, a null sink at 48 kHz, is the
@@ -250,41 +289,57 @@ no_sound_server=unix:$work/ryll-has-no-sound-server
 
 # The PulseAudio capture's test (andris/tests/pulse.rs), which plays
 # tones into the default sink, so before anything else listens to it.
-say "running the PulseAudio capture's test"
-if ! ANDRIS_TEST_PULSE=1 "$CARGO" test --frozen --quiet --test pulse >"$work/pulse-test.log" 2>&1; then
-    say "FAIL: the PulseAudio capture's test failed"
-    exit 1
+if [ "$VIA" = direct ]; then
+    say "running the PulseAudio capture's test"
+    if ! ANDRIS_TEST_PULSE=1 "$CARGO" test --frozen --quiet --test pulse >"$work/pulse-test.log" 2>&1; then
+        say "FAIL: the PulseAudio capture's test failed"
+        exit 1
+    fi
+    say "the PulseAudio capture's test passed"
 fi
-say "the PulseAudio capture's test passed"
 
 # 4. The window that keys are typed into.
 start keylogger python3 -u "$here/e2e-keylogger.py" --display "$X_DISPLAY"
 wait_until "$KEYLOGGER_BOUND" keylogger "keylogger mapped" grep -qx READY "$work/keylogger.log"
 
-# 5. The ticket, 0600 as andris requires.
-ticket=$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')
-(umask 077 && printf '%s\n' "$ticket" >"$work/ticket")
+# 5. The ticket, 0600 as andris requires. Through kerbside it is the
+# lane's, which kerbside's sources.yaml also holds.
+if [ "$VIA" = kerbside ]; then
+    ticket_file=$E2E_TICKET
+else
+    ticket=$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')
+    ticket_file=$work/ticket
+    (umask 077 && printf '%s\n' "$ticket" >"$ticket_file")
+fi
 
 # 6. Andris. The display channel logs at debug, for the stream reports
 # and bitrate changes the driver summarises.
 start andris env RUST_LOG=info,andris::server::display=debug NO_COLOR=1 "$ANDRIS" --platform x11 \
     --display "$X_DISPLAY" \
-    --listen "127.0.0.1:$PORT" --ticket-file "$work/ticket"
+    --listen "127.0.0.1:$PORT" --ticket-file "$ticket_file"
 wait_until "$ANDRIS_BOUND" andris "andris listening on $PORT" grep -q "plain listener ready" "$work/andris.log"
 say "andris is $(sed 's/\x1b\[[0-9;]*m//g' "$work/andris.log" | grep -o 'capturing the screen with [A-Za-z-]*' | head -n1 || true)"
 
 # 7. Ryll, headless. The password needs a .vv file: --direct has no
-# password option.
-(umask 077 && printf '[virt-viewer]\ntype=spice\nhost=127.0.0.1\nport=%s\npassword=%s\n' \
-    "$PORT" "$ticket" >"$work/andris.vv")
-start ryll env NO_COLOR=1 PULSE_SERVER="$no_sound_server" "$RYLL" --headless --file "$work/andris.vv" \
+# password option. Through kerbside, the .vv is the one kerbside minted,
+# which sends ryll to kerbside's TLS port with kerbside's token.
+if [ "$VIA" = kerbside ]; then
+    vv=$E2E_VV
+    drive_mode=(--kerbside)
+else
+    vv=$work/andris.vv
+    drive_mode=()
+    (umask 077 && printf '[virt-viewer]\ntype=spice\nhost=127.0.0.1\nport=%s\npassword=%s\n' \
+        "$PORT" "$ticket" >"$vv")
+fi
+start ryll env NO_COLOR=1 PULSE_SERVER="$no_sound_server" "$RYLL" --headless --file "$vv" \
     --control-socket "$sock" --verbose
 
 # 8. The assertions. The driver bounds its own waits, and gives up early
 # if a process it depends on exits.
 rc=0
 python3 "$here/e2e-drive.py" --socket "$sock" --keylog "$work/keylogger.log" --display "$X_DISPLAY" \
-    --andris-log "$work/andris.log" --ryll-log "$work/ryll.log" --work "$work" \
+    --andris-log "$work/andris.log" --ryll-log "$work/ryll.log" --work "$work" "${drive_mode[@]}" \
     --watch "andris=${pids[andris]}" --watch "ryll=${pids[ryll]}" --watch "keylogger=${pids[keylogger]}" \
     >"$work/drive.log" 2>&1 || rc=$?
 cat "$work/drive.log"
@@ -339,6 +394,33 @@ if [ "${audio_frames:-0}" -lt "$AUDIO_FRAMES" ] || ! echo "$line" | grep 'audio 
     exit 1
 fi
 say "the first session's metrics: ${line#*: }"
+
+# Through kerbside, the rest tests andris rather than the proxy: stop
+# andris as systemd does, and check its log, then stop the X server and
+# the sound server.
+if [ "$VIA" = kerbside ]; then
+    stop andris TERM
+    stop keylogger TERM any
+    if sed 's/\x1b\[[0-9;]*m//g' "$work/andris.log" | grep ' ERROR ' >/dev/null; then
+        say "FAIL: andris logged an ERROR"
+        exit 1
+    fi
+    if sed 's/\x1b\[[0-9;]*m//g' "$work/andris.log" \
+        | grep 'audio capture could not start\|cannot capture sound' >/dev/null; then
+        say "FAIL: andris could not capture sound"
+        exit 1
+    fi
+    if ! sed 's/\x1b\[[0-9;]*m//g' "$work/andris.log" | grep 'SIGTERM: shutting down' >/dev/null; then
+        say "FAIL: andris never logged that SIGTERM stopped it"
+        exit 1
+    fi
+    say "andris logged no ERROR, captured sound, and logged that SIGTERM stopped it"
+    stop xvfb TERM any
+    stop pulse TERM
+    passed=true
+    say "PASS"
+    exit 0
+fi
 
 # 10. A ryll without H.264, and the same picture: no stream, JPEG draws.
 start ryll-no-h264 env NO_COLOR=1 PULSE_SERVER="$no_sound_server" "$RYLL" --headless \

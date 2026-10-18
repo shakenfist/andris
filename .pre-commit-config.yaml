@@ -23,6 +23,14 @@ repos:
       - id: trailing-whitespace
       - id: end-of-file-fixer
       - id: check-yaml
+        exclude: ^scripts/kerbside-lane/compose\.override\.yml$
+      # A compose override's `!reset` tag is not one PyYAML can
+      # construct, so that file is checked for syntax alone; `docker
+      # compose config` checks the rest when the lane runs.
+      - id: check-yaml
+        name: check yaml (syntax only, for compose's tags)
+        files: ^scripts/kerbside-lane/compose\.override\.yml$
+        args: ['--unsafe']
       - id: check-merge-conflict
 
   - repo: https://github.com/shellcheck-py/shellcheck-py

@@ -6,7 +6,7 @@ members = ["andris"]
 unwrap_used = "warn"
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"

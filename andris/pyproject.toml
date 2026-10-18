@@ -26,6 +26,12 @@ build-backend = "maturin"
 [project]
 name = "andris"
 description = "A SPICE server that exports an existing X11 desktop"
+# PyPI's project page shows the repository's README. maturin resolves the
+# path from this file's directory, and accepts one that leaves it as long
+# as it stays inside the cargo workspace, as the root README.md does. Its
+# links are absolute, as the repository's documentation rules require,
+# so they work on PyPI too.
+readme = "../README.md"
 requires-python = ">=3.9"
 license = "Apache-2.0"
 dynamic = ["version"]

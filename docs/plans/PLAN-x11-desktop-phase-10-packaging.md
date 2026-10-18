@@ -418,14 +418,14 @@ management session reviews each diff and makes each commit.
 
 | Step | Effort | Model | Isolation | Status | Brief for sub-agent |
 |------|--------|-------|-----------|--------|---------------------|
-| 0 | low | management | none | Not started | Commit phase 9's close-out and this plan. See brief 0. |
-| 1 | high | opus | none | Not started | Load libpulse at run time; serve without sound when it is missing. See brief 1. |
-| 2 | medium | opus | none | Not started | `andris install-unit`, and `SystemCallFilter` in the unit. See brief 2. |
-| 3 | high | opus | none | Not started | The wheel: pyproject, build image, build scripts, `make wheel`, the earned-tag and SIMD checks, the merge-tier job and its slim-container smoke test. See brief 3. |
-| 4 | medium | opus | none | Not started | The release workflow and scripts, and `docs/releasing.md`; the consistency audit passes. See brief 4. |
-| 5 | high | opus | none | Not started | The kerbside lane: `make e2e-kerbside` and its merge-tier job. See brief 5. |
-| 6 | medium | sonnet | none | Not started | Documentation, including the soak recipe. See brief 6. |
-| 7 | medium | management | none | Not started | Operator check of the wheel on `:10`. See brief 7. |
+| 0 | low | management | none | Complete | Commit phase 9's close-out and this plan. See brief 0. |
+| 1 | high | opus | none | Complete | Load libpulse at run time; serve without sound when it is missing. See brief 1. |
+| 2 | medium | opus | none | Complete | `andris install-unit`, and `SystemCallFilter` in the unit. See brief 2. |
+| 3 | high | opus | none | Complete | The wheel: pyproject, build image, build scripts, `make wheel`, the earned-tag and SIMD checks, the merge-tier job and its slim-container smoke test. See brief 3. |
+| 4 | medium | opus | none | Complete | The release workflow and scripts, and `docs/releasing.md`; the consistency audit passes. See brief 4. |
+| 5 | high | opus | none | Complete | The kerbside lane: `make e2e-kerbside` and its merge-tier job. See brief 5. |
+| 6 | medium | sonnet | none | Complete | Documentation, including the soak recipe. See brief 6. |
+| 7 | medium | management | none | Complete | Operator check of the wheel on `:10`. See brief 7. |
 | 8 | medium | management | none | Not started | Push audit and pull request. See brief 8. |
 | 9 | low | operator | none | Not started | PyPI trusted publisher, the `release` environment, tag protection. See brief 9. |
 | 10 | low | management | none | Not started | Release 0.1.0. See brief 10. |
@@ -1000,4 +1000,49 @@ intend to do aligns with that plan.
 
 ## Result
 
-Not started.
+### Step 7: the wheel on `:10`
+
+On 2026-10-18 the operator installed step 3's x86_64 wheel with pipx,
+ran `andris install-unit` and `systemctl --user daemon-reload`, and
+removed `/usr/local/bin/andris`, all while connected through ryll. The
+session did not drop, because nothing had restarted `andris@10`. The
+old process (started 08:13, `NRestarts=0`) kept serving from its
+deleted file: `/proc/<pid>/exe` read `/usr/local/bin/andris
+(deleted)`, while systemd's `ExecStart` already named the pipx binary.
+The operator had followed `install-unit`'s printed `systemctl --user
+enable --now andris@10`, and `--now` does nothing to a running
+instance.
+
+That was a defect in step 2, fixed in this step: `install-unit` now
+prints `enable` followed by `restart`. Restarting starts a stopped
+instance, and replaces a running one, so the same commands serve a
+first install, a replaced unit, and an unchanged unit whose binary
+`pipx upgrade` replaced in place. `docs/xrdp.md` explains why, and
+gains the upgrade recipe. The `next_steps` tests now require `restart`
+and refuse `--now`. Mutating the output back to `enable --now` fails
+both.
+
+After the operator restarted `andris@10` at 16:40:39, the management
+session read, from `systemctl show` and the journal only:
+
+- `ExecStart` path `/home/mikal/.local/share/pipx/venvs/andris/bin/andris`,
+  with `--ticket-file /home/mikal/.config/andris/ticket` from `%E`;
+  `/proc/<MainPID>/exe` is the same pipx binary. `SystemCallFilter`
+  is in effect.
+- The startup log: `andris 0.0.1`, sound from `@DEFAULT_MONITOR@`
+  (libpulse loaded at run time), `capturing the screen with MIT-SHM,
+  through a shared memfd`, the desktop 2212x1308.
+- ryll reconnected within a second. The playback channel opened in
+  Opus mode with `capture_opened=true`. A video played: one H.264
+  stream (1216x704, target 2568 kbit/s, about 2.5 Mbit/s, encode
+  3 to 10 ms) and Opus at 105 kbit/s, with no server or audio drops.
+  The operator reported that video playback works well.
+- No `status=31/SYS`, nor any other kill, in the first minutes under
+  the seccomp filter. The soak (step 11) decides whether it stays.
+- The old binary's session-end line, as a baseline: 21840.5 s, 4.8
+  fps, display 338 kbit/s, capture 0.9 ms, encode 1.1 ms, 929890 kB
+  written.
+
+The cursor warning, `hot spot (1, 1) is outside a 1x1 cursor`,
+appears at startup with both the old binary and the new one, so it is
+not a regression from packaging.

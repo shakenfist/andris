@@ -47,6 +47,14 @@ unchanged, and always overwrites it, so run it again whenever the
 binary moves, after reinstalling andris with a different pipx or pip,
 say. Do not edit the installed unit: the next run replaces it. Put
 local changes in a drop-in, with `systemctl --user edit andris@`.
+
+A running andris keeps running the binary it started from, so after an
+upgrade restart each instance to run the new one:
+
+```bash
+pipx upgrade andris
+systemctl --user restart andris@10
+```
 Systemd cannot run a binary whose path holds a quote, a backslash or a
 control character, so `install-unit` refuses one; install andris
 elsewhere if yours does.
@@ -131,12 +139,18 @@ found:
 
 ```bash
 systemctl --user daemon-reload
-systemctl --user enable --now andris@10
+systemctl --user enable andris@10
+systemctl --user restart andris@10
 ```
 
 `enable` makes the instance start whenever the user's systemd manager
-does, and `--now` starts it straight away. Check it, and read its log,
-with:
+does, and `restart` starts it straight away. `install-unit` prints
+`restart` rather than `enable --now` because `--now` does nothing to an
+instance that is already running: after a reinstall, the old binary
+would carry on serving, from its deleted file if the reinstall removed
+it, under a unit that names the new one. `restart` starts a stopped
+instance, and replaces a running one, dropping any client connected to
+it. Check it, and read its log, with:
 
 ```bash
 systemctl --user status andris@10

@@ -407,6 +407,13 @@ impl fmt::Display for Report {
 /// The commands to run after installing, for `DISPLAY`'s value
 /// `display`. Only the value is read; the display is never opened.
 ///
+/// They restart the instance rather than `enable --now` it: `--now` does
+/// nothing to an instance that is already running, which would leave the
+/// old binary serving after a reinstall, under a unit that names the new
+/// one. Restarting starts an instance that is stopped, so the same
+/// commands serve a first install, a replaced unit, and an unchanged one
+/// whose binary an upgrade replaced in place.
+///
 /// When `display` names a local display, the commands name its instance.
 /// Otherwise they carry a placeholder, and say where the docs tell how to
 /// find the number.
@@ -415,9 +422,13 @@ pub fn next_steps(display: Option<&str>) -> String {
     let instance = number.map_or_else(|| "N".to_string(), |number| number.to_string());
     let mut steps = String::from("Then, to start andris, run:\n\n");
     steps.push_str("    systemctl --user daemon-reload\n");
-    steps.push_str(&format!(
-        "    systemctl --user enable --now andris@{instance}\n"
-    ));
+    steps.push_str(&format!("    systemctl --user enable andris@{instance}\n"));
+    steps.push_str(&format!("    systemctl --user restart andris@{instance}\n"));
+    steps.push_str(
+        "\nRestarting starts andris if it is stopped. If it is running, it stops the old \
+         process, dropping any client connected to it, so that the new unit and binary take \
+         effect.\n",
+    );
     match number {
         Some(number) => steps.push_str(&format!(
             "\nandris@{number} shares display :{number}, which DISPLAY names here.\n"
@@ -785,9 +796,16 @@ mod tests {
             "{steps}"
         );
         assert!(
-            steps.contains("systemctl --user enable --now andris@10\n"),
+            steps.contains("systemctl --user enable andris@10\n"),
             "{steps}"
         );
+        assert!(
+            steps.contains("systemctl --user restart andris@10\n"),
+            "{steps}"
+        );
+        // --now does nothing to a running instance, so it would leave the
+        // old binary serving after a reinstall.
+        assert!(!steps.contains("--now"), "{steps}");
         assert!(!steps.contains(STARTING_DOC), "{steps}");
     }
 
@@ -796,7 +814,11 @@ mod tests {
         for display in [None, Some("localhost:10.0"), Some("")] {
             let steps = next_steps(display);
             assert!(
-                steps.contains("systemctl --user enable --now andris@N\n"),
+                steps.contains("systemctl --user enable andris@N\n"),
+                "{steps}"
+            );
+            assert!(
+                steps.contains("systemctl --user restart andris@N\n"),
                 "{steps}"
             );
             assert!(steps.contains(STARTING_DOC), "{steps}");

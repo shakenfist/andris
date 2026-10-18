@@ -371,9 +371,13 @@ fn make_ticket(path: &Path) -> Result<TicketState> {
             return Err(err).with_context(|| format!("cannot create {}", path.display()));
         }
     };
-    if let Err(err) = file.write_all(new_ticket().as_bytes()) {
+    let written = file
+        .write_all(new_ticket().as_bytes())
+        .and_then(|()| file.sync_all());
+    if let Err(err) = written {
         // An empty or partial ticket would be refused by every later
-        // run, and never replaced, so take it away again.
+        // run, and never replaced, so take it away again. Synced, so a
+        // crash cannot leave one behind either.
         let _ = fs::remove_file(path);
         return Err(err).with_context(|| format!("cannot write {}", path.display()));
     }

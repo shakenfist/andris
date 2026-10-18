@@ -29,6 +29,12 @@ on:
 
 permissions: {}
 
+# One run per tag at a time, never cancelled part way: a release that
+# has signed its tag or begun uploading must finish.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   # The tag must name the version in [workspace.package], and Cargo.lock
   # must agree, since the build is --frozen. On a dispatch to a branch

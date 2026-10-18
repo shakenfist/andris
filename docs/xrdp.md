@@ -84,6 +84,10 @@ that will run it.
 
 The unit reads two things from `~/.config/andris/`, which it finds
 through systemd's `%E`, the user manager's `$XDG_CONFIG_HOME`.
+`install-unit` writes them under the shell's `$XDG_CONFIG_HOME`, so
+if you set that, it must match what `systemctl --user
+show-environment` reports; otherwise systemd finds neither the unit
+nor the ticket.
 
 The ticket file, `ticket`, holds the password SPICE clients must
 present. `andris install-unit` made one if there was none. It must be

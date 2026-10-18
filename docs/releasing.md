@@ -137,7 +137,9 @@ new version.
 
 ## Stage 2: tag the merged commit
 
-After the pull request has landed:
+After the pull request has landed, as a merge commit (the merge
+queue's setting), so that `develop` keeps the commit `Release X.Y.Z.`
+the script looks for:
 
 ```bash
 make tag-release 0.1.0

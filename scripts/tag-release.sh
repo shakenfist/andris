@@ -60,7 +60,7 @@ info "Finding the commit that landed release ${VERSION}"
 RELEASE_SHA="$(git log origin/develop --format='%H%x09%s' \
     | awk -F '\t' -v want="Release ${VERSION}." '$2 == want { print $1; exit }')"
 [[ -n "${RELEASE_SHA}" ]] \
-    || err "no commit 'Release ${VERSION}.' on origin/develop. Has the release-${VERSION} pull request landed?"
+    || err "no commit 'Release ${VERSION}.' on origin/develop. Has the release-${VERSION} pull request landed, as a merge commit? A squash merge renames it."
 TARGET_SHA=''
 while read -r commit; do
     if git merge-base --is-ancestor "${RELEASE_SHA}" "${commit}"; then

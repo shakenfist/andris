@@ -7,15 +7,15 @@
 # REV is the full commit, VERSION the kerbside release whose tag, vVERSION,
 # must name that commit: the fetch is of the tag, and fails unless the tag
 # resolves to REV, so the two pins in the Makefile cannot drift apart. The
-# tree goes in DIR/REV, and the fetch is skipped when that is already
-# there. It is fetched into DIR/REV.tmp and renamed into place only once
-# complete, as `make ryll-headless` stages ryll, so an interrupted fetch is
-# never mistaken for a finished one.
+# tree goes in DIR/REV, replacing any already there. It is fetched into
+# DIR/REV.tmp and renamed into place only once complete, as `make
+# ryll-headless` stages ryll, so an interrupted fetch is never mistaken
+# for a finished one.
 #
 # This needs the network, and runs git on the host. Fetching runs nothing
 # from the repository: git runs no hooks a repository brings with it.
 # The lane does run one of its scripts, the demo's get-console.sh, on the
-# host, which is why a cached tree is checked before it is reused.
+# host, which is why the tree is never reused from a cache.
 
 set -euo pipefail
 
@@ -35,15 +35,11 @@ if ! echo "$rev" | grep -Eqx '[0-9a-f]{40}'; then
 fi
 
 tree=$dir/$rev
-# A cached tree comes back from the CI cache, and the lane runs the
-# demo's get-console.sh from it on the host, so it is used only while it
-# is still exactly REV; otherwise it is fetched again.
-if [ -f "$tree/demo/docker-compose.yml" ] \
-    && [ "$(git -C "$tree" rev-parse HEAD 2>/dev/null)" = "$rev" ] \
-    && [ -z "$(git -C "$tree" status --porcelain 2>/dev/null)" ]; then
-    echo "[kerbside-fetch] kerbside $version already fetched: $tree"
-    exit 0
-fi
+# Always fetched afresh, never reused: the directory can come back from
+# the CI cache, and the lane runs the demo's get-console.sh from it on
+# the host. A cached tree's own git metadata cannot vouch for it, since
+# whoever could change its files could change that too, and a shallow
+# fetch of one tag costs a second or two.
 
 staging=$tree.tmp
 rm -rf "$staging"

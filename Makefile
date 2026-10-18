@@ -307,8 +307,8 @@ e2e: build ryll-headless
 		sh -c "cargo test --frozen --no-run --test x11 --test pulse && scripts/e2e.sh"
 
 # Fetch kerbside's repository at KERBSIDE_REV, for its demo stack; see
-# scripts/kerbside-lane/fetch.sh. Needs the network, and is skipped when
-# that commit is already there.
+# scripts/kerbside-lane/fetch.sh. Needs the network, and fetches afresh
+# every time.
 kerbside-demo:
 	scripts/kerbside-lane/fetch.sh $(KERBSIDE_REV) $(KERBSIDE_VERSION) "$(KERBSIDE_ROOT)"
 

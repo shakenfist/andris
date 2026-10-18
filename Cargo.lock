@@ -16,6 +16,7 @@ name = "andris"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "libc",
  "libloading",

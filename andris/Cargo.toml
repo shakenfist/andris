@@ -13,6 +13,10 @@ workspace = true
 
 [dependencies]
 anyhow = "1"
+# Encodes the random ticket `andris install-unit` writes. 0.23, the
+# version rcgen already pulls in (through pem), with pem's features:
+# none of the SIMD engines, which are the crate's only unsafe code.
+base64 = { version = "0.23", default-features = false, features = ["alloc"] }
 clap = { version = "4", features = ["derive", "env"] }
 # For O_NONBLOCK, and memfd_create and file seals for the MIT-SHM capture
 # segment; already in the tree through tokio.
@@ -33,8 +37,8 @@ libloading = "0.9"
 # with the cmake the image already has, so andris links no system
 # libopus.
 opus = "0.4"
-# 0.8, the version shakenfist-spice-protocol uses, so that only one rand
-# is built.
+# 0.10. shakenfist-spice-protocol (and rsa, through num-bigint-dig)
+# still use 0.8, so two rands are built until they move.
 rand = "0.10"
 # 0.6, the version tokio already pulls in, for TCP_NOTSENT_LOWAT on the
 # playback channel's socket (behind its `all` feature), which tokio does

@@ -4,6 +4,8 @@
 //! drive the server in-process.
 //!
 //! - [`config`] holds the command line and its validation;
+//! - [`install`] holds `andris install-unit`, which installs the systemd
+//!   user unit;
 //! - [`platform`] holds the seams between the server and the desktop,
 //!   and their implementations;
 //! - [`server`] holds the SPICE server.
@@ -17,6 +19,7 @@
 #![deny(unsafe_code)]
 
 pub mod config;
+pub mod install;
 pub mod platform;
 pub mod server;
 

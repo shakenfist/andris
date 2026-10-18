@@ -9,7 +9,7 @@ use clap::Parser;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use andris::config::Args;
+use andris::config::{Cli, Command};
 
 /// The exit status for a configuration andris refused, the same status
 /// clap uses for a malformed command line. A supervisor should not
@@ -18,7 +18,18 @@ use andris::config::Args;
 const CONFIGURATION_REFUSED: u8 = 2;
 
 fn main() -> Result<ExitCode> {
-    let args = Args::parse();
+    let cli = Cli::parse();
+    // A subcommand runs instead of the server: before logging is set up,
+    // and without reading a ticket, opening a display or starting the
+    // async runtime.
+    match cli.command {
+        Some(Command::InstallUnit) => {
+            andris::install::run()?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        None => {}
+    }
+    let args = cli.serve;
 
     // RUST_LOG picks what is logged, and info is the default. Logs go to
     // stderr, in colour only when that is a terminal: under systemd it is

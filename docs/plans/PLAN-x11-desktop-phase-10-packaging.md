@@ -262,10 +262,20 @@ Later steps need not redo this.
 
    Running systemctl itself would make the command's tests touch a
    real user manager, and would make enabling a side effect of
-   installing. The `ExecStart` path is quoted and escaped by
-   systemd's rules: `%` becomes `%%`, `$` becomes `$$`, and `\` and
-   `"` are escaped inside double quotes. A path that is not UTF-8,
-   or that contains a newline, is refused.
+   installing. The `ExecStart` path is double-quoted, with `%`
+   doubled. Step 2 checked the remaining rules against systemd 257's
+   `systemd-analyze verify`, which corrected this decision's first
+   draft:
+   - `$` is left as it is, because systemd does not expand variables
+     in the executable path;
+   - a `"`, `'` or `\` is refused, because systemd rejects them in an
+     executable path whether or not they are escaped;
+   - a control character, a path that is not UTF-8 and a relative
+     path are refused too.
+
+   The unit names its ticket and environment file through `%E`,
+   which a user manager defines as `$XDG_CONFIG_HOME`, so the unit
+   and `install-unit` agree on where they are.
 
 6. **The unit gains `SystemCallFilter=@system-service`, killing on a
    violation.** systemd's default action kills the process with

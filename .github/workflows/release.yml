@@ -41,6 +41,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Check the version
         run: scripts/check-release-version.sh "${GITHUB_REF}"
@@ -76,6 +78,8 @@ jobs:
             runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Build the wheel
         run: scripts/build-andris-wheel.sh ${{ matrix.arch }}

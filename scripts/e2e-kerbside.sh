@@ -166,7 +166,11 @@ redact() {
     for secret in "$token" "$ticket"; do
         [ -n "$secret" ] || continue
         while IFS= read -r -d '' f; do
-            sed -i "s/$secret/REDACTED/g" "$f"
+            # Replaced as literal text, not as a regular expression, which
+            # a secret holding / or + or . would break or widen. perl
+            # takes it from its environment, not its code, and \Q quotes
+            # every character in it.
+            SECRET="$secret" perl -pi -e 's/\Q$ENV{SECRET}\E/REDACTED/g' "$f"
         done < <(grep -rlZF -- "$secret" "$artifacts" 2>/dev/null || true)
     done
     while IFS= read -r -d '' f; do

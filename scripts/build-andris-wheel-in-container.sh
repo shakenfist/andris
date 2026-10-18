@@ -6,7 +6,7 @@
 # is not meant to be run on a normal host.
 #
 # It builds andris into a manylinux_2_28 wheel with maturin (bindings =
-# "bin"), and checks two things before the wheel reaches target/wheels:
+# "bin"), and checks three things before the wheel reaches target/wheels:
 #
 # - **The tag is earned.** maturin runs its policy check
 #   (--auditwheel check) and refuses a binary that links a library
@@ -14,6 +14,8 @@
 #   rather than repairing the wheel by bundling the library. Andris
 #   loads libpulse at run time, so nothing needs an exception. The
 #   binary's DT_NEEDED list is printed for the record.
+# - **The binary names no library search path.** Loading libpulse at run
+#   time searches an RPATH or RUNPATH first, so andris must have neither.
 # - **openh264's SIMD code went in.** Without nasm, the openh264 crate
 #   silently builds without its x86 assembly, and encodes much slower.
 
@@ -70,12 +72,25 @@ with zipfile.ZipFile(wheel) as zf:
     print(zf.extract(names[0], dest))
 EOF
 )"
-NEEDED="$(readelf -d "${BINARY}" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p')"
+DYNAMIC="$(readelf -d "${BINARY}")"
+NEEDED="$(sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' <<< "${DYNAMIC}")"
 if [ -z "${NEEDED}" ]; then
     echo "no DT_NEEDED entries read from ${BINARY}" >&2
     exit 1
 fi
 echo "DT_NEEDED of the wheel's andris: ${NEEDED//$'\n'/ }"
+
+# dlopen("libpulse-simple.so.0") searches the binary's RPATH even before
+# the user's LD_LIBRARY_PATH, and its RUNPATH before ld.so.cache and the
+# default directories, so either would let a directory baked in here
+# supply the library in place of the host's own libpulse.
+SEARCH_PATHS="$(grep -E '\((RPATH|RUNPATH)\)' <<< "${DYNAMIC}" || true)"
+if [ -n "${SEARCH_PATHS}" ]; then
+    echo "the wheel's andris names a library search path, which it must not:" >&2
+    echo "${SEARCH_PATHS}" >&2
+    exit 1
+fi
+echo "The wheel's andris has no RPATH or RUNPATH"
 
 # The SIMD check. nm reads cargo's own binary, which keeps its symbol
 # table whatever packaging later does to the wheel's copy. The symbol is

@@ -359,6 +359,8 @@ jobs:
       no_proxy: 127.0.0.1,localhost
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       # Must stay directly after checkout; see the action for why.
       - uses: ./.github/actions/cargo-cache
@@ -409,6 +411,8 @@ jobs:
       cancel-in-progress: true
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       # Must stay directly after checkout; see the action for why.
       - uses: ./.github/actions/cargo-cache

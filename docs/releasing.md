@@ -222,7 +222,8 @@ a library outside the policy. There is no list of exceptions to keep.
 
 The build also fails if openh264's SIMD code is missing from the
 binary, which happens silently when nasm is absent and makes encoding
-far slower.
+far slower, and if the binary has an RPATH or RUNPATH, which would be
+searched for libpulse ahead of the host's own library directories.
 
 Andris's end-to-end tests run only on x86_64. The aarch64 wheel is
 checked by the same build checks and the same smoke test, which runs

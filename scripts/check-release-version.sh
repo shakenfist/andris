@@ -4,7 +4,10 @@
 # and the andris entry in Cargo.lock to agree, since the wheel is built
 # --frozen from both. Run by release.yml's check-version job.
 #
-# Usage: scripts/check-release-version.sh GITHUB_REF
+# Usage: scripts/check-release-version.sh GITHUB_REF [ROOT]
+#
+# ROOT, the directory holding Cargo.toml and Cargo.lock, defaults to this
+# checkout; scripts/test-check-release-version.sh points it at fixtures.
 #
 # A ref that is not a tag -- a workflow_dispatch on a branch, which
 # builds the wheels and publishes nothing -- has no version to compare
@@ -13,10 +16,11 @@
 
 set -euo pipefail
 
-REF="${1:?usage: check-release-version.sh GITHUB_REF}"
+REF="${1:?usage: check-release-version.sh GITHUB_REF [ROOT]}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="${2:-${REPO_ROOT}}"
 
-ACTUAL="$("${REPO_ROOT}/scripts/release-version.sh")"
+ACTUAL="$("${REPO_ROOT}/scripts/release-version.sh" "${ROOT}/Cargo.toml")"
 # The andris package's version line in Cargo.lock: the line after
 # `name = "andris"` in its [[package]] entry.
 LOCKED="$(awk '
@@ -26,7 +30,7 @@ LOCKED="$(awk '
         print
         exit
     }
-' "${REPO_ROOT}/Cargo.lock")"
+' "${ROOT}/Cargo.lock")"
 
 echo "Ref: ${REF}"
 echo "Workspace version: ${ACTUAL}"

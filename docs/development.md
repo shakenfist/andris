@@ -194,17 +194,21 @@ to build the stack's images and fetch kerbside, but not to run it.
 Bump the kerbside pin by hand, since Renovate tracks neither value:
 set `KERBSIDE_VERSION` to the new release and `KERBSIDE_REV` to the
 full commit its tag `v<version>` names, together. The fetch fails if
-the tag names another commit.
+the tag names another commit. The version in
+[Trying it with kerbside's demo stack](running.md#trying-it-with-kerbsides-demo-stack)
+moves with them, since that recipe runs the release the lane tests.
 
 ### The wheel
 
 `make wheel ARCH=x86_64` (or `aarch64`, on a host of that
 architecture) builds andris into a `manylinux_2_28` wheel in
 `target/wheels/`, with openh264 compiled in and checked for its SIMD
-code. It builds in its own image, on the manylinux base, with the same
-offline split as the targets above. The tag is earned: maturin's
-policy check runs without an exception list, and fails if the binary
-links a library outside the policy.
+code. It builds in its own image, on the manylinux base pinned by
+digest, with Rust and maturin at exact versions that Renovate bumps,
+and with the same offline split as the targets above. The tag is
+earned: maturin's policy check runs without an exception list, and
+fails if the binary links a library outside the policy. The build
+also fails if the binary has an RPATH or RUNPATH.
 [`scripts/wheel-smoke.sh`](https://github.com/shakenfist/andris/blob/develop/scripts/wheel-smoke.sh)
 then installs the wheel as pipx would in a stock `python:3-slim`
 container, which has no libpulse, no X server and no systemd, and
@@ -380,6 +384,10 @@ hooks are:
   which calls `make lint` so the hook and the Makefile cannot drift.
   It runs only when a `.rs` file or a `Cargo.toml`/`Cargo.lock`
   changes.
+- **The release version check's fixtures**,
+  [`scripts/test-check-release-version.sh`](https://github.com/shakenfist/andris/blob/develop/scripts/test-check-release-version.sh),
+  which runs `scripts/check-release-version.sh` against fixture
+  `Cargo.toml` and `Cargo.lock` files.
 - **actionlint** over the workflows, using
   [`.github/actionlint.yaml`](https://github.com/shakenfist/andris/blob/develop/.github/actionlint.yaml)
   to declare the self-hosted runner labels in use.

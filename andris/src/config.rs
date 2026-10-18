@@ -376,8 +376,9 @@ fn check_private(
 }
 
 /// The process's effective uid, from `/proc/self/status`. Andris is
-/// Linux-only, and this needs no new dependency.
-fn effective_uid() -> Result<u32> {
+/// Linux-only, and this needs no new dependency, nor an `unsafe` call to
+/// libc's `geteuid`.
+pub fn effective_uid() -> Result<u32> {
     let status = std::fs::read_to_string("/proc/self/status")
         .context("reading /proc/self/status for andris's effective uid")?;
     parse_effective_uid(&status).context("/proc/self/status names no effective uid")

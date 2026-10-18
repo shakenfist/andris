@@ -33,15 +33,18 @@ SPICE.
 | X11 platform | `platform/x11/` | XDamage on the root window, MIT-SHM capture through a shared memfd with `GetImage` as the fallback, XTEST input, XFIXES cursor and XKB key names, each on its own connection and thread (five connections: capture, which also makes the RandR resizes, input, cursor, damage, and the clipboard, whose thread has a small timer thread that wakes it at its deadlines); the MIT-SHM mapping is one of andris's two `unsafe` modules (`platform/x11/shm.rs`; the other is the libpulse bindings, and the rest of the crate denies it), because mapping memory that other processes write into cannot be expressed in safe Rust; it is kept sound by never making a Rust reference into the mapping and copying pixels out through raw pointers, so a concurrent writer can only tear pixels; the input queue is bounded, with room kept for releases; refuses an X server it cannot read as BGRX |
 
 Around the code: `Makefile` and `.devcontainer/` run cargo in a
-container; `scripts/e2e.sh` drives the end-to-end test;
+container; `scripts/e2e.sh` drives the end-to-end test, and
+`scripts/e2e-kerbside.sh` (`make e2e-kerbside`, with
+`scripts/kerbside-lane/`) runs it through kerbside's demo stack;
 `scripts/build-andris-wheel.sh` builds the manylinux wheel that
 `pipx install andris` installs, and `andris install-unit`
 (`andris/src/install.rs`) writes the systemd user unit from
 `packaging/systemd/` for whichever binary runs it;
-`.github/workflows/` holds the two-tier CI and the release workflow; `docs/plans/` holds the
-plans; `AGENTS.md` carries conventions for AI coding assistants;
-`PLAN-TEMPLATE.md` and `PUSH-AUDIT.md` are the planning template and
-the pre-push audit runbook.
+`.github/workflows/` holds the two-tier CI and the release workflow,
+whose scripts [`docs/releasing.md`](docs/releasing.md) describes;
+`docs/plans/` holds the plans; `AGENTS.md` carries conventions for AI
+coding assistants; `PLAN-TEMPLATE.md` and `PUSH-AUDIT.md` are the
+planning template and the pre-push audit runbook.
 
 ### How a frame reaches the wire
 

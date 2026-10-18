@@ -51,6 +51,10 @@ MemoryDenyWriteExecute=yes
 # with MIT-SHM capture and sound, which decides whether it stays; see
 # https://github.com/shakenfist/andris/blob/develop/docs/plans/PLAN-x11-desktop.md
 SystemCallFilter=@system-service
+# Only the native ABI's system calls, so that another ABI (on x86_64,
+# i386's or x32's) cannot reach calls the filter above would refuse; the
+# pairing systemd.exec(5) recommends.
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=default.target

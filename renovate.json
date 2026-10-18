@@ -1,7 +1,8 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "customManagers:githubActionsVersions"
+    "customManagers:githubActionsVersions",
+    "customManagers:dockerfileVersions"
   ],
   "gitAuthor": "shakenfist-bot <bot@shakenfist.com>",
   "dependencyDashboard": true,

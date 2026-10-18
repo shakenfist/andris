@@ -30,23 +30,21 @@ case "${TAG_NAME}" in
         ;;
 esac
 
-# Kept in step with ryll's copy. The download is checked against the
-# release's checksums.txt before it is installed.
+# Kept in step with ryll's copy, by hand: Renovate does not track it.
+# The download is checked against a hash held here, not against the
+# checksums.txt of the release it came from, which whoever could replace
+# the binary could replace too. The version and the hash move together:
+# take the new hash from the release's checksums.txt, and check it
+# against a download of the binary.
 GITSIGN_VERSION='0.14.0'
+GITSIGN_SHA256='23fcc3d71e0abcbc635b1b95dbe758ac08773e3642b407646c32c3cf4c6def74'
 BINARY="gitsign_${GITSIGN_VERSION}_linux_amd64"
 BASE="https://github.com/sigstore/gitsign/releases/download/v${GITSIGN_VERSION}"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
-(
-    cd "${WORK}"
-    curl -fsSLO "${BASE}/${BINARY}"
-    curl -fsSLO "${BASE}/checksums.txt"
-    sha256sum --ignore-missing -c checksums.txt
-    # --ignore-missing passes when no line names the file at all, so
-    # check that one did.
-    grep -q " ${BINARY}\$" checksums.txt
-)
+curl -fsSL -o "${WORK}/${BINARY}" "${BASE}/${BINARY}"
+echo "${GITSIGN_SHA256}  ${WORK}/${BINARY}" | sha256sum --strict -c -
 chmod +x "${WORK}/${BINARY}"
 sudo mv "${WORK}/${BINARY}" /usr/local/bin/gitsign
 

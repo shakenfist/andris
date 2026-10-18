@@ -426,7 +426,7 @@ management session reviews each diff and makes each commit.
 | 5 | high | opus | none | Complete | The kerbside lane: `make e2e-kerbside` and its merge-tier job. See brief 5. |
 | 6 | medium | sonnet | none | Complete | Documentation, including the soak recipe. See brief 6. |
 | 7 | medium | management | none | Complete | Operator check of the wheel on `:10`. See brief 7. |
-| 8 | medium | management | none | Not started | Push audit and pull request. See brief 8. |
+| 8 | medium | management | none | In progress | Push audit and pull request. See brief 8. |
 | 9 | low | operator | none | Not started | PyPI trusted publisher, the `release` environment, tag protection. See brief 9. |
 | 10 | low | management | none | Not started | Release 0.1.0. See brief 10. |
 | 11 | medium | operator | none | Not started | The week's soak through kerbside. See brief 11. |
@@ -1046,3 +1046,78 @@ session read, from `systemctl show` and the journal only:
 The cursor warning, `hot spot (1, 1) is outside a 1x1 cursor`,
 appears at startup with both the old binary and the new one, so it is
 not a regression from packaging.
+
+### Step 8: push audit
+
+`PUSH-AUDIT.md` ran over `develop...HEAD` on 2026-10-18. Wave 1
+(`pre-commit run --all-files`, `make lint`, `make test`) passed on the
+step 7 tip. Wave 2's five reviewers found nothing blocking, critical
+or high. Style conformance passed outright.
+
+Taken, in one commit, each verified as noted:
+
+- **Security:**
+  - The wheel image's toolchain is pinned: the manylinux base by
+    digest for each architecture, Rust 1.99.1, and maturin 1.15.0
+    with `--require-hashes`. Renovate tracks all three.
+  - `install-unit` refuses to run as root, which would follow the
+    user's symbolic links; the `root_is_refused` mutation fails.
+  - `SystemCallArchitectures=native` sits beside `SystemCallFilter`.
+  - `sign-release-tag.sh` checks gitsign against a sha256 held in the
+    script, not the release's own `checksums.txt`.
+  - `persist-credentials: false` on the jobs that never push.
+  - The wheel build fails on an RPATH or RUNPATH; a build linked with
+    `-rpath,/tmp` fails it.
+- **Tests:**
+  - `tests/cli.rs` runs `install-unit` through the real binary, with
+    `DISPLAY` cleared and a temporary config home, on its success
+    path and a refused config home.
+  - `scripts/test-check-release-version.sh` gives
+    `check-release-version.sh` eleven fixture cases, run by
+    pre-commit; two mutations of the script fail it.
+- **Code:** `e2e-kerbside.sh`'s `redact()` replaces each secret as
+  literal text. sed's regular expression broke on `/`, and a fixture
+  token `ab/c+d.e*f$1` now redacts exactly.
+- **Documentation:** ARCHITECTURE.md maps the kerbside lane and links
+  `docs/releasing.md`. `docs/development.md` says the running.md
+  recipe's kerbside version moves with the Makefile's pin.
+
+After the fixes, `pre-commit`, `make lint`, `make test`, `make wheel
+ARCH=x86_64` with `scripts/wheel-smoke.sh`, and `make e2e-kerbside`
+all passed.
+
+Declined:
+
+- **The tag ruleset rejects `sign-tag`'s force-push** (security,
+  medium). Refuted: ryll's live ruleset has the same rules
+  (`creation`, `deletion`, `non_fast_forward`, bypassed only by the
+  admin role). Its v0.3.0 tag object is tagged by
+  `github-actions[bot]`, so CI's re-signed tag was accepted.
+- **Actions pinned by tag, not SHA** (security, medium). Ryll's
+  release workflow does the same; that is a fleet decision for
+  shakenfist/development's templates, not this branch.
+- **Warning on a group- or other-writable binary directory**
+  (security, low). pipx installs under the user's home, and the
+  check would have to walk every parent directory.
+- **Secrets in CI logs, the kerbside cache, Renovate on the static
+  runner, self-review** (security, informational). Per-run secrets in
+  a network-less stack; the rest are fleet template choices.
+- **Duplication in `e2e.sh` and the wheel scripts, and comment
+  length** (code quality, advisory). Deliberate shell ports of the
+  Makefile, each saying so; the long comments carry the why
+  (systemd's quoting rules, header citations).
+- **`config.rs` at 993 lines** (advisory). Under the 1,500 line
+  threshold; splitting `Cli` off is a separate change.
+- **The remaining edge cases of `install-unit`** (tests, advisory),
+  such as a directory at the unit path. These are each refused by a
+  plain filesystem error, which the cli test's refused path
+  exercises in kind.
+- **README's `pipx install andris` before 0.1.0 is on PyPI**
+  (documentation, advisory). The docs ship in the pull request that
+  precedes the release; step 10 follows the merge.
+- **`make wheel` and `make e2e-kerbside` in AGENTS.md** (advisory).
+  `docs/development.md` covers them, and they hold no convention an
+  agent could not read there.
+
+The unit changed after step 7, so the operator re-runs `andris
+install-unit` and restarts `andris@10` before the soak.

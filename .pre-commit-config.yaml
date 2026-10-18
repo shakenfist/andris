@@ -8,6 +8,13 @@ repos:
         language: script
         pass_filenames: false
         files: \.rs$|Cargo\.(toml|lock)$
+      # The release workflow's version check, against fixtures.
+      - id: check-release-version
+        name: check-release-version.sh fixtures
+        entry: ./scripts/test-check-release-version.sh
+        language: script
+        pass_filenames: false
+        files: ^scripts/(test-check-|check-)?release-version\.sh$
 
   # GitHub Actions workflow linter. The config declares the self-hosted
   # runner labels the workflows use.

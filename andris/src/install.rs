@@ -27,7 +27,7 @@ use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 
-use crate::config::read_ticket_file;
+use crate::config::{effective_uid, read_ticket_file};
 
 /// The unit template, `packaging/systemd/andris@.service`. Its
 /// `ExecStart=` names a bare `andris`, which [`render_unit`] replaces.
@@ -475,10 +475,28 @@ pub fn config_home(xdg_config_home: Option<OsString>, home: Option<OsString>) ->
     }
 }
 
+/// Refuse to install when `euid`, the effective user, is root.
+///
+/// The unit is a *user* unit, installed into a directory the environment
+/// names. Under sudo with `HOME` or `XDG_CONFIG_HOME` kept, root would
+/// create directories, follow symbolic links (`andris/` among them, on
+/// purpose) and remove and write files in a directory the user chose,
+/// and leave root-owned files in the user's configuration besides.
+pub fn refuse_root(euid: u32) -> Result<()> {
+    if euid == 0 {
+        bail!(
+            "andris install-unit installs a systemd user unit, and must be run as the user whose \
+             desktop andris will export, not as root or under sudo"
+        );
+    }
+    Ok(())
+}
+
 /// `andris install-unit`: install for the running binary, under the
 /// configuration directory the environment names, and print what was
 /// done and what to run next.
 pub fn run() -> Result<()> {
+    refuse_root(effective_uid()?)?;
     let exe = std::env::current_exe().context("cannot find andris's own path")?;
     // The kernel's name for a binary deleted since it started ends
     // " (deleted)"; a unit naming it would never start.
@@ -601,6 +619,12 @@ mod tests {
         assert!(
             unit.lines()
                 .any(|line| line == "SystemCallFilter=@system-service"),
+            "{unit}"
+        );
+        // Without it, a call made through another ABI escapes the filter.
+        assert!(
+            unit.lines()
+                .any(|line| line == "SystemCallArchitectures=native"),
             "{unit}"
         );
         // NoNewPrivileges=yes is what lets a user unit filter calls.
@@ -822,6 +846,15 @@ mod tests {
                 "{steps}"
             );
             assert!(steps.contains(STARTING_DOC), "{steps}");
+        }
+    }
+
+    #[test]
+    fn root_is_refused() {
+        let message = format!("{:#}", refuse_root(0).unwrap_err());
+        assert!(message.contains("not as root or under sudo"), "{message}");
+        for euid in [1, 1000, 65534] {
+            assert!(refuse_root(euid).is_ok(), "{euid}");
         }
     }
 

@@ -57,7 +57,8 @@ systemctl --user restart andris@10
 ```
 Systemd cannot run a binary whose path holds a quote, a backslash or a
 control character, so `install-unit` refuses one; install andris
-elsewhere if yours does.
+elsewhere if yours does. It also refuses to run as root, sudo
+included: run it as the user whose desktop andris will export.
 
 It reports an `andris/` directory that is open to other users, and a
 ticket andris would refuse (see

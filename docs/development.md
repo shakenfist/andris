@@ -189,7 +189,10 @@ it redacts the run's secrets from the logs it keeps in
 `docker compose down -v` however it ends.
 
 It needs Docker Compose 2.24 or newer, for `!reset`, and the network
-to build the stack's images and fetch kerbside, but not to run it.
+to build the stack's images and fetch kerbside, but not to run it. The
+CI runners have Docker but not Compose, so the merge-tier job first
+runs `scripts/install-compose.sh`, which installs Debian's
+`docker-compose` package where `docker compose` does not already run.
 
 Bump the kerbside pin by hand, since Renovate tracks neither value:
 set `KERBSIDE_VERSION` to the new release and `KERBSIDE_REV` to the

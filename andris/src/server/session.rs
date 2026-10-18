@@ -182,6 +182,12 @@ impl Session {
         self.stats.snapshot()
     }
 
+    /// When the session began: the zero of its clock, from which the
+    /// multimedia time is counted.
+    pub fn started(&self) -> Instant {
+        self.started
+    }
+
     /// Time since the session began.
     pub fn elapsed(&self) -> Duration {
         self.started.elapsed()

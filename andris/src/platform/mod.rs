@@ -1,6 +1,6 @@
 //! The platform seams: what andris needs from the desktop it exports.
 //!
-//! Six traits separate the SPICE server from the display system:
+//! Seven traits separate the SPICE server from the desktop:
 //!
 //! - [`DisplayGeometry`] reports the size of the desktop;
 //! - [`ScreenSource`] reports where the desktop changed, as damage, and
@@ -10,13 +10,17 @@
 //! - [`CursorSource`] yields the cursor shape as it changes;
 //! - [`DisplayControl`] asks the desktop to change its size;
 //! - [`Clipboard`] follows the text on the desktop's clipboard, and puts
-//!   text there.
+//!   text there;
+//! - [`AudioSource`] captures the desktop's sound, in 10 ms frames.
 //!
 //! [`Platform`] bundles one implementation of each, with a [`GoneSignal`]
 //! that is set, with the reason, once the desktop has gone for good: when
 //! the connection to the X display fails, say. [`synthetic`] is a
 //! deterministic implementation for tests and load testing, and [`x11`]
-//! exports an X display.
+//! exports an X display. Sound does not come from the display system, so
+//! it is a seam of its own: [`pulse`] captures it from the session's sound
+//! server, beside either display backend, and the synthetic platform plays
+//! a tone. Audio is optional, and a platform may have none.
 //!
 //! # Threads
 //!
@@ -36,17 +40,22 @@
 //! - [`DisplayControl::set_size`] **may block**, for as long as the
 //!   desktop takes to answer;
 //! - [`Clipboard::changes`] and [`Clipboard::set`] never block: the
-//!   receiver is awaited, and `set` only queues the text.
+//!   receiver is awaited, and `set` only queues the text;
+//! - [`AudioSource::open`] never blocks: capture starts on a thread or
+//!   task of its own, and its receiver is awaited.
 //!
 //! [`damage`] holds the types damage is reported in, and how it is
-//! accumulated.
+//! accumulated. [`audio`] holds the audio frame, and the queue that
+//! carries frames from capture to the server.
 //!
 //! This module knows nothing of SPICE. Mapping SPICE's scancodes, button
 //! ids and modifier flags onto these types is the server's job, as is
 //! speaking the guest agent protocol that resizes and clipboard text
 //! arrive in.
 
+pub mod audio;
 pub mod damage;
+pub mod pulse;
 pub mod synthetic;
 pub mod x11;
 
@@ -59,6 +68,11 @@ use anyhow::{Context, Result, bail, ensure};
 use shakenfist_spice_compression::{MAX_IMAGE_DIMENSION, MAX_IMAGE_PIXELS};
 use tokio::sync::watch;
 
+pub use audio::{
+    AUDIO_CHANNELS, AUDIO_FRAME_BYTES, AUDIO_FRAME_DURATION, AUDIO_FRAME_SAMPLES,
+    AUDIO_FRAME_VALUES, AUDIO_QUEUE_FRAMES, AUDIO_RATE, AudioFrame, AudioReceiver, AudioSender,
+    audio_queue,
+};
 pub use damage::{DamageHub, DamageSubscription, Rectangle, Region, TILE};
 
 /// The most clipboard text andris carries in either direction, in bytes.
@@ -674,6 +688,32 @@ pub trait Clipboard: Send + Sync {
     fn set(&self, text: Arc<str>) -> Result<()>;
 }
 
+/// Captures the desktop's sound.
+///
+/// Capture runs only while someone listens: [`AudioSource::open`] starts
+/// it, and dropping the receiver it returns stops it, so the sound server
+/// is not held, nor a sink kept awake, with nobody listening. Each open is
+/// a fresh capture, with a queue of its own.
+///
+/// Frames are [`AUDIO_FRAME_SAMPLES`] samples a channel, S16 stereo at
+/// [`AUDIO_RATE`], paced by the source's clock: a sound server's, or a
+/// timer's. Each carries its capture time, and within one receiver those
+/// times never go backwards. When the consumer falls behind, the receiver
+/// drops the oldest frames and counts them (see [`audio`]).
+///
+/// Sound failing must never end a session, so failures are not errors of
+/// the seam: a capture that cannot start (no sound server, a source that
+/// does not exist) or that fails part way is logged once, as a warning,
+/// and closes the receiver. Opening again tries again.
+pub trait AudioSource: Send + Sync {
+    /// Start capturing, and return the receiver frames arrive on. Never
+    /// blocks: connecting to a sound server happens on the capture's own
+    /// thread or task. Fails only when capture cannot even be started (a
+    /// thread cannot be spawned, say); a capture that starts and then
+    /// fails closes the receiver instead.
+    fn open(&self) -> Result<AudioReceiver>;
+}
+
 /// One implementation of each seam, shared by the server's tasks, and the
 /// signal that the desktop behind them has gone.
 #[derive(Clone)]
@@ -684,6 +724,9 @@ pub struct Platform {
     pub cursor: Arc<dyn CursorSource>,
     pub display_control: Arc<dyn DisplayControl>,
     pub clipboard: Arc<dyn Clipboard>,
+    /// The desktop's sound, or `None` when andris captures none
+    /// (`--no-audio`).
+    pub audio: Option<Arc<dyn AudioSource>>,
     /// Set once the desktop has gone for good; `andris` exits when it is.
     pub gone: GoneSignal,
 }

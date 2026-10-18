@@ -14,12 +14,12 @@ pub mod display;
 
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use andris::config::Ticket;
-use andris::platform::Size;
 use andris::platform::synthetic::SyntheticPlatform;
+use andris::platform::{AudioSource, Platform, Size};
 use andris::server::{
     DisplayOptions, HandshakeTimeouts, Server, ServerHandle, ServerOptions, TlsOptions,
 };
@@ -36,8 +36,12 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
-/// The ticket every test server uses.
-pub const TICKET: &str = "andris-test-ticket";
+/// The ticket every test server in this process uses. It is random, so
+/// no test can depend on its value and none is written in the source.
+pub fn ticket() -> &'static str {
+    static TICKET: OnceLock<String> = OnceLock::new();
+    TICKET.get_or_init(|| format!("andris-test-{:016x}", rand::random::<u64>()))
+}
 
 /// How long any one wait may take. Generous, because RSA key generation
 /// in a debug build is slow, and several may run at once.
@@ -147,11 +151,41 @@ impl TestServer {
         Self::start_on(tls, size, display, timeouts).await
     }
 
+    /// A server with only a plain listener whose platform's sound is
+    /// `audio` in place of the synthetic tone: `None` as `--no-audio`
+    /// leaves it.
+    pub async fn start_with_audio(audio: Option<Arc<dyn AudioSource>>) -> Self {
+        let size = Size {
+            width: 256,
+            height: 192,
+        };
+        Self::start_custom(
+            false,
+            size,
+            display_options(),
+            HandshakeTimeouts::default(),
+            move |platform| platform.audio = audio,
+        )
+        .await
+    }
+
     async fn start_on(
         tls: bool,
         size: Size,
         display: DisplayOptions,
         timeouts: HandshakeTimeouts,
+    ) -> Self {
+        Self::start_custom(tls, size, display, timeouts, |_| {}).await
+    }
+
+    /// A server whose synthetic platform `customise` adjusts before the
+    /// server is given it.
+    async fn start_custom(
+        tls: bool,
+        size: Size,
+        display: DisplayOptions,
+        timeouts: HandshakeTimeouts,
+        customise: impl FnOnce(&mut Platform),
     ) -> Self {
         init_logging();
         let platform = SyntheticPlatform::new(size).unwrap();
@@ -174,15 +208,13 @@ impl TestServer {
         let options = ServerOptions {
             listen: "127.0.0.1:0".parse().unwrap(),
             tls: tls_options,
-            ticket: Ticket::new(TICKET).unwrap(),
+            ticket: Ticket::new(ticket()).unwrap(),
             display,
             timeouts,
         };
-        let handle = Server::bind(options, platform.platform())
-            .await
-            .unwrap()
-            .spawn()
-            .unwrap();
+        let mut seams = platform.platform();
+        customise(&mut seams);
+        let handle = Server::bind(options, seams).await.unwrap().spawn().unwrap();
         Self {
             handle,
             platform,
@@ -237,7 +269,37 @@ impl TestServer {
             .link_with_caps(connection_id, channel_type, channel_caps)
             .await;
         assert_eq!(reply.error, SpiceError::Ok, "linking {channel_type:?}");
-        client.auth(TICKET).await.unwrap();
+        client.auth(ticket()).await.unwrap();
+        client
+    }
+
+    /// A client on the plain listener whose socket's receive buffer is
+    /// asked to be `recv_buffer` bytes, with an authenticated channel whose
+    /// link advertised `channel_caps`. A small buffer makes a client that
+    /// stops reading stall the server's writes quickly.
+    pub async fn open_with_recv_buffer(
+        &self,
+        connection_id: u32,
+        channel_type: ChannelType,
+        channel_caps: u32,
+        recv_buffer: u32,
+    ) -> TestClient {
+        let socket = TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(recv_buffer).unwrap();
+        let tcp = tokio::time::timeout(WAIT, socket.connect(self.addr()))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut client = TestClient {
+            stream: SpiceStream::Plain(tcp),
+            buf: ReceiveBuffer::new(),
+            last_key: None,
+        };
+        let reply = client
+            .link_with_caps(connection_id, channel_type, channel_caps)
+            .await;
+        assert_eq!(reply.error, SpiceError::Ok, "linking {channel_type:?}");
+        client.auth(ticket()).await.unwrap();
         client
     }
 

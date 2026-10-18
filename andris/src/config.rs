@@ -12,6 +12,7 @@ use clap::{Parser, ValueEnum};
 use tracing::warn;
 
 use crate::platform::Size;
+use crate::platform::pulse::DEFAULT_SOURCE;
 use crate::server::TlsOptions;
 use crate::server::tls::load_server_config;
 use crate::server::updates::JpegQuality;
@@ -106,6 +107,17 @@ pub struct Args {
         value_parser = clap::value_parser!(u8).range(0..=100),
     )]
     pub jpeg_quality: u8,
+
+    /// Capture no sound from the desktop.
+    #[arg(long)]
+    pub no_audio: bool,
+
+    /// The PulseAudio source to capture the desktop's sound from, for
+    /// `--platform x11`. The default, @DEFAULT_MONITOR@, is the monitor of
+    /// the session's default sink: whatever the desktop plays. PipeWire's
+    /// pipewire-pulse serves the same names.
+    #[arg(long, value_name = "NAME", conflicts_with = "no_audio")]
+    pub audio_source: Option<String>,
 }
 
 /// The platform to build, with what it needs.
@@ -115,6 +127,18 @@ pub enum PlatformConfig {
     X11 { display: String },
     /// The synthetic test pattern, at this size.
     Synthetic { size: Size },
+}
+
+/// Where the desktop's sound comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AudioConfig {
+    /// Nowhere: `--no-audio`.
+    Off,
+    /// A PulseAudio source, by name: the default for `--platform x11`.
+    Pulse { source: String },
+    /// The synthetic platform's tone: the default for `--platform
+    /// synthetic`.
+    Tone,
 }
 
 /// The SPICE ticket. Its `Debug` output does not show it.
@@ -161,6 +185,7 @@ pub struct Config {
     pub frame_interval: Duration,
     /// The quality to send JPEG at, or `None` for `--jpeg-quality 0`.
     pub jpeg_quality: Option<JpegQuality>,
+    pub audio: AudioConfig,
 }
 
 impl Args {
@@ -193,6 +218,24 @@ impl Args {
 
         let ticket = read_ticket_file(&self.ticket_file)?;
 
+        let audio = match (self.no_audio, self.platform, self.audio_source) {
+            // clap refuses --no-audio with --audio-source.
+            (true, _, _) => AudioConfig::Off,
+            (false, PlatformKind::X11, None) => AudioConfig::Pulse {
+                source: DEFAULT_SOURCE.to_string(),
+            },
+            (false, PlatformKind::X11, Some(source)) if source.is_empty() => bail!(
+                "--audio-source is empty: name a PulseAudio source, or leave it out for the \
+                 default sink's monitor"
+            ),
+            (false, PlatformKind::X11, Some(source)) => AudioConfig::Pulse { source },
+            (false, PlatformKind::Synthetic, None) => AudioConfig::Tone,
+            (false, PlatformKind::Synthetic, Some(source)) => bail!(
+                "--audio-source {source} names a PulseAudio source, but --platform synthetic \
+                 plays a tone of its own: leave --audio-source out, or use --platform x11"
+            ),
+        };
+
         let platform = match self.platform {
             PlatformKind::X11 => match self.display {
                 Some(display) if !display.is_empty() => PlatformConfig::X11 { display },
@@ -214,6 +257,7 @@ impl Args {
             frame_interval: Duration::from_millis(self.frame_interval_ms),
             // The parser allows 0 to 100, and 0 means none.
             jpeg_quality: JpegQuality::new(self.jpeg_quality),
+            audio,
         })
     }
 }
@@ -405,6 +449,7 @@ mod tests {
         );
         assert_eq!(config.frame_interval, Duration::from_millis(33));
         assert_eq!(config.jpeg_quality, JpegQuality::new(85));
+        assert_eq!(config.audio, AudioConfig::Tone);
     }
 
     #[test]
@@ -757,5 +802,68 @@ mod tests {
     fn clap_definition_is_consistent() {
         use clap::CommandFactory;
         Args::command().debug_assert();
+    }
+
+    /// Parse `extra` after a good ticket file and `--platform x11
+    /// --display :10`.
+    fn parse_x11(ticket: &NamedTempFile, extra: &[&str]) -> Result<Args, clap::Error> {
+        let path = ticket.path().to_str().unwrap();
+        let mut argv = vec!["andris", "--ticket-file", path, "--display", ":10"];
+        argv.extend_from_slice(extra);
+        Args::try_parse_from(argv)
+    }
+
+    #[test]
+    fn x11_captures_the_default_monitor_unless_told_otherwise() {
+        let ticket = ticket_file(b"secret", 0o600);
+        let config = parse_x11(&ticket, &[]).unwrap().validate().unwrap();
+        assert_eq!(
+            config.audio,
+            AudioConfig::Pulse {
+                source: "@DEFAULT_MONITOR@".into()
+            }
+        );
+        let config = parse_x11(&ticket, &["--audio-source", "xrdp-sink.monitor"])
+            .unwrap()
+            .validate()
+            .unwrap();
+        assert_eq!(
+            config.audio,
+            AudioConfig::Pulse {
+                source: "xrdp-sink.monitor".into()
+            }
+        );
+        let message = error(parse_x11(&ticket, &["--audio-source", ""]).unwrap());
+        assert!(message.contains("--audio-source is empty"), "{message}");
+    }
+
+    #[test]
+    fn no_audio_turns_sound_off_on_either_platform() {
+        let ticket = ticket_file(b"secret", 0o600);
+        let config = parse_x11(&ticket, &["--no-audio"])
+            .unwrap()
+            .validate()
+            .unwrap();
+        assert_eq!(config.audio, AudioConfig::Off);
+        let config = parse(&ticket, &["--no-audio"]).validate().unwrap();
+        assert_eq!(config.audio, AudioConfig::Off);
+    }
+
+    #[test]
+    fn no_audio_and_audio_source_conflict() {
+        let ticket = ticket_file(b"secret", 0o600);
+        let message = parse_x11(&ticket, &["--no-audio", "--audio-source", "x"])
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("--no-audio"), "{message}");
+        assert!(message.contains("--audio-source"), "{message}");
+    }
+
+    #[test]
+    fn the_synthetic_platform_refuses_an_audio_source() {
+        let ticket = ticket_file(b"secret", 0o600);
+        let message = error(parse(&ticket, &["--audio-source", "sink.monitor"]));
+        assert!(message.contains("--audio-source sink.monitor"), "{message}");
+        assert!(message.contains("--platform synthetic"), "{message}");
     }
 }

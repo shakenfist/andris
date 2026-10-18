@@ -18,6 +18,13 @@
 //! and is not refreshed losslessly, and what matters about it (how many
 //! streams came and went, what bitrate they aimed for) has no meaning
 //! for a draw. The draw counters stay exactly the draws.
+//!
+//! The playback channel has counters of its own too: audio frames sent,
+//! how long Opus took to encode them, how many capture dropped because
+//! the channel fell behind, and how often the stream started and
+//! stopped. Its bytes are the playback channel's, in the per-channel
+//! counters. An interval in which only sound was sent is logged like one
+//! in which frames were.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -41,7 +48,7 @@ const ENCODINGS: usize = 3;
 
 /// How many per-channel byte counters there are: one for each channel
 /// type andris serves.
-const CHANNELS: usize = 4;
+const CHANNELS: usize = 5;
 
 /// The slot of `encoding` in the per-encoding counters, below
 /// [`ENCODINGS`].
@@ -61,6 +68,7 @@ const fn channel_slot(channel: ChannelType) -> Option<usize> {
         ChannelType::Display => Some(1),
         ChannelType::Inputs => Some(2),
         ChannelType::Cursor => Some(3),
+        ChannelType::Playback => Some(4),
         _ => None,
     }
 }
@@ -92,6 +100,15 @@ fn ms(duration: Option<Duration>) -> String {
     duration.map_or_else(
         || '-'.to_string(),
         |d| format!("{:.1}", d.as_secs_f64() * 1e3),
+    )
+}
+
+/// `duration` in milliseconds to two decimal places, or `-` for `None`:
+/// for times well under a millisecond, such as an Opus frame's encode.
+fn fine_ms(duration: Option<Duration>) -> String {
+    duration.map_or_else(
+        || '-'.to_string(),
+        |d| format!("{:.2}", d.as_secs_f64() * 1e3),
     )
 }
 
@@ -190,6 +207,11 @@ pub struct Stats {
     stream_server_drops: AtomicU64,
     /// A gauge, not a counter: the live stream's target, or 0.
     stream_target_bps: AtomicU64,
+    audio_frames: AtomicU64,
+    audio_encode: Timing,
+    audio_drops: AtomicU64,
+    audio_starts: AtomicU64,
+    audio_stops: AtomicU64,
 }
 
 impl Stats {
@@ -288,13 +310,45 @@ impl Stats {
         self.stream_target_bps.store(u64::from(bps), RELAXED);
     }
 
+    /// Count one playback `DATA` sent.
+    pub fn audio_frame_sent(&self) {
+        self.audio_frames.fetch_add(1, RELAXED);
+    }
+
+    /// Record the time encoding one audio frame as Opus took.
+    pub fn audio_encode_done(&self, took: Duration) {
+        self.audio_encode.record(took);
+    }
+
+    /// Count `frames` of sound that capture dropped because the playback
+    /// channel had not taken them in time.
+    pub fn audio_dropped(&self, frames: u64) {
+        saturating_add(&self.audio_drops, frames);
+    }
+
+    /// Count a playback `START`.
+    pub fn audio_started(&self) {
+        self.audio_starts.fetch_add(1, RELAXED);
+    }
+
+    /// Count a playback `STOP`.
+    pub fn audio_stopped(&self) {
+        self.audio_stops.fetch_add(1, RELAXED);
+    }
+
     /// Read every metric. The reads are independent, so a snapshot taken
     /// while channels run may be a message or two out of step.
     pub fn snapshot(&self) -> StatsSnapshot {
         // In slot order: see encoding_slot and channel_slot.
         let [lz4_draws, bitmap_draws, jpeg_draws] = load(&self.draws);
         let [lz4_bytes, bitmap_bytes, jpeg_bytes] = load(&self.draw_bytes);
-        let [main_bytes, display_bytes, inputs_bytes, cursor_bytes] = load(&self.channel_bytes);
+        let [
+            main_bytes,
+            display_bytes,
+            inputs_bytes,
+            cursor_bytes,
+            playback_bytes,
+        ] = load(&self.channel_bytes);
         StatsSnapshot {
             frames: self.frames.load(RELAXED),
             refreshes: self.refreshes.load(RELAXED),
@@ -308,6 +362,7 @@ impl Stats {
             display_bytes,
             inputs_bytes,
             cursor_bytes,
+            playback_bytes,
             capture: self.capture.read(),
             encode: self.encode.read(),
             captured_area: self.captured_area.load(RELAXED),
@@ -322,6 +377,11 @@ impl Stats {
             stream_encode: self.stream_encode.read(),
             stream_server_drops: self.stream_server_drops.load(RELAXED),
             stream_target_bps: self.stream_target_bps.load(RELAXED),
+            audio_frames: self.audio_frames.load(RELAXED),
+            audio_encode: self.audio_encode.read(),
+            audio_drops: self.audio_drops.load(RELAXED),
+            audio_starts: self.audio_starts.load(RELAXED),
+            audio_stops: self.audio_stops.load(RELAXED),
         }
     }
 }
@@ -354,6 +414,8 @@ pub struct StatsSnapshot {
     pub inputs_bytes: u64,
     /// Bytes written on the cursor channel, headers included.
     pub cursor_bytes: u64,
+    /// Bytes written on the playback channel, headers included.
+    pub playback_bytes: u64,
     /// Desktop captures, the scrub's included.
     pub capture: TimingSnapshot,
     /// Passes of the update pipeline: comparing, merging and encoding.
@@ -384,6 +446,17 @@ pub struct StatsSnapshot {
     /// The live stream's target bitrate, in bits a second, or 0 if no
     /// stream is live. A gauge: [`StatsSnapshot::since`] keeps it.
     pub stream_target_bps: u64,
+    /// Playback `DATA`s sent: 10 ms frames of sound.
+    pub audio_frames: u64,
+    /// Encoding an audio frame as Opus; nothing in raw mode.
+    pub audio_encode: TimingSnapshot,
+    /// Audio frames capture dropped because the playback channel fell
+    /// behind.
+    pub audio_drops: u64,
+    /// Playback `START`s sent.
+    pub audio_starts: u64,
+    /// Playback `STOP`s sent.
+    pub audio_stops: u64,
 }
 
 impl StatsSnapshot {
@@ -394,13 +467,17 @@ impl StatsSnapshot {
 
     /// Bytes written on every channel.
     pub fn total_bytes(&self) -> u64 {
-        self.main_bytes + self.display_bytes + self.inputs_bytes + self.cursor_bytes
+        self.main_bytes
+            + self.display_bytes
+            + self.inputs_bytes
+            + self.cursor_bytes
+            + self.playback_bytes
     }
 
-    /// Whether any frame, refresh or stream frame was sent: what the
-    /// periodic log line waits for.
+    /// Whether any frame, refresh, stream frame or audio frame was sent:
+    /// what the periodic log line waits for.
     pub fn has_frames(&self) -> bool {
-        self.frames + self.refreshes + self.stream_frames > 0
+        self.frames + self.refreshes + self.stream_frames + self.audio_frames > 0
     }
 
     /// What happened since `prev`, an earlier snapshot of the same
@@ -425,9 +502,10 @@ impl StatsSnapshot {
         since!(
             counters: frames, refreshes, lz4_draws, bitmap_draws, jpeg_draws, lz4_bytes,
                 bitmap_bytes, jpeg_bytes, main_bytes, display_bytes, inputs_bytes, cursor_bytes,
-                captured_area, changed_area, scrub_tiles, streams_created, streams_destroyed,
-                stream_frames, stream_bytes, stream_server_drops;
-            timings: capture, encode, ack_lag, ping, stream_encode;
+                playback_bytes, captured_area, changed_area, scrub_tiles, streams_created,
+                streams_destroyed, stream_frames, stream_bytes, stream_server_drops, audio_frames,
+                audio_drops, audio_starts, audio_stops;
+            timings: capture, encode, ack_lag, ping, stream_encode, audio_encode;
             gauges: stream_target_bps
         )
     }
@@ -453,7 +531,8 @@ impl StatsSnapshot {
             "{:.1} fps ({} refreshes), draws lz4={} bitmap={} jpeg={}, display {:.0} kbit/s, \
              capture {} ms, encode {} ms, ack lag {} ms, ping {} ms, scrub tiles {}, \
              changed {} of captured, streams created={} destroyed={}, stream frames {} at \
-             {:.0} kbit/s, stream encode {} ms, server drops {}, stream target {}",
+             {:.0} kbit/s, stream encode {} ms, server drops {}, stream target {}, audio frames {} \
+             at {:.0} kbit/s, opus encode {} ms, audio drops {}, audio starts={} stops={}",
             (self.frames + self.refreshes) as f64 / secs,
             self.refreshes,
             self.lz4_draws,
@@ -473,6 +552,12 @@ impl StatsSnapshot {
             self.stream_encode.mean_ms(),
             self.stream_server_drops,
             target,
+            self.audio_frames,
+            self.playback_bytes as f64 * 8.0 / 1000.0 / secs,
+            fine_ms(self.audio_encode.mean()),
+            self.audio_drops,
+            self.audio_starts,
+            self.audio_stops,
         )
     }
 }
@@ -556,6 +641,49 @@ mod tests {
     }
 
     #[test]
+    fn audio_counters_count_and_reach_the_summary() {
+        let stats = Stats::default();
+        stats.audio_started();
+        for _ in 0..100 {
+            stats.audio_frame_sent();
+        }
+        stats.bytes_sent(ChannelType::Playback, 12_500);
+        stats.audio_encode_done(Duration::from_micros(40));
+        stats.audio_encode_done(Duration::from_micros(60));
+        stats.audio_dropped(3);
+        stats.audio_dropped(2);
+        stats.audio_stopped();
+        let first = stats.snapshot();
+        assert!(first.has_frames(), "audio frames alone count as frames");
+        assert_eq!(
+            (
+                first.audio_frames,
+                first.audio_drops,
+                first.audio_starts,
+                first.audio_stops
+            ),
+            (100, 5, 1, 1)
+        );
+        assert_eq!(first.audio_encode.mean(), Some(Duration::from_micros(50)));
+        assert_eq!(first.total_bytes(), 12_500);
+        let line = first.summary(Duration::from_secs(1));
+        assert!(
+            line.ends_with(
+                "audio frames 100 at 100 kbit/s, opus encode 0.05 ms, audio drops 5, \
+                 audio starts=1 stops=1"
+            ),
+            "{line}"
+        );
+        stats.audio_frame_sent();
+        stats.audio_started();
+        let delta = stats.snapshot().since(&first);
+        assert_eq!((delta.audio_frames, delta.audio_starts), (1, 1));
+        assert_eq!((delta.audio_drops, delta.audio_stops), (0, 0));
+        assert_eq!(delta.audio_encode.count, 0);
+        assert_eq!(delta.draws(), 0, "audio frames are not draws");
+    }
+
+    #[test]
     fn counters_land_in_the_right_slots() {
         let stats = Stats::default();
         stats.draw_sent(Encoding::Jpeg, 7);
@@ -566,7 +694,8 @@ mod tests {
             (ChannelType::Display, 2),
             (ChannelType::Inputs, 3),
             (ChannelType::Cursor, 4),
-            (ChannelType::Playback, 100),
+            (ChannelType::Playback, 5),
+            (ChannelType::Record, 100),
         ] {
             stats.bytes_sent(channel, bytes);
         }
@@ -578,11 +707,12 @@ mod tests {
                 s.main_bytes,
                 s.display_bytes,
                 s.inputs_bytes,
-                s.cursor_bytes
+                s.cursor_bytes,
+                s.playback_bytes
             ),
-            (1, 2, 3, 4)
+            (1, 2, 3, 4, 5)
         );
-        assert_eq!(s.total_bytes(), 10);
+        assert_eq!(s.total_bytes(), 15);
         assert_eq!(s.draws(), 3);
     }
 
@@ -628,13 +758,15 @@ mod tests {
             "1.0 fps (0 refreshes), draws lz4=1 bitmap=0 jpeg=0, display 100 kbit/s, \
              capture 2.0 ms, encode 4.0 ms, ack lag 6.0 ms, ping 0.5 ms, scrub tiles 0, \
              changed 25.0% of captured, streams created=0 destroyed=0, stream frames 0 at \
-             0 kbit/s, stream encode - ms, server drops 0, stream target -"
+             0 kbit/s, stream encode - ms, server drops 0, stream target -, audio frames 0 at \
+             0 kbit/s, opus encode - ms, audio drops 0, audio starts=0 stops=0"
         );
         let line = streaming().summary(Duration::from_secs(2));
         assert!(
             line.ends_with(
                 "streams created=1 destroyed=0, stream frames 2 at 100 kbit/s, \
-                 stream encode 3.0 ms, server drops 1, stream target 1500 kbit/s"
+                 stream encode 3.0 ms, server drops 1, stream target 1500 kbit/s, audio frames 0 \
+                 at 0 kbit/s, opus encode - ms, audio drops 0, audio starts=0 stops=0"
             ),
             "{line}"
         );
@@ -656,9 +788,10 @@ mod tests {
             ChannelType::Display,
             ChannelType::Inputs,
             ChannelType::Cursor,
+            ChannelType::Playback,
         ]
         .map(|channel| channel_slot(channel).unwrap());
-        assert_eq!(channels, [0, 1, 2, 3]);
+        assert_eq!(channels, [0, 1, 2, 3, 4]);
         assert_eq!(channels.len(), CHANNELS);
     }
 

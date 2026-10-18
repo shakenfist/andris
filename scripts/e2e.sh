@@ -12,6 +12,13 @@
 # display at its starting size, and the clipboard both ways, with xclip,
 # which leaves CLIPBOARD with no owner.
 #
+# It also starts a PulseAudio daemon of its own, unprivileged, whose only
+# sink, and so its default, is a 48 kHz null sink, and exports PULSE_SERVER
+# naming its socket, so that andris, pacat and pactl reach it and nothing
+# else. With it up, the PulseAudio capture's own test runs
+# (andris/tests/pulse.rs, which plays tones into that sink), before andris
+# starts. The daemon is stopped last.
+#
 # It then starts, in order: scripts/e2e-keylogger.py, a full-screen window
 # of a known colour that prints each key's keysym name; andris against that
 # display, reporting which capture method andris chose; and ryll --headless
@@ -24,24 +31,28 @@
 # threshold, that a resize from ryll within Xvfb's -screen size is applied
 # while one above it is refused, logged once, and that a moving picture
 # from scripts/e2e-video.py becomes one H.264 stream that decodes, ends
-# when the picture stops, and leaves the area exact. This script then
-# checks ryll's log for all four channels, since nothing else uses the
-# cursor channel, and stops ryll with SIGINT; the session-end metrics line
-# must count the stream.
+# when the picture stops, and leaves the area exact, and that a tone played
+# into the null sink reaches ryll as one Opus stream that decodes and stops
+# once the tone ends. This script then checks ryll's log for all five
+# channels, since nothing else uses the cursor channel, and stops ryll with
+# SIGINT; the session-end metrics line must count the stream, the audio
+# frames, and one audio start and stop.
 #
 # A second ryll, started with --no-h264, then sees the same picture: the
 # driver checks that no stream is created, and once that ryll is stopped,
 # andris's session-end line for its session must count JPEG draws and no
-# stream. Then andris is stopped with SIGTERM, as systemd stops it; both
-# rylls and andris must exit 0, and andris's log must say SIGTERM stopped
-# it.
+# stream. A second andris, run with --no-audio on another port, must then
+# give a third ryll no playback channel. Then andris is stopped with
+# SIGTERM, as systemd stops it; the rylls and andrises must exit 0, and
+# andris's log must say SIGTERM stopped it.
 #
-# Last, a second andris is started against the same display, and Xvfb is
+# Last, another andris is started against the same display, and Xvfb is
 # killed under it. That andris must exit 1 within GONE_BOUND seconds,
 # saying in its log that the desktop has gone and why.
 #
 # It fails if any step fails or times out, if any process exits before it
-# is stopped, or if andris logged an ERROR. On failure it prints every log.
+# is stopped, if either andris serving a session logged an ERROR, or if
+# andris could not capture sound. On failure it prints every log.
 #
 # Environment:
 #   RYLL    the ryll binary, built by `make ryll-headless` (required)
@@ -56,9 +67,18 @@ CARGO=${CARGO:-cargo}
 X_DISPLAY=:99
 GEOMETRY=1024x768
 PORT=5930
+# The port of the andris run with --no-audio, alongside the first.
+NO_AUDIO_PORT=5931
+# The null sink the PulseAudio daemon plays into, at the rate andris
+# captures at. PulseAudio's default is 44.1 kHz.
+SINK=e2e
+# The fewest audio frames andris must count for the driver's tone, which
+# is 500 frames of 10 ms: as many as the driver needs ryll to decode.
+AUDIO_FRAMES=400
 
 # Bounds, in seconds, on each wait.
 XVFB_BOUND=10
+PULSE_BOUND=10
 KEYLOGGER_BOUND=10
 ANDRIS_BOUND=10
 STOP_BOUND=15
@@ -168,7 +188,7 @@ cleanup() {
         { wait "${pids[$name]}"; } 2>/dev/null || true
     done
     if ! $passed; then
-        for name in x11-test "${names[@]}" drive drive-no-h264 video video-no-h264; do
+        for name in x11-test pulse-test "${names[@]}" drive drive-no-h264 drive-no-audio video video-no-h264 tone; do
             if [ -f "$work/$name.log" ]; then
                 echo "===== $name.log ====="
                 cat "$work/$name.log"
@@ -202,15 +222,50 @@ if ! ANDRIS_TEST_DISPLAY=$X_DISPLAY "$CARGO" test --frozen --quiet --test x11 \
 fi
 say "the X11 backend's test passed"
 
-# 3. The window that keys are typed into.
+# 3. The sound server, unprivileged: a PulseAudio daemon with no
+# configuration (-n), whose one sink, a null sink at 48 kHz, is the
+# default. PulseAudio wants a private (0700) runtime directory and a
+# writable home, so it gets its own of each under $work. Its socket is
+# anonymous, since only this container's processes can reach $work, and
+# PULSE_SERVER names it for every client from here on: andris, pacat and
+# pactl, and the capture test. With PULSE_SERVER set, libpulse never
+# spawns a daemon of its own.
+pulse_runtime=$work/pulse-runtime
+pulse_home=$work/pulse-home
+mkdir -m 0700 "$pulse_runtime" "$pulse_home"
+start pulse env HOME="$pulse_home" XDG_RUNTIME_DIR="$pulse_runtime" pulseaudio -n --daemonize=no \
+    --exit-idle-time=-1 --use-pid-file=no --log-target=stderr --realtime=no --high-priority=no --disable-shm \
+    --load="module-native-protocol-unix auth-anonymous=1 socket=$pulse_runtime/native" \
+    --load="module-null-sink sink_name=$SINK rate=48000"
+export PULSE_SERVER=unix:$pulse_runtime/native
+wait_until "$PULSE_BOUND" pulse "PulseAudio answering" pactl info
+pactl set-default-sink "$SINK"
+say "PulseAudio's default sink is $(pactl get-default-sink)"
+# Ryll plays what it decodes through ALSA, whose default device here is
+# PulseAudio's plugin. Given this PULSE_SERVER, ryll would play the tone
+# back into the null sink, andris would capture it again, and the sound
+# would never stop. So each ryll gets a server that does not exist, and
+# decodes with no device, as on a host without sound.
+no_sound_server=unix:$work/ryll-has-no-sound-server
+
+# The PulseAudio capture's test (andris/tests/pulse.rs), which plays
+# tones into the default sink, so before anything else listens to it.
+say "running the PulseAudio capture's test"
+if ! ANDRIS_TEST_PULSE=1 "$CARGO" test --frozen --quiet --test pulse >"$work/pulse-test.log" 2>&1; then
+    say "FAIL: the PulseAudio capture's test failed"
+    exit 1
+fi
+say "the PulseAudio capture's test passed"
+
+# 4. The window that keys are typed into.
 start keylogger python3 -u "$here/e2e-keylogger.py" --display "$X_DISPLAY"
 wait_until "$KEYLOGGER_BOUND" keylogger "keylogger mapped" grep -qx READY "$work/keylogger.log"
 
-# 4. The ticket, 0600 as andris requires.
+# 5. The ticket, 0600 as andris requires.
 ticket=$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')
 (umask 077 && printf '%s\n' "$ticket" >"$work/ticket")
 
-# 5. Andris. The display channel logs at debug, for the stream reports
+# 6. Andris. The display channel logs at debug, for the stream reports
 # and bitrate changes the driver summarises.
 start andris env RUST_LOG=info,andris::server::display=debug NO_COLOR=1 "$ANDRIS" --platform x11 \
     --display "$X_DISPLAY" \
@@ -218,13 +273,14 @@ start andris env RUST_LOG=info,andris::server::display=debug NO_COLOR=1 "$ANDRIS
 wait_until "$ANDRIS_BOUND" andris "andris listening on $PORT" grep -q "plain listener ready" "$work/andris.log"
 say "andris is $(sed 's/\x1b\[[0-9;]*m//g' "$work/andris.log" | grep -o 'capturing the screen with [A-Za-z-]*' | head -n1 || true)"
 
-# 6. Ryll, headless. The password needs a .vv file: --direct has no
+# 7. Ryll, headless. The password needs a .vv file: --direct has no
 # password option.
 (umask 077 && printf '[virt-viewer]\ntype=spice\nhost=127.0.0.1\nport=%s\npassword=%s\n' \
     "$PORT" "$ticket" >"$work/andris.vv")
-start ryll env NO_COLOR=1 "$RYLL" --headless --file "$work/andris.vv" --control-socket "$sock" --verbose
+start ryll env NO_COLOR=1 PULSE_SERVER="$no_sound_server" "$RYLL" --headless --file "$work/andris.vv" \
+    --control-socket "$sock" --verbose
 
-# 7. The assertions. The driver bounds its own waits, and gives up early
+# 8. The assertions. The driver bounds its own waits, and gives up early
 # if a process it depends on exits.
 rc=0
 python3 "$here/e2e-drive.py" --socket "$sock" --keylog "$work/keylogger.log" --display "$X_DISPLAY" \
@@ -245,13 +301,13 @@ fi
 # per-channel status, so ryll's log is the oracle: SpiceClient's
 # connect_channel logs "<channel>: connected successfully" once the
 # ticket is accepted. Nothing above uses the cursor channel.
-for channel in main display inputs cursor; do
+for channel in main display inputs cursor playback; do
     if ! sed 's/\x1b\[[0-9;]*m//g' "$work/ryll.log" | grep " INFO $channel: connected successfully\$" >/dev/null; then
         say "FAIL: ryll never connected the $channel channel"
         exit 1
     fi
 done
-say "ryll connected the main, display, inputs and cursor channels"
+say "ryll connected the main, display, inputs, cursor and playback channels"
 
 # Nothing may have exited before it was asked to.
 for name in "${names[@]}"; do
@@ -266,8 +322,9 @@ last_session_end() {
     sed 's/\x1b\[[0-9;]*m//g' "$work/andris.log" | grep 'session ends after' | tail -n1
 }
 
-# 8. Stop ryll, which ends its session. Its metrics must count the
-# stream the driver saw.
+# 9. Stop ryll, which ends its session. Its metrics must count the
+# stream the driver saw, and the tone: one audio start and stop, and at
+# least as many audio frames as the driver needed ryll to decode.
 stop ryll INT
 wait_until "$STOP_BOUND" andris "the first session's metrics line" \
     sh -c "sed 's/\x1b\[[0-9;]*m//g' '$work/andris.log' | grep -c 'session ends after' | grep -qx 1"
@@ -276,11 +333,16 @@ if ! echo "$line" | grep 'streams created=1 destroyed=1,' >/dev/null; then
     say "FAIL: the first session's metrics do not count one stream created and destroyed: $line"
     exit 1
 fi
+audio_frames=$(echo "$line" | sed -n 's/.*audio frames \([0-9]*\) at .*/\1/p')
+if [ "${audio_frames:-0}" -lt "$AUDIO_FRAMES" ] || ! echo "$line" | grep 'audio starts=1 stops=1;' >/dev/null; then
+    say "FAIL: the first session's metrics do not count $AUDIO_FRAMES audio frames and one start and stop: $line"
+    exit 1
+fi
 say "the first session's metrics: ${line#*: }"
 
-# 9. A ryll without H.264, and the same picture: no stream, JPEG draws.
-start ryll-no-h264 env NO_COLOR=1 "$RYLL" --headless --file "$work/andris.vv" \
-    --control-socket "$work/ryll-no-h264.sock" --verbose --no-h264
+# 10. A ryll without H.264, and the same picture: no stream, JPEG draws.
+start ryll-no-h264 env NO_COLOR=1 PULSE_SERVER="$no_sound_server" "$RYLL" --headless \
+    --file "$work/andris.vv" --control-socket "$work/ryll-no-h264.sock" --verbose --no-h264
 rc=0
 python3 "$here/e2e-drive.py" --socket "$work/ryll-no-h264.sock" --display "$X_DISPLAY" \
     --andris-log "$work/andris.log" --ryll-log "$work/ryll-no-h264.log" --work "$work" --no-stream \
@@ -301,19 +363,66 @@ if ! echo "$line" | grep 'streams created=0 ' >/dev/null || ! echo "$line" | gre
 fi
 say "the --no-h264 session's metrics: ${line#*: }"
 
-# 10. Stop the rest but Xvfb. Andris is stopped as systemd stops a unit,
-# with SIGTERM.
+# 11. An andris without audio, alongside the first on another port: a
+# ryll connected to it gets no playback channel. The driver checks ryll's
+# stats, and ryll's log must show none offered and none linked.
+start andris-no-audio env RUST_LOG=info NO_COLOR=1 "$ANDRIS" --platform x11 --display "$X_DISPLAY" \
+    --listen "127.0.0.1:$NO_AUDIO_PORT" --ticket-file "$work/ticket" --no-audio
+wait_until "$ANDRIS_BOUND" andris-no-audio "andris --no-audio listening on $NO_AUDIO_PORT" \
+    grep -q "plain listener ready" "$work/andris-no-audio.log"
+(umask 077 && printf '[virt-viewer]\ntype=spice\nhost=127.0.0.1\nport=%s\npassword=%s\n' \
+    "$NO_AUDIO_PORT" "$ticket" >"$work/andris-no-audio.vv")
+start ryll-no-audio env NO_COLOR=1 PULSE_SERVER="$no_sound_server" "$RYLL" --headless \
+    --file "$work/andris-no-audio.vv" --control-socket "$work/ryll-no-audio.sock" --verbose
+rc=0
+python3 "$here/e2e-drive.py" --socket "$work/ryll-no-audio.sock" --display "$X_DISPLAY" \
+    --andris-log "$work/andris-no-audio.log" --ryll-log "$work/ryll-no-audio.log" --work "$work" --no-audio \
+    --watch "andris-no-audio=${pids[andris-no-audio]}" --watch "ryll-no-audio=${pids[ryll-no-audio]}" \
+    >"$work/drive-no-audio.log" 2>&1 || rc=$?
+cat "$work/drive-no-audio.log"
+if [ "$rc" -ne 0 ]; then
+    say "FAIL: the --no-audio driver exited $rc"
+    exit 1
+fi
+# Ryll's debug lines list the channels andris offers, as "channel:
+# playback (type=5, id=0)" for playback; the display's line shows that
+# the list was logged.
+if ! sed 's/\x1b\[[0-9;]*m//g' "$work/ryll-no-audio.log" | grep 'channel: display (type=2' >/dev/null; then
+    say "FAIL: ryll's log does not list the channels andris --no-audio offered"
+    exit 1
+fi
+if sed 's/\x1b\[[0-9;]*m//g' "$work/ryll-no-audio.log" \
+    | grep 'channel: playback (type=5\|playback: connected successfully' >/dev/null; then
+    say "FAIL: andris --no-audio offered ryll a playback channel, or ryll linked one"
+    exit 1
+fi
+say "andris --no-audio offered ryll no playback channel, and ryll linked none"
+stop ryll-no-audio INT
+stop andris-no-audio TERM
+
+# 12. Stop the rest but Xvfb and the sound server. Andris is stopped as
+# systemd stops a unit, with SIGTERM.
 stop andris TERM
 stop keylogger TERM any
 
-# 11. Andris must not have logged an error. Colour is off, but strip any
-# escape codes anyway so the match cannot be split by one.
-if sed 's/\x1b\[[0-9;]*m//g' "$work/andris.log" | grep ' ERROR ' >/dev/null; then
-    say "FAIL: andris logged an ERROR"
+# 13. Neither andris may have logged an error. Colour is off, but strip
+# any escape codes anyway so the match cannot be split by one. With the
+# sound server up, the first must also have captured sound in every
+# session: andris warns each time a client links the playback channel
+# and it cannot.
+for name in andris andris-no-audio; do
+    if sed 's/\x1b\[[0-9;]*m//g' "$work/$name.log" | grep ' ERROR ' >/dev/null; then
+        say "FAIL: $name logged an ERROR"
+        exit 1
+    fi
+done
+if sed 's/\x1b\[[0-9;]*m//g' "$work/andris.log" \
+    | grep 'audio capture could not start\|cannot capture sound' >/dev/null; then
+    say "FAIL: andris could not capture sound"
     exit 1
 fi
 
-# 12. Ending a session, which stopping each ryll did, logs the metrics.
+# 14. Ending a session, which stopping each ryll did, logs the metrics.
 if ! sed 's/\x1b\[[0-9;]*m//g' "$work/andris.log" | grep 'session ends after .*kB written in all' >/dev/null; then
     say "FAIL: andris never logged the session-end metrics line"
     exit 1
@@ -326,7 +435,7 @@ if ! sed 's/\x1b\[[0-9;]*m//g' "$work/andris.log" | grep 'SIGTERM: shutting down
 fi
 say "andris logged that SIGTERM stopped it"
 
-# 13. The desktop going away: a second andris on the same display, and
+# 15. The desktop going away: another andris on the same display, and
 # Xvfb killed under it.
 start andris-gone env RUST_LOG=info NO_COLOR=1 "$ANDRIS" --platform x11 --display "$X_DISPLAY" \
     --listen "127.0.0.1:$PORT" --ticket-file "$work/ticket"
@@ -342,6 +451,9 @@ if ! sed 's/\x1b\[[0-9;]*m//g' "$work/andris-gone.log" \
     exit 1
 fi
 say "andris logged that the desktop had gone, and why"
+
+# 16. The sound server, last, which exits 0 on SIGTERM.
+stop pulse TERM
 
 passed=true
 say "PASS"

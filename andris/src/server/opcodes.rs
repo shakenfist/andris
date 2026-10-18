@@ -13,7 +13,7 @@ use std::fmt::Debug;
 
 use shakenfist_spice_protocol::logging::message_names;
 use shakenfist_spice_protocol::{
-    ChannelType, cursor_server, display_server, inputs_server, main_server,
+    ChannelType, cursor_server, display_server, inputs_server, main_server, playback_server,
 };
 
 /// The server-to-client messages of one channel type.
@@ -82,7 +82,8 @@ macro_rules! server_opcodes {
 
 /// 64 KiB: the main and display channels' client message limit.
 const MAX_BODY_LARGE: usize = 64 * 1024;
-/// 4 KiB: the inputs and cursor channels' client message limit.
+/// 4 KiB: the inputs, cursor and playback channels' client message
+/// limit.
 const MAX_BODY_SMALL: usize = 4 * 1024;
 
 server_opcodes! {
@@ -142,6 +143,24 @@ server_opcodes! {
     }
 }
 
+server_opcodes! {
+    /// What the playback channel sends. It has no `SET_ACK`, so it is no
+    /// [`AckedOpcode`]: spice-server runs playback without an ack window,
+    /// and andris drops audio rather than holding it back (see
+    /// `server::playback`).
+    PlaybackOpcode: ChannelType::Playback, max body MAX_BODY_SMALL,
+        names message_names::playback_server, client names message_names::playback_client {
+        /// One frame of sound, Opus or raw as `Mode` said.
+        Data = playback_server::DATA,
+        /// The data mode, sent first.
+        Mode = playback_server::MODE,
+        /// A stream of sound begins.
+        Start = playback_server::START,
+        /// The stream ends: the desktop has fallen silent.
+        Stop = playback_server::STOP,
+    }
+}
+
 impl AckedOpcode for DisplayOpcode {
     const SET_ACK: Self = DisplayOpcode::SetAck;
 }
@@ -175,6 +194,7 @@ mod tests {
         check_named::<DisplayOpcode>();
         check_named::<InputsOpcode>();
         check_named::<CursorOpcode>();
+        check_named::<PlaybackOpcode>();
     }
 
     #[test]
@@ -189,6 +209,7 @@ mod tests {
         check::<DisplayOpcode>();
         check::<InputsOpcode>();
         check::<CursorOpcode>();
+        check::<PlaybackOpcode>();
     }
 
     #[test]
@@ -199,5 +220,6 @@ mod tests {
         assert!(!DisplayOpcode::ALL.iter().any(|op| op.code() == 8));
         assert!(!InputsOpcode::ALL.iter().any(|op| op.code() == 8));
         assert!(!CursorOpcode::ALL.iter().any(|op| op.code() == 8));
+        assert!(!PlaybackOpcode::ALL.iter().any(|op| op.code() == 8));
     }
 }

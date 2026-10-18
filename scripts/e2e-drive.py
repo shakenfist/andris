@@ -49,12 +49,28 @@ up. It asserts, in order:
               screenshot of the video's area matches its last frame
               exactly, which proves andris repaired the area losslessly.
               Last, a summary of ryll's STREAM_REPORTs and of andris's
-              bitrate changes, from andris's debug log, is printed.
+              bitrate changes, from andris's debug log, is printed;
+  audio       a 440 Hz tone of TONE_SECONDS is played with `pacat` into the
+              default sink of the sound server andris captures (the
+              environment names it, as PULSE_SERVER). Polling the `playback`
+              object of ryll's `stats` every AUDIO_POLL: within
+              AUDIO_START_BOUND of the tone starting, one START arrives, for
+              Opus at 48 kHz in two channels; no STOP arrives while the tone
+              plays, and no second START; once `pacat` has drained and
+              exited, a STOP arrives within AUDIO_STOP_BOUND, andris
+              stopping after a second of silence. Over the tone ryll must
+              have decoded at least AUDIO_PACKETS packets, with no decode
+              failure.
 
 With --no-stream, for a ryll started with --no-h264, it checks only that:
 once a surface is up, the video plays for NO_STREAM_SPELL with ryll's
 `stats` showing no stream created at any poll. scripts/e2e.sh then reads
 andris's session-end metrics line for the JPEG draws the video went as.
+
+With --no-audio, for an andris started with --no-audio, it checks only that,
+once a frame has arrived, ryll's `stats` have no `playback` object at any
+poll for NO_AUDIO_SPELL: ryll was offered no playback channel. scripts/e2e.sh
+also checks ryll's log for no playback link.
 
 Every wait gives up at once if a process named with --watch (andris, ryll,
 the keylogger) exits, rather than running out its bound.
@@ -65,7 +81,7 @@ ryll's docs/control-socket-protocol.md. `send_key` takes the logical set-1
 make code, with the 0xE0 prefix in the high byte. Protocol 1.4 is required,
 for the `stats` verb; 1.3 added the clipboard and resize verbs, and 1.2
 fixed extended keys, which older servers sent with the bytes the wrong way
-round.
+round. The audio checks need 1.6, which added `stats`' `playback` object.
 
 The resize checks read andris's log (--andris-log), and ryll's (--ryll-log),
 whose debug lines record each agent reply andris sends.
@@ -74,9 +90,11 @@ Exit status: 0 when every check passed, 1 otherwise.
 """
 
 import argparse
+import array
 import base64
 import importlib.util
 import json
+import math
 import os
 import re
 import select
@@ -164,6 +182,33 @@ NO_STREAM_SPELL = 5.0
 # How long the video script may take to build its picture and map.
 VIDEO_BOUND = 30.0
 
+# The control protocol the audio checks need: 1.6 added `stats`' playback
+# object.
+AUDIO_PROTOCOL = (1, 6)
+# The tone: a 440 Hz sine at a quarter of full scale, the same in both
+# channels, as raw S16LE stereo at 48 kHz, the format andris captures.
+TONE_FREQUENCY = 440.0
+TONE_AMPLITUDE = 8192
+TONE_RATE = 48000
+TONE_SECONDS = 5.0
+# From the start of the audio check to ryll's stats having a playback
+# object, which ryll publishes every 100 ms while the channel is silent.
+PLAYBACK_BOUND = 10.0
+# From `pacat` starting to ryll seeing a START. Andris starts on the first
+# frame over its silence threshold; a PulseAudio null sink can take a
+# second or two to wake.
+AUDIO_START_BOUND = 5.0
+# From `pacat` exiting, once its stream has drained, to ryll seeing a STOP:
+# andris stops after a second of silence.
+AUDIO_STOP_BOUND = 2.0
+# How long `pacat` may take beyond the tone itself, to connect and drain.
+TONE_BOUND = TONE_SECONDS + 10.0
+# The packets ryll must decode over the tone, which is 500 10 ms frames.
+AUDIO_PACKETS = 400
+AUDIO_POLL = 0.1
+# The --no-audio run: how long ryll's stats must show no playback object.
+NO_AUDIO_SPELL = 3.0
+
 
 def log(message):
     print(f'{PREFIX} {message}', flush=True)
@@ -187,6 +232,8 @@ class Control:
         self.sock.connect(path)
         self.buf = bytearray()
         self.next_id = 0
+        # The control protocol ryll speaks, as a tuple; connect() sets it.
+        self.protocol = None
         # Events seen while waiting for a response, as (monotonic time, name,
         # data).
         self.events = []
@@ -310,6 +357,7 @@ def connect(path, deadline, watch):
             raise Failure(f'ryll speaks control protocol {hello["protocol_version"]}; {wanted} or later is '
                           'needed for the stats verb')
         log(f'connected to {path}, protocol {hello["protocol_version"]}')
+        control.protocol = version
         return control
     raise Failure(f'could not connect to {path} within {SURFACE_BOUND:.0f} s: {last}')
 
@@ -985,6 +1033,141 @@ def check_no_stream(control, display, work, watch):
         video.close()
 
 
+# -- audio
+
+
+def write_tone(path, seconds):
+    """Write `seconds` of the tone to `path`, as raw S16LE stereo at TONE_RATE."""
+    step = 2 * math.pi * TONE_FREQUENCY / TONE_RATE
+    samples = array.array('h')
+    for i in range(int(seconds * TONE_RATE)):
+        value = int(TONE_AMPLITUDE * math.sin(i * step))
+        samples.append(value)
+        samples.append(value)
+    if sys.byteorder != 'little':
+        samples.byteswap()
+    with open(path, 'wb') as f:
+        samples.tofile(f)
+
+
+def play_tone(work, name, prefix=()):
+    """Start `pacat` playing the tone into the default sink, its output in `work`/`name`.log; return it. `prefix`
+    goes before the pacat command, to run it as another user, say. With a short latency, pacat drains the stream
+    and exits once the sink has played the tone's last sample. PULSE_SERVER must name the test's own sound
+    server, in the environment or in `prefix`: without it libpulse would find the desktop's."""
+    if not os.environ.get('PULSE_SERVER') and not any(arg.startswith('PULSE_SERVER=') for arg in prefix):
+        raise SystemExit('play_tone: PULSE_SERVER does not name a sound server; refusing to use the default one')
+    path = os.path.join(work, f'{name}.raw')
+    write_tone(path, TONE_SECONDS)
+    command = list(prefix) + ['pacat', '--playback', '--raw', '--format=s16le', f'--rate={TONE_RATE}',
+                              '--channels=2', '--latency-msec=50', '--client-name=andris-e2e-tone']
+    with open(path, 'rb') as tone, open(os.path.join(work, f'{name}.log'), 'wb') as out:
+        return subprocess.Popen(command, stdin=tone, stdout=out, stderr=subprocess.STDOUT)
+
+
+def playback_stats(control):
+    """The `playback` object of ryll's stats, or None when it has none."""
+    return control.call('stats').get('playback')
+
+
+def poll_playback(control, before, what, bound, test, watch):
+    """Poll ryll's playback stats every AUDIO_POLL until test(playback) is true, and return them. Fails if the
+    object goes, on a decode failure, or on a second START since `before`."""
+    deadline = time.monotonic() + bound
+    while True:
+        playback = playback_stats(control)
+        if playback is None:
+            raise Failure('ryll\'s stats lost their playback object: the playback channel closed')
+        if playback['decode_failures'] > before['decode_failures']:
+            raise Failure(f'ryll failed to decode audio packets; playback stats: {playback}')
+        if playback['starts'] > before['starts'] + 1:
+            raise Failure(f'more than one START arrived for one tone; playback stats: {playback}')
+        if test(playback):
+            return playback
+        watch.check()
+        if time.monotonic() >= deadline:
+            raise Failure(f'{what} within {bound:.1f} s; last playback stats: {playback}')
+        time.sleep(AUDIO_POLL)
+
+
+def check_audio(control, work, watch, name='tone', prefix=()):
+    """A tone played into the default sink reaches ryll as one Opus stream that decodes, and stops once the tone
+    ends; return a summary. `name` and `prefix` are for play_tone."""
+    if control.protocol < AUDIO_PROTOCOL:
+        wanted = '.'.join(str(part) for part in AUDIO_PROTOCOL)
+        raise Failure(f'ryll speaks control protocol {".".join(str(p) for p in control.protocol)}; {wanted} or '
+                      'later is needed for the playback stats')
+    deadline = time.monotonic() + PLAYBACK_BOUND
+    before = playback_stats(control)
+    while before is None:
+        watch.check()
+        if time.monotonic() >= deadline:
+            raise Failure(f'ryll\'s stats had no playback object within {PLAYBACK_BOUND:.0f} s: no playback '
+                          'channel linked')
+        time.sleep(AUDIO_POLL)
+        before = playback_stats(control)
+    if before['starts'] != before['stops'] or before['codec'] is not None:
+        raise Failure(f'audio was already playing before the tone; playback stats: {before}')
+
+    player = play_tone(work, name, prefix)
+    try:
+        started = time.monotonic()
+        playing = poll_playback(control, before, 'no playback START arrived', AUDIO_START_BOUND,
+                                lambda p: p['starts'] > before['starts'] and p['codec'] is not None, watch)
+        to_start = time.monotonic() - started
+        stream = (playing['codec'], playing['sample_rate'], playing['channels'])
+        if stream != ('opus', TONE_RATE, 2):
+            raise Failure(f'the tone arrived as {stream[0]} at {stream[1]} Hz in {stream[2]} channels, not opus at '
+                          f'{TONE_RATE} Hz in 2; playback stats: {playing}')
+
+        def drained(playback):
+            if playback['stops'] > before['stops']:
+                raise Failure(f'a STOP arrived while the tone played; playback stats: {playback}')
+            return player.poll() is not None
+        poll_playback(control, before, 'pacat did not finish the tone', TONE_BOUND, drained, watch)
+        ended = time.monotonic()
+        if player.returncode != 0:
+            raise Failure(f'pacat exited {player.returncode}; see {name}.log')
+        played = ended - started
+    finally:
+        if player.poll() is None:
+            player.kill()
+            player.wait()
+
+    stopped = poll_playback(control, before, 'no playback STOP arrived after the tone ended', AUDIO_STOP_BOUND,
+                            lambda p: p['stops'] > before['stops'], watch)
+    to_stop = time.monotonic() - ended
+    decoded = stopped['packets_decoded'] - before['packets_decoded']
+    if stopped['starts'] != before['starts'] + 1 or stopped['stops'] != before['stops'] + 1:
+        raise Failure(f'the tone gave {stopped["starts"] - before["starts"]} STARTs and '
+                      f'{stopped["stops"] - before["stops"]} STOPs, not one of each; playback stats: {stopped}')
+    if decoded < AUDIO_PACKETS:
+        raise Failure(f'ryll decoded {decoded} packets of a {TONE_SECONDS:.0f} s tone, fewer than {AUDIO_PACKETS}; '
+                      f'playback stats: {stopped}')
+    if stopped['codec'] is not None:
+        raise Failure(f'ryll still reports a {stopped["codec"]} stream after the STOP; playback stats: {stopped}')
+    received = stopped['bytes_received'] - before['bytes_received']
+    return (f'one START {to_start:.2f} s after the tone began, {stream[0]} at {stream[1]} Hz in {stream[2]} '
+            f'channels; {decoded} packets ({received} bytes) decoded, no decode failures; pacat played for '
+            f'{played:.2f} s, and the STOP arrived {to_stop:.2f} s after it exited')
+
+
+def check_no_audio(control, watch):
+    """With an andris run with --no-audio, ryll's stats never have a playback object."""
+    if control.protocol < AUDIO_PROTOCOL:
+        raise Failure('ryll\'s control protocol is too old to report a playback channel')
+    deadline = time.monotonic() + NO_AUDIO_SPELL
+    polls = 0
+    while time.monotonic() < deadline:
+        playback = playback_stats(control)
+        polls += 1
+        if playback is not None:
+            raise Failure(f'ryll linked a playback channel to an andris without audio; playback stats: {playback}')
+        watch.check()
+        time.sleep(POLL)
+    log(f'no-audio: {polls} polls of stats over {NO_AUDIO_SPELL:.0f} s showed no playback channel')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--socket', required=True, help="ryll's control socket")
@@ -997,11 +1180,13 @@ def main():
     parser.add_argument('--work', required=True, help='where the video script writes its log and last frame')
     parser.add_argument('--no-stream', action='store_true',
                         help='for a ryll started with --no-h264: check only that the video never streams')
+    parser.add_argument('--no-audio', action='store_true',
+                        help='for an andris started with --no-audio: check only that ryll has no playback channel')
     parser.add_argument('--watch', action='append', default=[], metavar='NAME=PID',
                         help='a process that must stay up; fail at once if it exits (repeatable)')
     args = parser.parse_args()
-    if not args.no_stream and not args.keylog:
-        parser.error('--keylog is required unless --no-stream')
+    if not (args.no_stream or args.no_audio) and not args.keylog:
+        parser.error('--keylog is required unless --no-stream or --no-audio')
     watch = Watch(args.watch)
 
     keylogger = keylogger_module()
@@ -1016,6 +1201,10 @@ def main():
             check_no_stream(control, args.display, args.work, watch)
             log('PASS')
             return 0
+        if args.no_audio:
+            check_no_audio(control, watch)
+            log('PASS')
+            return 0
         events = ['surface_drawn', 'clipboard_changed']
         subscribed = control.call('subscribe', {'events': events})['subscribed']
         if set(events) - set(subscribed):
@@ -1027,6 +1216,7 @@ def main():
         check_resize(control, (args.width, args.height), args.andris_log, args.ryll_log, watch)
         check_video(control, surface['surface_id'], args.display, args.work, args.andris_log, watch)
         log(f'stream reports: {report_summary(args.andris_log)}')
+        log(f'audio: {check_audio(control, args.work, watch)}')
     except (Failure, RuntimeError, EOFError, OSError, subprocess.SubprocessError) as e:
         log(f'FAIL: {e}')
         return 1

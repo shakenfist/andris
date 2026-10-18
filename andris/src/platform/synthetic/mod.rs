@@ -1,7 +1,7 @@
 //! A synthetic platform: a deterministic test pattern, an input sink
 //! that records the most recent [`RECORDED_EVENTS`] events it is given,
-//! one cursor shape, display control that resizes the pattern, and a
-//! clipboard held in memory.
+//! one cursor shape, display control that resizes the pattern, a
+//! clipboard held in memory, and a tone for its sound.
 //!
 //! It backs `--platform synthetic`, for load testing, and the in-process
 //! tests, which drive it through [`SyntheticPlatform`]'s own methods and
@@ -68,6 +68,17 @@
 //! [`SyntheticPlatform::clipboard_set`] and is not reported back; it
 //! replaces what was copied, so `None` is reported in its place.
 //!
+//! # The tone
+//!
+//! [`ToneSource`] is the platform's sound: a [`TONE_FREQUENCY`] sine that
+//! sounds and falls silent in turn, as its [`TonePattern`] says, paced at
+//! one frame every 10 ms by the async runtime's clock. The platform's
+//! default sounds for [`DEFAULT_TONE_ON`] and is silent for
+//! [`DEFAULT_TONE_OFF`]; a test that wants another pattern puts a
+//! [`ToneSource`] of its own in the [`Platform`]'s `audio`.
+//!
+//! # Reporting changes
+//!
 //! Every change is reported while the state lock is still held, so
 //! damage and resizes reach the hub in the order the changes were made:
 //! two racing [`SyntheticPlatform::set_size`] calls cannot leave the hub
@@ -75,6 +86,8 @@
 //! for the lock, so it sees the change. The lock order is the state lock,
 //! then the hub's locks; the hub never calls back into the platform, so
 //! nothing takes them the other way round.
+
+mod tone;
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -86,6 +99,9 @@ use super::{
     Capture, Clipboard, ClipboardReceiver, CursorReceiver, CursorShape, CursorSource, DamageHub,
     DamageSubscription, DisplayControl, DisplayGeometry, EvdevCode, Frame, GoneSender, GoneSignal,
     InputEvent, InputSink, LockState, Patch, Platform, Rectangle, Resize, ScreenSource, Size,
+};
+pub use tone::{
+    DEFAULT_TONE_OFF, DEFAULT_TONE_ON, TONE_AMPLITUDE, TONE_FREQUENCY, TonePattern, ToneSource,
 };
 
 /// The side of the moving square, in pixels.
@@ -213,7 +229,8 @@ impl SyntheticPlatform {
         }))
     }
 
-    /// This platform as all six seams, and its gone signal.
+    /// This platform as all seven seams, with a [`ToneSource`] of the
+    /// default pattern as its sound, and its gone signal.
     pub fn platform(self: &Arc<Self>) -> Platform {
         Platform {
             geometry: self.clone(),
@@ -222,6 +239,7 @@ impl SyntheticPlatform {
             cursor: self.clone(),
             display_control: self.clone(),
             clipboard: self.clone(),
+            audio: Some(Arc::new(ToneSource::default())),
             gone: self.gone_signal.clone(),
         }
     }
@@ -696,6 +714,8 @@ pub fn default_cursor() -> CursorShape {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::platform::Region;
 
@@ -1273,5 +1293,17 @@ mod tests {
         assert_eq!(cursor.argb()[0], 0xFF00_0000);
         assert_eq!(cursor.argb()[31], 0);
         assert!(cursor.argb().contains(&0xFFFF_FFFF));
+    }
+
+    #[tokio::test]
+    async fn the_platform_sounds_the_default_tone() {
+        let platform = SyntheticPlatform::new(SIZE).unwrap();
+        let audio = platform.platform().audio.unwrap();
+        let mut receiver = audio.open().unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(frame.peak() > 8000, "the pattern starts with the sound");
     }
 }

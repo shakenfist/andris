@@ -349,7 +349,8 @@ impl X11Platform {
         }
     }
 
-    /// This platform as all six seams, and its gone signal.
+    /// This platform as the six display seams, with no sound, and its gone
+    /// signal.
     pub fn platform(self: &Arc<Self>) -> Platform {
         Platform {
             geometry: self.clone(),
@@ -358,6 +359,9 @@ impl X11Platform {
             cursor: self.clone(),
             display_control: self.clone(),
             clipboard: self.clone(),
+            // Sound comes from the session's sound server, not the X
+            // display: `andris` adds a PulseAudio source alongside.
+            audio: None,
             gone: self.gone.clone(),
         }
     }

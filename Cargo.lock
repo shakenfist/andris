@@ -18,11 +18,16 @@ dependencies = [
  "anyhow",
  "clap",
  "libc",
+ "libpulse-binding",
+ "libpulse-simple-binding",
  "memmap2",
+ "opus",
+ "opus-decoder",
  "rand 0.10.3",
  "rcgen",
  "shakenfist-spice-compression",
  "shakenfist-spice-protocol",
+ "socket2",
  "subtle",
  "tempfile",
  "tokio",
@@ -579,6 +584,54 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
+name = "libpulse-binding"
+version = "2.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "909eb3049e16e373680fe65afe6e2a722ace06b671250cc4849557bc57d6a397"
+dependencies = [
+ "bitflags",
+ "libc",
+ "libpulse-sys",
+ "num-derive",
+ "num-traits",
+ "winapi",
+]
+
+[[package]]
+name = "libpulse-simple-binding"
+version = "2.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7bebef0381c8e3e4b23cc24aaf36fab37472bece128de96f6a111efa464cfef"
+dependencies = [
+ "libpulse-binding",
+ "libpulse-simple-sys",
+ "libpulse-sys",
+]
+
+[[package]]
+name = "libpulse-simple-sys"
+version = "1.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3bd96888fe37ad270d16abf5e82cccca1424871cf6afa2861824d2a52758eebc"
+dependencies = [
+ "libpulse-sys",
+ "pkg-config",
+]
+
+[[package]]
+name = "libpulse-sys"
+version = "1.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d74371848b22e989f829cc1621d2ebd74960711557d8b45cfe740f60d0a05e61"
+dependencies = [
+ "libc",
+ "num-derive",
+ "num-traits",
+ "pkg-config",
+ "winapi",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -719,6 +772,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441"
 
 [[package]]
+name = "num-derive"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed3955f1a9c7c0c15e092f9c887db08b1fc683305fdf6eb6684f22555355e202"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "num-integer"
 version = "0.1.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -816,6 +880,33 @@ dependencies = [
  "cc",
  "nasm-rs",
  "walkdir",
+]
+
+[[package]]
+name = "opus"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33718946cc77d4032911d4efe03a66dbcbfbd2bb16c3da06aaeadcc637c32216"
+dependencies = [
+ "opusic-sys",
+]
+
+[[package]]
+name = "opus-decoder"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15ae32c275dabb0cd2c863460bf349e9abc3568ba2abf0f9eb7b7d2edeeed07e"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "opusic-sys"
+version = "0.7.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9d1ecdf206421bc74343ab3bb2f30ad2abbfee41fa341f7181fecbaf957769a"
+dependencies = [
+ "cmake",
 ]
 
 [[package]]
@@ -1207,8 +1298,8 @@ dependencies = [
 
 [[package]]
 name = "shakenfist-spice-compression"
-version = "0.2.0"
-source = "git+https://github.com/shakenfist/ryll?rev=49072fcc0927403201ba4656e5c8a1779ad224c9#49072fcc0927403201ba4656e5c8a1779ad224c9"
+version = "0.3.0"
+source = "git+https://github.com/shakenfist/ryll?rev=38c51eff3351795342b4ba283cf283b0eb2bab94#38c51eff3351795342b4ba283cf283b0eb2bab94"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -1229,8 +1320,8 @@ dependencies = [
 
 [[package]]
 name = "shakenfist-spice-protocol"
-version = "0.2.0"
-source = "git+https://github.com/shakenfist/ryll?rev=49072fcc0927403201ba4656e5c8a1779ad224c9#49072fcc0927403201ba4656e5c8a1779ad224c9"
+version = "0.3.0"
+source = "git+https://github.com/shakenfist/ryll?rev=38c51eff3351795342b4ba283cf283b0eb2bab94#38c51eff3351795342b4ba283cf283b0eb2bab94"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -1609,6 +1700,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "winapi"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c839a674fcd7a98952e593242ea400abe93992746761e38641405d28b00f419"
+dependencies = [
+ "winapi-i686-pc-windows-gnu",
+ "winapi-x86_64-pc-windows-gnu",
+]
+
+[[package]]
+name = "winapi-i686-pc-windows-gnu"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6"
+
+[[package]]
 name = "winapi-util"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1616,6 +1723,12 @@ checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
  "windows-sys 0.52.0",
 ]
+
+[[package]]
+name = "winapi-x86_64-pc-windows-gnu"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "windows"

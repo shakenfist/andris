@@ -20,9 +20,24 @@ libc = "0.2"
 # Maps the MIT-SHM capture segment, a memfd shared with the X server, so
 # andris does not hand-roll mmap and munmap.
 memmap2 = "0.9"
+# PulseAudio's simple API, to capture the desktop's sound from a sink's
+# monitor on a thread of its own. The protocol is served by PulseAudio
+# and by PipeWire's pipewire-pulse alike. Both link libpulse0, which
+# andris then needs at run time (the image's libpulse-dev provides it).
+libpulse-binding = "2.30"
+libpulse-simple-binding = "2.29"
+# The playback channel's Opus encoder, as ryll's WebRTC bridge uses. It
+# builds libopus statically from bundled source (through opusic-sys),
+# with the cmake the image already has, so andris links no system
+# libopus.
+opus = "0.4"
 # 0.8, the version shakenfist-spice-protocol uses, so that only one rand
 # is built.
 rand = "0.10"
+# 0.6, the version tokio already pulls in, for TCP_NOTSENT_LOWAT on the
+# playback channel's socket (behind its `all` feature), which tokio does
+# not expose.
+socket2 = { version = "0.6", features = ["all"] }
 # 2.6, the version rsa and rustls already pull in.
 subtle = "2.6"
 tokio = { version = "1", features = ["full"] }
@@ -33,27 +48,35 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 x11rb = { version = "0.14", features = ["damage", "randr", "shm", "xfixes", "xkb", "xtest"] }
 
-# ryll's shared crates, pinned to 49072fc, ryll#557's merge on develop,
-# which lets the H.264 encoder be tuned for video (`H264Content`). The
+# ryll's shared crates, pinned to 38c51ef, ryll#578's merge on develop,
+# which adds the playback wire types (ryll 0.3.0 also has `H264Content`,
+# which tunes the H.264 encoder for video). The
 # encoder itself (in shakenfist-spice-compression, behind its `encode`
 # feature) and the control-socket `stats` verb that `make e2e` needs came
 # with ryll#552.
 # Both crates come from one ryll workspace, so they must always carry the
 # same rev, here and in [dev-dependencies]; move them together.
-shakenfist-spice-protocol = { version = "0.2.0", git = "https://github.com/shakenfist/ryll", rev = "49072fcc0927403201ba4656e5c8a1779ad224c9" }
+shakenfist-spice-protocol = { version = "0.3.0", git = "https://github.com/shakenfist/ryll", rev = "38c51eff3351795342b4ba283cf283b0eb2bab94" }
 # Only the encoders. openh264 is also built, because the crate depends on
 # it unconditionally (ryll#499), and is now used too, for the H.264 encoder.
-shakenfist-spice-compression = { version = "0.2.0", git = "https://github.com/shakenfist/ryll", rev = "49072fcc0927403201ba4656e5c8a1779ad224c9", default-features = false, features = [
+shakenfist-spice-compression = { version = "0.3.0", git = "https://github.com/shakenfist/ryll", rev = "38c51eff3351795342b4ba283cf283b0eb2bab94", default-features = false, features = [
     "encode",
 ] }
 
 [dev-dependencies]
+# Ryll's Opus decoder, so tests decode the playback channel's packets as
+# ryll would, into a buffer of exactly one 10 ms frame.
+opus-decoder = "0.1"
 rcgen = "0.14"
+# The paused clock (`test-util`), so the synthetic tone's pacing can be
+# tested without waiting for it. Cargo unifies these features with the
+# ones above in test builds.
+tokio = { version = "1", features = ["full", "test-util"] }
 # The LZ4 and pure-Rust JPEG decoders too, so tests can decode what the
 # encoders produced. `jpeg` also gates the video stream decoders
 # (`video::for_stream`), H.264's among them. Cargo unifies these features
 # with the ones above in test builds only.
-shakenfist-spice-compression = { version = "0.2.0", git = "https://github.com/shakenfist/ryll", rev = "49072fcc0927403201ba4656e5c8a1779ad224c9", default-features = false, features = [
+shakenfist-spice-compression = { version = "0.3.0", git = "https://github.com/shakenfist/ryll", rev = "38c51eff3351795342b4ba283cf283b0eb2bab94", default-features = false, features = [
     "encode",
     "jpeg",
     "lz4",

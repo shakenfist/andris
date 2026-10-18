@@ -69,6 +69,10 @@ pub struct HandshakeContext<'a> {
     pub wrong_tickets: &'a LogThrottle,
     /// The peer, for the log.
     pub peer: SocketAddr,
+    /// Whether the playback channel is served: false when the platform
+    /// has no audio (`--no-audio`), and a playback link is then refused as
+    /// a channel andris does not serve.
+    pub playback: bool,
 }
 
 /// `SPICE_INPUTS_CAP_KEY_SCANCODE`, bit 0 of the inputs channel's
@@ -98,6 +102,12 @@ const DISPLAY_CAPS: [u32; 1] = [capabilities::DISPLAY_MONITORS_CONFIG
     | capabilities::DISPLAY_PREF_COMPRESSION
     | capabilities::DISPLAY_PREF_VIDEO_CODEC_TYPE];
 const INPUTS_CAPS: [u32; 1] = [INPUTS_CAP_KEY_SCANCODE];
+/// `VOLUME | OPUS`, kerbside's offer for playback. Andris sends no
+/// `VOLUME` or `MUTE`: whether a sink's monitor already follows the
+/// desktop's volume depends on the sink, so forwarding it could
+/// attenuate twice. Offering what kerbside offers on andris's behalf
+/// leaves kerbside nothing to warn about.
+const PLAYBACK_CAPS: [u32; 1] = [capabilities::PLAYBACK_VOLUME | capabilities::PLAYBACK_OPUS];
 
 /// The channels andris serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -106,6 +116,9 @@ pub enum ServedChannel {
     Display,
     Inputs,
     Cursor,
+    /// Served only when the platform has audio; see
+    /// [`HandshakeContext::playback`].
+    Playback,
 }
 
 impl ServedChannel {
@@ -116,6 +129,7 @@ impl ServedChannel {
             ChannelType::Display => Some(ServedChannel::Display),
             ChannelType::Inputs => Some(ServedChannel::Inputs),
             ChannelType::Cursor => Some(ServedChannel::Cursor),
+            ChannelType::Playback => Some(ServedChannel::Playback),
             _ => None,
         }
     }
@@ -126,6 +140,7 @@ impl ServedChannel {
             ServedChannel::Display => "display",
             ServedChannel::Inputs => "inputs",
             ServedChannel::Cursor => "cursor",
+            ServedChannel::Playback => "playback",
         }
     }
 
@@ -136,6 +151,7 @@ impl ServedChannel {
             ServedChannel::Display => &DISPLAY_CAPS,
             ServedChannel::Inputs => &INPUTS_CAPS,
             ServedChannel::Cursor => &[],
+            ServedChannel::Playback => &PLAYBACK_CAPS,
         }
     }
 }
@@ -232,6 +248,10 @@ where
         );
         return refuse(stream, stage, SpiceError::ChannelUnavailable).await;
     };
+    if channel == ServedChannel::Playback && !ctx.playback {
+        debug!("refusing the playback channel: andris captures no audio");
+        return refuse(stream, stage, SpiceError::ChannelUnavailable).await;
+    }
     if link.channel_id != 0 {
         debug!(
             channel = channel.name(),
@@ -380,6 +400,7 @@ mod tests {
         );
         assert_eq!(ServedChannel::Inputs.reply_caps(), &[1]);
         assert!(ServedChannel::Cursor.reply_caps().is_empty());
+        assert_eq!(ServedChannel::Playback.reply_caps(), &[(1 << 1) | (1 << 3)]);
     }
 
     #[test]
@@ -389,11 +410,12 @@ mod tests {
             (ChannelType::Display, ServedChannel::Display),
             (ChannelType::Inputs, ServedChannel::Inputs),
             (ChannelType::Cursor, ServedChannel::Cursor),
+            (ChannelType::Playback, ServedChannel::Playback),
         ] {
             assert_eq!(ServedChannel::from_type(channel_type), Some(served));
             assert_eq!(served.name(), channel_type.name());
         }
-        assert_eq!(ServedChannel::from_type(ChannelType::Playback), None);
+        assert_eq!(ServedChannel::from_type(ChannelType::Record), None);
         assert_eq!(ServedChannel::from_type(ChannelType::Usbredir), None);
     }
 }

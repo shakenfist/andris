@@ -186,8 +186,8 @@ written with `/next-phase` as each phase comes up.
 | 5. Damage and flow control | PLAN-x11-desktop-phase-05-damage.md | Complete | andris `68b1058` (#8); andris `43bfe88` (#11) |
 | 6. Sharing the xrdp session | PLAN-x11-desktop-phase-06-sharing.md | Complete | andris `498a72c` (#12) |
 | 7. In-process agent: resize and clipboard | PLAN-x11-desktop-phase-07-agent.md | Complete | ryll `b298b39` (#534); andris `b7ba2dd` (#16) |
-| 8. Video streams | PLAN-x11-desktop-phase-08-video.md | In progress | |
-| 9. Audio | Not yet written | Not started | |
+| 8. Video streams | PLAN-x11-desktop-phase-08-video.md | Complete | ryll `a157ced` (#552), `601b9dc` (#554), `49072fc` (#557); andris `c2fe8a7` (#21), `1ecafa5` (#23) |
+| 9. Audio | PLAN-x11-desktop-phase-09-audio.md | In progress | |
 | 10. Packaging and dogfood soak | Not yet written | Not started | |
 | 11. Human review | Not yet written | Not started | |
 | 12. Push audit | This file, below | Not started | |
@@ -460,8 +460,15 @@ stream-flap diagnostics are the instrument for tuning this. Planned in
 ### Phase 9: Audio
 
 Add a playback channel that captures the session's default sink
-monitor (the xrdp sink on the development host), encodes Opus at 48
-kHz and honours the client's volume and mute messages.
+monitor over the PulseAudio protocol, which PipeWire's
+`pipewire-pulse` also serves, and encodes Opus at 48 kHz in 10 ms
+frames. The development host runs PipeWire with no xrdp sink module,
+so its default sink is a local output; with an xrdp sink module
+installed, andris captures that sink's monitor instead. `VOLUME` and
+`MUTE` carry the desktop's settings from server to client (the client
+cannot set them); the phase plan defers forwarding them. Ryll first
+gains playback wire types in its protocol crate and a `playback`
+section in its control socket's `stats`.
 
 ### Phase 10: Packaging and dogfood soak
 
@@ -607,6 +614,17 @@ file) and keep its status in step with the Execution table.
   area and a stream is replaced only by a cluster more than twice its
   size; the upper half went as JPEG at up to 38 Mbit/s meanwhile. A
   cluster that contains the stream could replace it whatever its size.
+- Forwarding the desktop's volume and mute to clients. Andris
+  advertises the playback `VOLUME` capability but sends neither
+  `VOLUME` nor `MUTE`. Following the sink's volume needs libpulse's
+  asynchronous API, and a monitor that is taken after the sink's
+  volume (a null sink's) would be attenuated twice, so it needs the
+  sink's kind taken into account.
+- Following a change of default sink mid-session. Andris keeps the
+  monitor it opened until the client's playback channel reconnects.
+- Handling the vdagent's `VD_AGENT_AUDIO_VOLUME_SYNC`, which is how a
+  client's own volume reaches a guest. Andris's in-process agent
+  ignores it.
 - VA-API H.264 encode; multi-monitor; the record channel
   (microphone); usbredir and webdav; several simultaneous viewers.
 - Kerbside L2 inspection reusing the phase 2 wire types.

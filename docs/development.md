@@ -16,8 +16,8 @@ Docker. Nothing else is needed on the host, and in particular no
 Rust toolchain: every cargo invocation runs inside a devcontainer
 built from
 [`.devcontainer/Dockerfile`](https://github.com/shakenfist/andris/blob/develop/.devcontainer/Dockerfile)
-(Debian with a C toolchain, `pkg-config`, `nasm` and stable Rust with
-rustfmt and clippy). `nasm` is for openh264, which andris builds from
+(Debian with a C toolchain, `pkg-config`, `nasm`, `libpulse-dev` and
+stable Rust with rustfmt and clippy). `nasm` is for openh264, which andris builds from
 source for its H.264 encoder: without it the crate silently skips its
 assembly, and a 1080p frame takes about 2.7 times as long to encode.
 Run `make` targets as an ordinary user in the docker group; the
@@ -112,7 +112,37 @@ then watches the same picture for five seconds: it must see no stream
 created, and andris's session-end line for it must count JPEG draws
 and no stream.
 
-It also checks ryll's log for all four channels, and stops ryll with
+**Audio.** Before andris starts, the script runs an unprivileged
+PulseAudio daemon whose only sink, so its default, is a null sink at
+48 kHz, and exports `PULSE_SERVER` naming its socket. Andris, `pacat`
+and `pactl` reach it through that variable and nothing else on the
+host. With it up, the PulseAudio capture's integration test
+(`andris/tests/pulse.rs`) runs there too, gated by
+`ANDRIS_TEST_PULSE`: it plays tones into the sink and reads them back
+through andris's capture. Under `make test` the variable is unset, so
+the test skips and passes. The driver then plays a 440 Hz tone for five
+seconds with `pacat` and checks, through ryll's `stats` `playback`
+section, that ryll saw one start and Opus at 48 kHz in two channels,
+decoded at least 400 packets with no failure, and saw a stop within two
+seconds of the tone ending. Andris's session-end metrics line must
+count at least that many audio frames and one audio start and stop.
+
+Ryll is built with its `audio` feature, so that it opens the playback
+channel, but every ryll the script starts is given a `PULSE_SERVER`
+that does not exist. The devcontainer's ALSA default is PulseAudio's
+plugin, so a ryll with the script's server would play the decoded tone
+into the null sink, andris would capture it again, and the stream
+would never stop. Never point a ryll at the sound server andris
+captures. Nothing here touches the host's sound server.
+
+A second andris, started with `--no-audio` on another port, must give
+a third ryll no playback channel: its `stats` never has a `playback`
+section, and ryll's log lists no playback channel and links none.
+Andris warns each time a client links the playback channel and it
+cannot capture sound, so the script also fails if the first andris
+logged that warning, or an `ERROR`.
+
+It also checks ryll's log for all five channels, and stops ryll with
 SIGINT and andris with SIGTERM; all three must exit 0. Last, it starts a
 second andris against the same display and kills Xvfb under it: that
 andris must exit 1 within ten seconds, logging that the desktop has
@@ -121,9 +151,9 @@ every log on failure.
 
 It needs nothing on the host beyond Docker: Xvfb and Python are in
 the devcontainer image, and `make ryll-headless`, which `make e2e`
-depends on, builds ryll with `--no-default-features` (no GUI, audio or
-capture) at the revision `Cargo.lock` pins for
-`shakenfist-spice-protocol`. That build needs the network, installs
+depends on, builds ryll with `--no-default-features --features
+audio` (no GUI or capture, but with audio) at the revision
+`Cargo.lock` pins for `shakenfist-spice-protocol`. That build needs the network, installs
 into `ryll/<revision>/` under the cargo cache, and is skipped when the
 binary for that revision is already there. Moving the ryll pin builds
 ryll afresh.
@@ -165,7 +195,22 @@ checks, after a smoke test, that:
   sends to FreeRDP, becomes one H.264 stream that ryll decodes with no
   failure and is destroyed once the picture stops, while FreeRDP stays
   connected and logs no error;
+- a 440 Hz tone played in the session with `pacat` (X13), into the
+  xrdp sink, reaches ryll as Opus: it decodes packets with no failure
+  and the stream stops once the tone ends, while FreeRDP stays
+  connected and logs no error;
 - ending the session makes andris exit with status 1.
+
+The session has a sound server, as a Debian 13 desktop does:
+PipeWire, WirePlumber and `pipewire-pulse` under `dbus-run-session`,
+started in that order, with each waiting for the one before (starting
+them together raced). The test bed has no desktop to run autostart
+entries, so the session then runs xrdp's loader script itself, which
+makes `xrdp-sink` the default. The test waits for that before it
+starts andris, since andris resolves the default sink when a playback
+channel links. FreeRDP connects with `/sound:sys:fake`. The session's
+`PULSE_SERVER` names pipewire-pulse's socket, so no PulseAudio client
+can start a daemon of its own, and ryll gets an unreachable one.
 
 Every clipboard check copies text not used before, because FreeRDP
 and xrdp keep what they last fetched. Andris runs there with debug

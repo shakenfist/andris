@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The xrdp test bed's interleaving checks, X1 to X12.
+"""The xrdp test bed's interleaving checks, X1 to X13.
 
 scripts/xrdp-testbed/run.sh runs this inside the andris-xrdp-testbed
 container, as root, once its smoke checks have passed: andris shares the
@@ -62,6 +62,13 @@ The checks, each printing PASS or FAIL with what it saw:
       created and decoding frames, with no decode failure, and it is
       destroyed once the picture stops. RDP is unaffected: FreeRDP stays
       connected throughout, and logs no error while the picture plays.
+  X13 A 440 Hz tone played with `pacat`, as the session's user, into the
+      session's default sink, which is xrdp's (pipewire-module-xrdp, under
+      PipeWire): andris captures it from the sink's monitor, and ryll's
+      `stats` show one Opus stream at 48 kHz in two channels that decodes
+      with no failure and stops once the tone ends, as scripts/e2e-drive.py
+      checks against a null sink. FreeRDP, which takes the session's sound
+      with /sound:sys:fake, stays connected and logs no error.
   X7  The session ended, by ending its window manager (the keylogger):
       andris exits within 10 s, logging that the desktop has gone. Andris
       is run.sh's child, so run.sh checks its exit status afterwards.
@@ -880,11 +887,22 @@ def x11(bed):
 FREERDP_ERROR = '[ERROR]'
 
 
+def freerdp_mark(bed):
+    """The length of the running FreeRDP's log, to read its new lines from."""
+    with open(bed.freerdp_log(), 'rb') as f:
+        return len(f.read())
+
+
+def freerdp_errors(bed, mark):
+    """The error lines the running FreeRDP has logged since `mark`."""
+    with open(bed.freerdp_log(), 'rb') as f:
+        f.seek(mark)
+        return [line for line in f.read().decode('utf-8', 'replace').splitlines() if FREERDP_ERROR in line]
+
+
 def x12(bed):
     """A video in the session streams to ryll as H.264, and RDP is unaffected."""
-    freerdp_log = bed.freerdp_log()
-    with open(freerdp_log, 'rb') as f:
-        mark = len(f.read())
+    mark = freerdp_mark(bed)
     video = drive.Video(bed.args.session, bed.args.work, 'video', bed.watch)
     try:
         start = time.monotonic()
@@ -907,9 +925,7 @@ def x12(bed):
     finally:
         video.close()
     bed.watch.check()
-    with open(freerdp_log, 'rb') as f:
-        f.seek(mark)
-        errors = [line for line in f.read().decode('utf-8', 'replace').splitlines() if FREERDP_ERROR in line]
+    errors = freerdp_errors(bed, mark)
     if errors:
         raise Failure(f'FreeRDP logged {len(errors)} error(s) while the video played: {errors[:3]}')
     rects = drive.stream_rects(bed.andris_log())
@@ -917,6 +933,17 @@ def x12(bed):
             f'{", ".join(drive.describe_rect(r) for r in rects)}) was decoding after {started:.1f} s, decoded '
             f'{live[0]["frames_decoded_ok"]} frames with no failure, and was destroyed {ended:.2f} s after the '
             f'video stopped; FreeRDP stayed up, and logged no error')
+
+
+def x13(bed):
+    """A tone played in the session reaches ryll as Opus, and RDP is unaffected."""
+    mark = freerdp_mark(bed)
+    summary = drive.check_audio(bed.control, bed.args.work, bed.watch, prefix=shlex.split(bed.args.sound_command))
+    bed.watch.check()
+    errors = freerdp_errors(bed, mark)
+    if errors:
+        raise Failure(f'FreeRDP logged {len(errors)} error(s) while the tone played: {errors[:3]}')
+    return f'{summary}; FreeRDP stayed up, and logged no error'
 
 
 def x7(bed):
@@ -962,7 +989,7 @@ def setup(bed):
 
 
 CHECKS = (('X1', x1), ('X2', x2), ('X3', x3), ('X4', x4), ('X5', x5), ('X6', x6), ('X8', x8), ('X9', x9),
-          ('X10', x10), ('X11', x11), ('X12', x12))
+          ('X10', x10), ('X11', x11), ('X12', x12), ('X13', x13))
 
 
 def main():
@@ -978,6 +1005,9 @@ def main():
     parser.add_argument('--freerdp', type=int, required=True, help="FreeRDP's pid")
     parser.add_argument('--ryll-command', required=True, help='the command that started ryll, shell-quoted')
     parser.add_argument('--freerdp-command', required=True, help='the command that started FreeRDP, shell-quoted')
+    parser.add_argument('--sound-command', required=True,
+                        help="a command prefix that runs a program as the session's user, with its sound server, "
+                        'shell-quoted')
     args = parser.parse_args()
     if not os.path.exists(MARKER):
         log(f'refusing to run: no {MARKER}, so this is not the andris-xrdp-testbed container')

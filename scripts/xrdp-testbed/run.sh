@@ -7,13 +7,16 @@
 #
 # It builds a real xrdp session and has andris share it:
 #   1. creates the user `tester`, whose ~/startwm.sh runs
-#      scripts/e2e-keylogger.py as the whole session;
+#      scripts/e2e-keylogger.py as the whole session, with the session's
+#      sound server beside it: PipeWire, WirePlumber and pipewire-pulse on
+#      a session bus, with xrdp's sink loaded and made the default;
 #   2. starts xrdp-sesman, and xrdp listening on loopback;
 #   3. starts an Xvfb for the RDP client, and xfreerdp3 on it, which logs
 #      in as tester, so that sesman starts an xorgxrdp Xorg and the
 #      keylogger on it;
 #   4. waits for that Xorg, reading its display number from sesman's log,
-#      and for the keylogger's window;
+#      for the keylogger's window, and for xrdp's sink to be the session's
+#      default;
 #   5. as tester, starts andris on the session's display, and ryll
 #      --headless against andris, as scripts/e2e.sh does.
 #
@@ -22,16 +25,17 @@
 #             is local;
 #   surface   ryll's screenshot has the session's size, and a frame of the
 #             keylogger's window reached it (scripts/xrdp-testbed/smoke.py);
-#   channels  ryll's log shows the main, display, inputs and cursor
-#             channels connected.
+#   channels  ryll's log shows the main, display, inputs, cursor and
+#             playback channels connected.
 #
-# If they pass, the interleaving checks X1 to X12 follow
+# If they pass, the interleaving checks X1 to X13 follow
 # (scripts/e2e-xrdp-drive.py): keys from RDP and SPICE in turn, held
 # modifiers, lock keys, an RDP resize, an RDP reconnect with the same and
 # with another layout, clipboard text each way, no clipboard loop through
 # a stand-in for a shared pasteboard, a SPICE resize refused, a video
-# streamed to ryll as H.264 while FreeRDP stays connected, and last,
-# the session ending. Andris must handle
+# streamed to ryll as H.264 while FreeRDP stays connected, a tone played
+# in the session reaching ryll as Opus (X13), and last, the session
+# ending. Andris must handle
 # that by exiting by itself, promptly and with status 1, the status it
 # gives when the desktop goes, rather than hanging, crashing or exiting
 # 0.
@@ -91,6 +95,7 @@ XVFB_BOUND=10
 SESSION_BOUND=30
 KEYLOGGER_BOUND=15
 ANDRIS_BOUND=10
+SOUND_BOUND=15
 
 here=$(cd "$(dirname "$0")" && pwd)
 scripts=$(dirname "$here")
@@ -215,20 +220,70 @@ if [ "$xrdp_version" != "$HOST_XRDP" ] || [ "$xorgxrdp_version" != "$HOST_XORGXR
     say "NOTE: the operator's host runs xrdp $HOST_XRDP and xorgxrdp $HOST_XORGXRDP"
 fi
 
-# 1. The session's user, and its session: the keylogger and nothing else.
-# Sesman runs ~/startwm.sh in place of /etc/xrdp/startwm.sh
+# 1. The session's user, and its session: the keylogger, and the session's
+# sound server. Sesman runs ~/startwm.sh in place of /etc/xrdp/startwm.sh
 # (UserWindowManager in sesman.ini), on the session's display, and ends
 # the session when it exits. The keylogger's output goes in the work
 # directory, which tester owns, so that this script can wait on it.
+#
+# The sound server is PipeWire, as on a Debian 13 desktop: pipewire,
+# wireplumber and pipewire-pulse, on a session bus from dbus-run-session.
+# A desktop starts them, and runs xrdp's loader script from an XDG
+# autostart entry; the test bed has no desktop, so the session does both
+# itself, in order: WirePlumber exits if PipeWire is not up yet. The
+# loader needs XRDP_SESSION and XRDP_SOCKET_PATH, which sesman sets, a
+# running pipewire-pulse, for pactl, and WirePlumber's "default"
+# metadata, without which pactl cannot make xrdp's sink and source the
+# defaults. The sound server's start runs beside the keylogger, so that
+# it holds up nothing else. The session's runtime directory is a private
+# one in the work directory, since nothing here makes /run/user, and
+# PULSE_SERVER names pipewire-pulse's socket in it, so that no PulseAudio
+# client can start a PulseAudio daemon of its own.
 useradd --create-home --shell /bin/bash "$TESTER"
 echo "$TESTER:$TESTER_PASSWORD" | chpasswd
 chown "$TESTER:" "$work"
+runtime=$work/runtime
+mkdir -m 0700 "$runtime"
+chown "$TESTER:" "$runtime"
+pulse_server=unix:$runtime/pulse/native
 cat >"$TESTER_HOME/startwm.sh" <<EOF
 #!/bin/sh
+exec dbus-run-session -- $TESTER_HOME/session.sh
+EOF
+cat >"$TESTER_HOME/session.sh" <<EOF
+#!/bin/sh
+export XDG_RUNTIME_DIR=$runtime PULSE_SERVER=$pulse_server
+# until_up WHAT COMMAND...: wait up to 10 s for COMMAND to succeed.
+until_up() {
+    what=\$1
+    shift
+    tries=0
+    until "\$@" >/dev/null 2>&1; do
+        tries=\$((tries + 1))
+        if [ "\$tries" -ge 100 ]; then
+            echo "\$what is not up after 10 s"
+            exit 1
+        fi
+        sleep 0.1
+    done
+    echo "\$what is up"
+}
+default_metadata() {
+    pw-cli ls Metadata | grep 'metadata.name = "default"'
+}
+(
+    pipewire >$work/pipewire.log 2>&1 &
+    until_up pipewire pw-cli quit
+    wireplumber >$work/wireplumber.log 2>&1 &
+    pipewire-pulse >$work/pipewire-pulse.log 2>&1 &
+    until_up pipewire-pulse pactl info
+    until_up "wireplumber's default metadata" default_metadata
+    exec /usr/libexec/pipewire-module-xrdp/load_pw_modules.sh
+) >$work/sound.log 2>&1 &
 exec python3 -u $scripts/e2e-keylogger.py --display "\$DISPLAY" --detail >$work/keylogger.log 2>&1
 EOF
-chown "$TESTER:" "$TESTER_HOME/startwm.sh"
-chmod 0755 "$TESTER_HOME/startwm.sh"
+chown "$TESTER:" "$TESTER_HOME/startwm.sh" "$TESTER_HOME/session.sh"
+chmod 0755 "$TESTER_HOME/startwm.sh" "$TESTER_HOME/session.sh"
 
 # 2. Sesman and xrdp. Sesman's config is Debian's, with the display offset
 # moved (see the header). KillDisconnected is false, as it is on the host,
@@ -249,12 +304,14 @@ wait_until "$DAEMON_BOUND" xrdp "xrdp listening on 127.0.0.1:$RDP_PORT" \
 # that window resize the session. -grab-keyboard stops FreeRDP grabbing
 # the client's keyboard while it has the focus, so that the interleaving
 # checks can change the client's own lock keys without FreeRDP seeing them.
-# The checks restart FreeRDP with this same command.
+# /sound:sys:fake has FreeRDP take the session's sound and play it
+# nowhere, so that xrdp's sound channel is up, as for a client with
+# speakers. The checks restart FreeRDP with this same command.
 start client-xvfb Xvfb "$CLIENT_DISPLAY" -screen 0 "${CLIENT_GEOMETRY}x24" -nolisten tcp
 wait_until "$XVFB_BOUND" client-xvfb "the client's Xvfb answering on $CLIENT_DISPLAY" \
     xdpyinfo -display "$CLIENT_DISPLAY"
 freerdp_command=(env DISPLAY="$CLIENT_DISPLAY" xfreerdp3 "/v:127.0.0.1:$RDP_PORT" "/u:$TESTER"
-    "/p:$TESTER_PASSWORD" /cert:ignore "/size:$RDP_SIZE" /dynamic-resolution -grab-keyboard)
+    "/p:$TESTER_PASSWORD" /cert:ignore "/size:$RDP_SIZE" /dynamic-resolution -grab-keyboard /sound:sys:fake)
 start freerdp "${freerdp_command[@]}"
 
 # 4. The session's Xorg, and the keylogger on it. FreeRDP is the process
@@ -273,6 +330,16 @@ session_size=$("${as_tester[@]}" xdpyinfo -display "$session" |
     sed -n 's/^ *dimensions: *\([0-9]*x[0-9]*\) pixels.*/\1/p')
 say "the session is $session_size"
 
+# The session's sound server, as tester sees it: andris captures from it,
+# and X13 plays its tone into it. Andris resolves the default sink's
+# monitor when a client's playback channel links, so xrdp's sink must be
+# the default before ryll connects.
+as_tester_sound=("${as_tester[@]}" XDG_RUNTIME_DIR="$runtime" PULSE_SERVER="$pulse_server")
+xrdp_sink_default() {
+    [ "$("${as_tester_sound[@]}" pactl get-default-sink 2>/dev/null)" = xrdp-sink ]
+}
+wait_until "$SOUND_BOUND" freerdp "xrdp's sink the session's default" xrdp_sink_default
+
 # 5. Andris and ryll, as tester, as scripts/e2e.sh runs them. The ticket
 # is 0600 and tester's, as andris requires.
 ticket=$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')
@@ -284,11 +351,16 @@ chown "$TESTER:" "$work/ticket" "$work/andris.vv"
 # Debug for the clipboard, whose lines carry a hash of each text, so that a
 # failure of X8 to X10 shows which text went where.
 andris_log=info,andris::server::agent=debug,andris::platform::x11::clipboard=debug
-start andris "${as_tester[@]}" RUST_LOG="$andris_log" "$ANDRIS" --platform x11 --display "$session" \
+start andris "${as_tester_sound[@]}" RUST_LOG="$andris_log" "$ANDRIS" --platform x11 --display "$session" \
     --listen "127.0.0.1:$SPICE_PORT" --ticket-file "$work/ticket"
 wait_until "$ANDRIS_BOUND" andris "andris listening on $SPICE_PORT" \
     grep -q "plain listener ready" "$work/andris.log"
-ryll_command=("${as_tester[@]}" "$RYLL" --headless --file "$work/andris.vv" --control-socket "$sock" --verbose)
+# Ryll plays what it decodes through ALSA, whose default device is
+# PulseAudio's plugin. Given the session's sound server, it would play
+# the tone back into xrdp's sink, and andris would capture it again; so
+# ryll gets a server that does not exist, and decodes with no device.
+ryll_command=("${as_tester[@]}" PULSE_SERVER="unix:$work/ryll-has-no-sound-server" "$RYLL" --headless
+    --file "$work/andris.vv" --control-socket "$sock" --verbose)
 start ryll "${ryll_command[@]}"
 
 # The smoke checks. smoke.py bounds its own waits, and gives up early if a
@@ -311,13 +383,13 @@ fi
 
 # Ryll's log is the oracle for the channels, as in scripts/e2e.sh.
 missing=()
-for channel in main display inputs cursor; do
+for channel in main display inputs cursor playback; do
     if ! plain "$work/ryll.log" | grep " INFO $channel: connected successfully\$" >/dev/null; then
         missing+=("$channel")
     fi
 done
 if [ "${#missing[@]}" -eq 0 ]; then
-    pass "ryll connected the main, display, inputs and cursor channels"
+    pass "ryll connected the main, display, inputs, cursor and playback channels"
 else
     fail "ryll never connected the ${missing[*]} channel(s)"
 fi
@@ -333,7 +405,7 @@ if [ "$failures" -ne 0 ]; then
     exit 1
 fi
 
-# The interleaving checks, X1 to X12 (scripts/e2e-xrdp-drive.py). They
+# The interleaving checks, X1 to X13 (scripts/e2e-xrdp-drive.py). They
 # restart ryll and FreeRDP with the commands above, and end the session
 # last, in X7. Andris is this script's child, so X7's last part, andris's
 # exit status, is checked here once the drive has seen it exit.
@@ -341,7 +413,8 @@ rc=0
 python3 "$scripts/e2e-xrdp-drive.py" --socket "$sock" --session "$session" --client-display "$CLIENT_DISPLAY" \
     --work "$work" --xauthority "$TESTER_HOME/.Xauthority" --xrdp-log "$XRDP_LOG" \
     --andris "${pids[andris]}" --ryll "${pids[ryll]}" --freerdp "${pids[freerdp]}" \
-    --ryll-command "${ryll_command[*]@Q}" --freerdp-command "${freerdp_command[*]@Q}" || rc=$?
+    --ryll-command "${ryll_command[*]@Q}" --freerdp-command "${freerdp_command[*]@Q}" \
+    --sound-command "${as_tester_sound[*]@Q}" || rc=$?
 if [ "$rc" -ne 0 ]; then
     failures=$((failures + 1))
 fi

@@ -164,10 +164,9 @@ Each has the default this plan takes if nobody answers.
    own binary, downloaded separately onto the user's machine; a build
    from source carries none. *Decided by the operator on 2026-10-15:*
    phase 8 builds openh264 from source, as ryll already ships it, and
-   documents the position. Phase 10 decides what the PyPI wheels
-   ship: the compiled encoder, or an andris built with openh264's
-   `libloading` feature that loads a Cisco binary the operator
-   fetches.
+   documents the position. *Decided by the operator on 2026-10-18,*
+   for phase 10: the PyPI wheels ship the compiled encoder, as ryll's
+   do, rather than loading a Cisco binary the operator fetches.
 
 ## Execution
 
@@ -188,7 +187,7 @@ written with `/next-phase` as each phase comes up.
 | 7. In-process agent: resize and clipboard | PLAN-x11-desktop-phase-07-agent.md | Complete | ryll `b298b39` (#534); andris `b7ba2dd` (#16) |
 | 8. Video streams | PLAN-x11-desktop-phase-08-video.md | Complete | ryll `a157ced` (#552), `601b9dc` (#554), `49072fc` (#557); andris `c2fe8a7` (#21), `1ecafa5` (#23) |
 | 9. Audio | PLAN-x11-desktop-phase-09-audio.md | Complete | ryll `38c51ef` (#578); andris `d8f316a` (#27) |
-| 10. Packaging and dogfood soak | Not yet written | Not started | |
+| 10. Packaging and dogfood soak | PLAN-x11-desktop-phase-10-packaging.md | In progress | |
 | 11. Human review | Not yet written | Not started | |
 | 12. Push audit | This file, below | Not started | |
 
@@ -296,9 +295,11 @@ phases 2 and 3; cutting it is not a step of this plan. From phase 4, andris depe
 on ryll's crates by git revision, as kerbside does, which andris's
 `deny.toml` already allows. A path `[patch]` against a sibling ryll
 worktree would not work, because andris's build container mounts
-only the andris checkout. Andris moves to crates.io versions once a
-release contains what it needs; phase 10 is the latest point at
-which that matters.
+only the andris checkout. Andris could move to crates.io versions
+once a release contains what it needs. Phase 10's survey found that
+nothing forces it: a wheel embeds the compiled binary, so a git
+dependency costs it nothing, and only publishing andris itself to
+crates.io would rule one out. Phase 10 keeps the git pin.
 
 ### Phase 4: Server skeleton
 
@@ -472,13 +473,18 @@ section in its control socket's `stats`.
 
 ### Phase 10: Packaging and dogfood soak
 
+Detail is in
+[PLAN-x11-desktop-phase-10-packaging.md](PLAN-x11-desktop-phase-10-packaging.md).
 Publish andris to PyPI as manylinux wheels, reusing ryll's release
 tooling: maturin with `bindings = "bin"`, a manylinux_2_28 build per
 architecture (ryll's `.devcontainer/wheel/Dockerfile` and
 `tools/build-ryll-wheel.sh`), and trusted publishing from a release
-workflow. Andris's X11 code is pure-Rust `x11rb`, linking no X
-library, so the manylinux tag holds without vendoring anything. A
-`.deb` is optional.
+workflow. Andris's X11 code is pure-Rust `x11rb`, but phase 9 made
+andris link libpulse, which is outside the manylinux policy. So this
+phase loads libpulse at run time instead, which earns the tag and
+lets andris run without sound where libpulse is missing. The wheels
+ship openh264 compiled in (open question 7). A `.deb` is left to
+Future work.
 
 A wheel cannot install a systemd unit, and phase 6's
 `andris@.service` names a bare `andris`, which systemd resolves only
@@ -493,15 +499,18 @@ with mode 0700 and a fresh 0600 ticket when none exists, so that
 which the documentation says.
 
 Phase 6 declined `SystemCallFilter=@system-service` until a soak
-shows MIT-SHM and the memfd survive it; this phase's soak is that
-test.
+shows MIT-SHM and the memfd survive it; this phase adds it, and its
+soak is that test.
 
-Write the kerbside static-source configuration into `docs/`. Automate phase 4's
-kerbside smoke test, either here or as a "custom backend" lane in
-kerbside's own CI. Then the operator uses
+The kerbside static-source configuration has been in `docs/` since
+phase 4. This phase automates phase 4's kerbside smoke test as a
+merge-tier lane in andris's CI, on kerbside's demo stack, covering
+the video and playback channels that did not exist in phase 4. Then
+andris 0.1.0 is released, and the operator uses
 ryll → kerbside → andris as the daily connection for a week, with
-RDP as the fallback. Every regression found is filed, and either
-fixed here or recorded under Future work.
+RDP as the fallback, through kerbside's demo stack on the development
+host. Every regression found is filed, and either fixed in an
+acceptance pull request or recorded under Future work.
 
 ### Phase 11: Human review
 
@@ -632,6 +641,11 @@ file) and keep its status in step with the Execution table.
   beside the encoder's tables, so that encode and decode can be tested
   against each other.
 - A side-by-side comparison against Xspice as a baseline.
+- A `.deb` or `.rpm` of andris. Phase 10 ships PyPI wheels and
+  `andris install-unit`, which cover the install story.
+- Depending on ryll's crates by crates.io version rather than git
+  revision, once a ryll release contains ryll#578 (0.3.0 does not).
+  Only a crates.io release of andris would require it.
 - Scroll detection: send a scrolled region as `COPY_BITS`, which ryll
   renders, plus the newly exposed strip, rather than as fresh pixels.
   Phase 5 measures whether scrolling needs it, and sizes it.

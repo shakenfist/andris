@@ -3,9 +3,12 @@
 # stages, run after the release-X.Y.Z pull request that
 # scripts/propose-release.sh began has landed on develop.
 #
-# Fetches origin/develop, checks that its tip carries version X.Y.Z, and,
-# after confirmation, creates an annotated tag vX.Y.Z at that commit and
-# pushes it. The push starts .github/workflows/release.yml, which builds
+# Fetches origin/develop, finds the commit that landed the release
+# (the merge of the pull request holding "Release X.Y.Z.", or that commit
+# itself if it landed directly), checks that it carries version X.Y.Z,
+# and, after confirmation, creates an annotated tag vX.Y.Z at that commit
+# and pushes it. Anything that landed on develop after it is listed, and
+# is not in the release. The push starts .github/workflows/release.yml, which builds
 # both wheels, waits for approval on the `release` environment, signs
 # the tag, creates the GitHub release and publishes the wheels to PyPI.
 # A version PyPI has published can never be published again, so this
@@ -45,29 +48,56 @@ if git ls-remote --tags --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; t
     err "tag ${TAG} already exists on origin"
 fi
 
-# --- the version on origin/develop ---
+# --- the commit that landed the release ---
+#
+# Not develop's tip: another pull request may have landed since, and
+# what is tagged is what is built and published, so it must be what was
+# reviewed as the release. The release commit is the one
+# propose-release.sh made; the commit that landed it is the first commit
+# on develop's first-parent line to contain it.
+
+info "Finding the commit that landed release ${VERSION}"
+RELEASE_SHA="$(git log origin/develop --format='%H%x09%s' \
+    | awk -F '\t' -v want="Release ${VERSION}." '$2 == want { print $1; exit }')"
+[[ -n "${RELEASE_SHA}" ]] \
+    || err "no commit 'Release ${VERSION}.' on origin/develop. Has the release-${VERSION} pull request landed?"
+TARGET_SHA=''
+while read -r commit; do
+    if git merge-base --is-ancestor "${RELEASE_SHA}" "${commit}"; then
+        TARGET_SHA="${commit}"
+        break
+    fi
+done < <(git rev-list --first-parent --reverse origin/develop --not "${RELEASE_SHA}^@")
+[[ -n "${TARGET_SHA}" ]] || err "could not find where ${RELEASE_SHA} landed on origin/develop"
+TARGET_SUBJECT="$(git log -1 --format=%s "${TARGET_SHA}")"
+
+# --- the version there ---
 #
 # Read from the commit that will be tagged, not the working tree, so
 # that a local branch or uncommitted edit cannot stand in for what
 # landed. Cargo.lock is checked too, since the release builds --frozen.
 
-info "Checking the version on origin/develop"
-ACTUAL="$(git show origin/develop:Cargo.toml | scripts/release-version.sh -)" \
-    || err "could not read [workspace.package] version from origin/develop"
+info "Checking the version at ${TARGET_SHA}"
+ACTUAL="$(git show "${TARGET_SHA}:Cargo.toml" | scripts/release-version.sh -)" \
+    || err "could not read [workspace.package] version at ${TARGET_SHA}"
 [[ "${ACTUAL}" == "${VERSION}" ]] \
-    || err "origin/develop is at ${ACTUAL}, not ${VERSION}. Has the release-${VERSION} pull request landed?"
-git show origin/develop:Cargo.lock \
+    || err "${TARGET_SHA} is at ${ACTUAL}, not ${VERSION}"
+git show "${TARGET_SHA}:Cargo.lock" \
     | grep -A1 -x 'name = "andris"' | grep -x "version = \"${VERSION}\"" >/dev/null \
-    || err "origin/develop's Cargo.lock does not record andris ${VERSION}"
+    || err "the Cargo.lock at ${TARGET_SHA} does not record andris ${VERSION}"
 
-TARGET_SHA="$(git rev-parse origin/develop)"
-TARGET_SUBJECT="$(git log -1 --format=%s origin/develop)"
+LATER="$(git log --oneline "${TARGET_SHA}..origin/develop")"
 
 # --- confirm ---
 
 echo
-echo "About to tag ${TAG} at ${TARGET_SHA} on origin/develop:"
+echo "About to tag ${TAG} at ${TARGET_SHA}, which landed the release:"
 echo "  ${TARGET_SUBJECT}"
+if [[ -n "${LATER}" ]]; then
+    echo
+    echo "These landed on origin/develop after it, and are NOT in ${TAG}:"
+    while IFS= read -r line; do echo "  ${line}"; done <<< "${LATER}"
+fi
 echo
 echo "Pushing the tag starts the release workflow, which:"
 echo "  - builds the x86_64 and aarch64 wheels and smoke-tests them;"

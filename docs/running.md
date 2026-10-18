@@ -798,7 +798,14 @@ You need Docker Compose 2.24 or newer, for the `!reset` tag.
    sed 's/0\.0\.0\.0:\${API_PORT}/127.0.0.1:${API_PORT}/' entrypoint.sh \
        > entrypoint-loopback.sh
    chmod +x entrypoint-loopback.sh
+   grep -q '127\.0\.0\.1:\${API_PORT}' entrypoint-loopback.sh \
+       && ! grep -q '0\.0\.0\.0' entrypoint-loopback.sh \
+       || { echo 'entrypoint-loopback.sh still binds 0.0.0.0: stop' >&2; false; }
    ```
+
+   The check matters: if a later kerbside changes that line, `sed`
+   matches nothing, and under host networking the copy would put
+   kerbside's API, which mints console tokens, on every interface.
 
 4. **Write a compose override**, `compose.host.yml`, beside the
    demo's `docker-compose.yml`:
@@ -832,10 +839,13 @@ You need Docker Compose 2.24 or newer, for the `!reset` tag.
    ```bash
    export COMPOSE_FILE=docker-compose.yml:compose.host.yml
    KERBSIDE_SOURCE=kerbside==0.7.0 docker compose up -d --build
-   ss -ltn | grep -E ':(5900|5901|13002|3306|5910) '
+   ss -Hltn | awk '$4 ~ /:(5900|5901|13002|3306|5910)$/ { print }
+       $4 ~ /:(5900|5901|13002|3306|5910)$/ && $4 !~ /^127\.0\.0\.1:/ { bad = 1 }
+       END { if (bad) { print "a port above is not on loopback: stop"; exit 1 } }'
    ```
 
-   Every address `ss` shows must be `127.0.0.1`. Stop if one is not.
+   It lists the stack's listening sockets, and fails if any of them
+   is bound to an address other than `127.0.0.1`. Stop if it does.
 
 6. **Fetch a `.vv` file.** The script waits for the stack, mints a
    token and writes `demo-console.vv`:

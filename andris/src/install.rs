@@ -313,7 +313,12 @@ fn write_unit(path: &Path, contents: &str) -> Result<UnitState> {
         .create_new(true)
         .mode(0o644)
         .open(&staged)
-        .and_then(|mut file| file.write_all(contents.as_bytes()))
+        .and_then(|mut file| {
+            file.write_all(contents.as_bytes())?;
+            // On disk before the rename, so that a crash cannot leave
+            // the rename done and the unit empty.
+            file.sync_all()
+        })
         .and_then(|()| fs::rename(&staged, path));
     if let Err(err) = written {
         let _ = fs::remove_file(&staged);
@@ -407,7 +412,8 @@ impl fmt::Display for Report {
             ConfigDirState::OpenToOthers { mode } => writeln!(
                 f,
                 "{dir} already exists, but is open to group or other (mode {mode:04o}); \
-                 run chmod 700 {dir}."
+                 run chmod 700 {}.",
+                shell_quote(&dir.to_string())
             )?,
         }
 
@@ -422,6 +428,12 @@ impl fmt::Display for Report {
             ),
         }
     }
+}
+
+/// `text` single-quoted for a POSIX shell, so that a path printed in a
+/// command still works when pasted, whatever it holds.
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', r"'\''"))
 }
 
 /// The commands to run after installing, for `DISPLAY`'s value
@@ -897,6 +909,12 @@ mod tests {
             );
             assert!(steps.contains(STARTING_DOC), "{steps}");
         }
+    }
+
+    #[test]
+    fn shell_quoting_survives_spaces_and_quotes() {
+        assert_eq!(shell_quote("/home/a b/x"), "'/home/a b/x'");
+        assert_eq!(shell_quote("/it's"), r"'/it'\''s'");
     }
 
     #[test]

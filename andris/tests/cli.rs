@@ -198,6 +198,35 @@ fn install_unit_installs_for_the_running_binary() {
     );
 }
 
+/// `--display` takes its default from `DISPLAY`, and serving options may
+/// not be mixed with a subcommand, so a clap that counted a value from
+/// the environment as an option given would refuse `install-unit` on
+/// every desktop. `:99` is only read, never opened.
+#[test]
+fn install_unit_works_with_display_set_and_names_its_instance() {
+    let home = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_andris"))
+        .arg("install-unit")
+        .env("DISPLAY", ":99")
+        .env_remove("XAUTHORITY")
+        .env_remove("RUST_LOG")
+        .env("XDG_CONFIG_HOME", home.path())
+        .env("HOME", home.path())
+        .output()
+        .expect("andris could not be run");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "andris install-unit exited with {}: {stderr}",
+        output.status
+    );
+    assert!(
+        stdout.contains("systemctl --user restart andris@99\n"),
+        "{stdout}"
+    );
+}
+
 #[test]
 fn install_unit_fails_on_an_unusable_config_home() {
     // A file where the configuration directory should be.

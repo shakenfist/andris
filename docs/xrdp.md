@@ -135,7 +135,7 @@ X10
 
 `X10` is display `:10`. xrdp gives a user's session the same number
 each time while the session lives, so you name it once. `andris
-install-unit` printed these two commands, with the number of the
+install-unit` printed these commands, with the number of the
 display `DISPLAY` named if it named a local one; use the number you
 found:
 

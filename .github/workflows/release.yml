@@ -172,6 +172,9 @@ jobs:
     name: Publish the wheels to PyPI
     needs: [build-wheels, sign-tag, github-release]
     if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+    # The vm pool's runners are VMs made for one job and then destroyed,
+    # so no earlier job can have tampered with the one holding this
+    # job's OIDC token; the static pool, which persists, never does this.
     runs-on: [self-hosted, vm, debian-13-docker, s]
     timeout-minutes: 15
     environment: release

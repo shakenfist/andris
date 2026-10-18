@@ -14,6 +14,8 @@
 #
 # This needs the network, and runs git on the host. Fetching runs nothing
 # from the repository: git runs no hooks a repository brings with it.
+# The lane does run one of its scripts, the demo's get-console.sh, on the
+# host, which is why a cached tree is checked before it is reused.
 
 set -euo pipefail
 
@@ -33,7 +35,12 @@ if ! echo "$rev" | grep -Eqx '[0-9a-f]{40}'; then
 fi
 
 tree=$dir/$rev
-if [ -f "$tree/demo/docker-compose.yml" ]; then
+# A cached tree comes back from the CI cache, and the lane runs the
+# demo's get-console.sh from it on the host, so it is used only while it
+# is still exactly REV; otherwise it is fetched again.
+if [ -f "$tree/demo/docker-compose.yml" ] \
+    && [ "$(git -C "$tree" rev-parse HEAD 2>/dev/null)" = "$rev" ] \
+    && [ -z "$(git -C "$tree" status --porcelain 2>/dev/null)" ]; then
     echo "[kerbside-fetch] kerbside $version already fetched: $tree"
     exit 0
 fi

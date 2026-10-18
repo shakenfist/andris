@@ -147,12 +147,17 @@ The script:
 
 1. fetches `origin/develop` and its tags;
 2. checks that `v0.1.0` does not exist locally or on `origin`;
-3. checks that `origin/develop`'s `Cargo.toml` and `Cargo.lock` both
-   say 0.1.0, which is to say the release pull request has landed;
-4. shows the commit it will tag and asks
+3. finds the commit that landed the release: the merge of the pull
+   request holding the commit `Release 0.1.0.`, or that commit itself
+   if it landed directly. It refuses if there is none, which is to say
+   the release pull request has not landed;
+4. checks that this commit's `Cargo.toml` and `Cargo.lock` both say
+   0.1.0;
+5. shows the commit it will tag, lists anything that landed on
+   `develop` after it (which is not in the release), and asks
    `Create and push tag v0.1.0? [y/N]`;
-5. on `y`, creates the annotated tag at that commit and pushes it;
-6. finds the workflow run the tag started, watches it with
+6. on `y`, creates the annotated tag at that commit and pushes it;
+7. finds the workflow run the tag started, watches it with
    `gh run watch`, and opens the release page when it finishes.
 
 ## What the workflow does
@@ -163,7 +168,7 @@ The script:
 | `build-wheels` | x86_64: the self-hosted `debian-13-docker` `l` pool; aarch64: GitHub's `ubuntu-24.04-arm` | Builds each wheel natively with `scripts/build-andris-wheel.sh`, the script `make wheel` runs, then smoke-tests it with `scripts/wheel-smoke.sh`. |
 | `sign-tag` | an ephemeral GitHub-hosted runner | After the first approval, replaces the tag with one signed keylessly through Sigstore's gitsign, and force-pushes it. |
 | `github-release` | static pool | Checks that exactly the two wheels arrived, writes `SHA256SUMS`, and creates the GitHub release with generated notes. |
-| `publish-pypi` | the self-hosted `debian-13-docker` `s` pool | After the second approval, attests the wheels' build provenance and uploads them to PyPI. |
+| `publish-pypi` | the self-hosted `debian-13-docker` `s` pool, whose VMs are made for one job and destroyed | After the second approval, attests the wheels' build provenance and uploads them to PyPI. |
 
 The wheel builds do not restore the cargo cache that pull request
 runs save, so a release is built only from what `Cargo.lock` names,

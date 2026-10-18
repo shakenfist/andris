@@ -20,12 +20,14 @@ libc = "0.2"
 # Maps the MIT-SHM capture segment, a memfd shared with the X server, so
 # andris does not hand-roll mmap and munmap.
 memmap2 = "0.9"
-# PulseAudio's simple API, to capture the desktop's sound from a sink's
-# monitor on a thread of its own. The protocol is served by PulseAudio
-# and by PipeWire's pipewire-pulse alike. Both link libpulse0, which
-# andris then needs at run time (the image's libpulse-dev provides it).
-libpulse-binding = "2.30"
-libpulse-simple-binding = "2.29"
+# Loads libpulse at run time, for PulseAudio's simple API, which
+# captures the desktop's sound from a sink's monitor (the protocol is
+# served by PulseAudio and by PipeWire's pipewire-pulse alike). Andris
+# does not link libpulse, so it starts without it, and serves without
+# sound; the bindings are hand-written, in platform/pulse/ffi.rs. 0.9,
+# the version shakenfist-spice-compression already pulls in, so that
+# only one libloading is built.
+libloading = "0.9"
 # The playback channel's Opus encoder, as ryll's WebRTC bridge uses. It
 # builds libopus statically from bundled source (through opusic-sys),
 # with the cmake the image already has, so andris links no system
@@ -64,6 +66,11 @@ shakenfist-spice-compression = { version = "0.3.0", git = "https://github.com/sh
 ] }
 
 [dev-dependencies]
+# libpulse's own bindings, which link it, so that a test can check the
+# hand-written constants and struct layouts in platform/pulse/ffi.rs
+# against them. Tests only: the andris binary links no libpulse. 1.23,
+# the version libpulse-binding used.
+libpulse-sys = "1.23"
 # Ryll's Opus decoder, so tests decode the playback channel's packets as
 # ryll would, into a buffer of exactly one 10 ms frame.
 opus-decoder = "0.1"

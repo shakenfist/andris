@@ -8,7 +8,9 @@ FROM mcr.microsoft.com/devcontainers/base:debian
 #     shakenfist-spice-protocol)
 #   - nasm: openh264's assembly; without it the openh264 crate silently
 #     skips its SIMD code, and a 1080p encode takes about 2.7x as long
-#   - libpulse-dev: libpulse, for andris's audio capture
+#   - libpulse-dev: libpulse, which andris's tests link (through the
+#     libpulse-sys dev-dependency) and load; the andris binary links
+#     none, and loads libpulse0 at run time only if it is there
 #   - libasound2-dev: ALSA, for ryll's cpal when ryll-headless is built
 #     with audio; also provides libasound.so.2 at run time
 RUN apt-get update && apt-get install -y \

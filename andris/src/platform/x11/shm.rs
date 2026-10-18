@@ -7,21 +7,21 @@
 //! with `memmap2`'s raw mapping, which hands out a pointer rather than a
 //! slice.
 //!
-//! This is andris's only `unsafe` code; the crate denies it everywhere
-//! else. Its trust boundary is this: andris is not the segment's only
-//! user. The X server writes it to serve andris's `ShmGetImage`, but any
-//! client of the display can name the segment's XID and write it too
-//! (draw into a `ShmCreatePixmap`, or `ShmGetImage` into it), and any
-//! process able to open the memfd (through `/proc/<pid>/fd`, say) can
-//! write it at any time. So andris treats the segment's bytes as
-//! untrusted pixels, and never relies on their stability. It never makes
-//! a Rust reference into the mapping: [`Mapping::copy`] copies bytes out
-//! through raw pointers into memory andris owns, and only that copy is
-//! ever read. [`Segment::capture`] copies once the reply to every
-//! `ShmGetImage` it sent has arrived, so in the normal case the pixels
-//! are complete; a concurrent writer can only tear them, never make the
-//! copy unsound. The seals keep the mapping backed, so reading it cannot
-//! fault.
+//! This and the libpulse bindings (`platform/pulse/ffi.rs`) are andris's
+//! only `unsafe` code; the crate denies it everywhere else. Its trust
+//! boundary is this: andris is not the segment's only user. The X server
+//! writes it to serve andris's `ShmGetImage`, but any client of the
+//! display can name the segment's XID and write it too (draw into a
+//! `ShmCreatePixmap`, or `ShmGetImage` into it), and any process able to
+//! open the memfd (through `/proc/<pid>/fd`, say) can write it at any
+//! time. So andris treats the segment's bytes as untrusted pixels, and
+//! never relies on their stability. It never makes a Rust reference into
+//! the mapping: [`Mapping::copy`] copies bytes out through raw pointers
+//! into memory andris owns, and only that copy is ever read.
+//! [`Segment::capture`] copies once the reply to every `ShmGetImage` it
+//! sent has arrived, so in the normal case the pixels are complete; a
+//! concurrent writer can only tear them, never make the copy unsound.
+//! The seals keep the mapping backed, so reading it cannot fault.
 
 use std::fs::File;
 use std::io;

@@ -8,6 +8,14 @@
 //! all. It uses libpulse's simple API, whose calls block, so each capture
 //! runs on a thread of its own.
 //!
+//! # Loading libpulse
+//!
+//! Andris does not link libpulse: [`load`] loads it the first time it is
+//! needed, through the bindings in `ffi`, and keeps it loaded for the
+//! life of the process. Without libpulse installed, andris still starts,
+//! and serves without sound. A capture loads it too, if nothing has, and
+//! fails, as any capture can, if it cannot.
+//!
 //! # A capture
 //!
 //! [`AudioSource::open`] spawns the thread and returns at once. The thread
@@ -47,23 +55,66 @@
 //! counted, and once [`MAX_LIVE_CAPTURES`] are, `open` refuses until one
 //! exits.
 
-use std::sync::Arc;
+// The only unsafe code outside the X11 backend's MIT-SHM capture: the
+// foreign function interface to libpulse. The module allows it itself.
+mod ffi;
+
+use std::ffi::CString;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, ensure};
-use libpulse_binding::def::BufferAttr;
-use libpulse_binding::sample::{Format, Spec};
-use libpulse_binding::stream::Direction;
-use libpulse_simple_binding::Simple;
+use anyhow::{Context, Result, anyhow};
 use tracing::{debug, info, warn};
+
+pub use ffi::LoadError;
+use ffi::{Api, BufferAttr, PA_SAMPLE_S16LE, SampleSpec, Simple};
 
 use super::audio::MonotonicStamps;
 use super::{
     AUDIO_CHANNELS, AUDIO_FRAME_BYTES, AUDIO_RATE, AudioFrame, AudioReceiver, AudioSender,
     AudioSource, audio_queue,
 };
+
+/// The library [`load`] loads, by its soname. It brings in `libpulse.so.0`
+/// as its own dependency. Both are in Debian and Ubuntu's `libpulse0`, and
+/// Fedora and RHEL's `pulseaudio-libs`, which most desktops have
+/// installed, since most programs that play sound link libpulse.
+pub const LIBRARY: &str = "libpulse-simple.so.0";
+
+/// libpulse, once [`load`] has tried to load it: loaded for the life of
+/// the process, or why it could not be. It is never unloaded, since a
+/// capture thread is never joined (see *Stopping*), so one may still be
+/// inside a read when everything else has gone.
+static LOADED: OnceLock<Result<Api, LoadError>> = OnceLock::new();
+
+/// Load libpulse ([`LIBRARY`]), if this is the first call, and say
+/// whether it is loaded. Every later call gives the first call's answer,
+/// without trying again.
+pub fn load() -> Result<(), LoadError> {
+    api().map(|_| ())
+}
+
+/// [`load`], but from the library `file`. Only [`LIBRARY`] is kept loaded
+/// for captures to use. Any other name is a test's, which needs only to
+/// see whether it loads, so it is loaded afresh each call and unloaded
+/// again at once; no capture can be using it.
+pub(crate) fn load_from(file: &str) -> Result<(), LoadError> {
+    if file == LIBRARY {
+        load()
+    } else {
+        Api::open(file).map(drop)
+    }
+}
+
+/// The loaded library, loading it on the first call.
+fn api() -> Result<&'static Api, LoadError> {
+    LOADED
+        .get_or_init(|| Api::open(LIBRARY))
+        .as_ref()
+        .map_err(Clone::clone)
+}
 
 /// The source `--audio-source` names by default: PulseAudio's alias for
 /// the monitor of the default sink, which pipewire-pulse also resolves.
@@ -203,26 +254,33 @@ impl PulseSource {
     /// Connect, then read frames into `sender` until its receiver goes.
     fn record(&self, sender: &AudioSender) -> Result<()> {
         let source = &self.source;
-        // libpulse-simple-binding panics on a NUL in a name, so refuse it
-        // here; a command-line argument cannot hold one.
-        ensure!(
-            !source.contains('\0') && !self.server.as_deref().unwrap_or("").contains('\0'),
-            "the source or server name holds a NUL byte"
-        );
-        let spec = Spec {
-            format: Format::S16le,
+        let api = api().context("loading libpulse")?;
+        // libpulse takes C strings, which cannot hold a NUL, so a name
+        // with one is refused here; a command-line argument cannot hold
+        // one.
+        let nul = || anyhow!("the source or server name holds a NUL byte");
+        let c_source = CString::new(source.as_str()).map_err(|_| nul())?;
+        let c_server = self
+            .server
+            .as_deref()
+            .map(CString::new)
+            .transpose()
+            .map_err(|_| nul())?;
+        let c_name = CString::new(APPLICATION_NAME)?;
+        let c_stream_name = CString::new(STREAM_NAME)?;
+        let spec = SampleSpec {
+            format: PA_SAMPLE_S16LE,
             rate: AUDIO_RATE,
             channels: AUDIO_CHANNELS as u8,
         };
-        let stream = Simple::new(
-            self.server.as_deref(),
-            APPLICATION_NAME,
-            Direction::Record,
-            Some(source),
-            STREAM_NAME,
+        let stream = Simple::record(
+            api,
+            c_server.as_deref(),
+            &c_name,
+            &c_source,
+            &c_stream_name,
             &spec,
-            None,
-            Some(&buffer_attr()),
+            &buffer_attr(),
         )
         .context("connecting to the sound server")?;
         info!("capturing sound from PulseAudio source {source}");
@@ -238,8 +296,8 @@ impl PulseSource {
             // The latency only moves the stamp earlier, and the stamps
             // never go backwards, so a failed read costs a stamp a little
             // late rather than the capture.
-            let latency = match stream.get_latency() {
-                Ok(latency) => Duration::from(latency),
+            let latency = match stream.latency() {
+                Ok(latency) => latency,
                 Err(e) => {
                     if !latency_failed {
                         latency_failed = true;

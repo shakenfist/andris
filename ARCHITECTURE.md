@@ -34,7 +34,11 @@ SPICE.
 
 Around the code: `Makefile` and `.devcontainer/` run cargo in a
 container; `scripts/e2e.sh` drives the end-to-end test;
-`.github/workflows/` holds the two-tier CI; `docs/plans/` holds the
+`scripts/build-andris-wheel.sh` builds the manylinux wheel that
+`pipx install andris` installs, and `andris install-unit`
+(`andris/src/install.rs`) writes the systemd user unit from
+`packaging/systemd/` for whichever binary runs it;
+`.github/workflows/` holds the two-tier CI and the release workflow; `docs/plans/` holds the
 plans; `AGENTS.md` carries conventions for AI coding assistants;
 `PLAN-TEMPLATE.md` and `PUSH-AUDIT.md` are the planning template and
 the pre-push audit runbook.

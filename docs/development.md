@@ -33,6 +33,8 @@ make lint       # cargo fmt --check, then clippy with -D warnings
 make ryll-headless  # build ryll's headless client at the pinned revision
 make e2e        # run andris against Xvfb, driven by ryll
 make e2e-xrdp   # run andris against a real xrdp session, in a container
+make e2e-kerbside  # run the end-to-end checks through kerbside's demo stack
+make wheel ARCH=x86_64  # build the manylinux wheel (or ARCH=aarch64), into target/wheels
 make lint-fix   # rustfmt and clippy --fix
 make fetch      # pre-download crates into the cargo cache
 make lock       # refresh Cargo.lock after editing a Cargo.toml
@@ -157,6 +159,58 @@ audio` (no GUI or capture, but with audio) at the revision
 into `ryll/<revision>/` under the cargo cache, and is skipped when the
 binary for that revision is already there. Moving the ryll pin builds
 ryll afresh.
+
+### The kerbside lane
+
+`make e2e-kerbside` runs the end-to-end checks with ryll connected
+through kerbside's proxy, so that every channel andris serves, the
+playback channel among them, crosses kerbside's message allowlist. It
+fetches kerbside's repository at the commit `KERBSIDE_REV` names in
+the Makefile, a release tagged `v$KERBSIDE_VERSION`, and runs its demo
+stack (MariaDB and the released kerbside from PyPI) with
+[`scripts/kerbside-lane/compose.override.yml`](https://github.com/shakenfist/andris/blob/develop/scripts/kerbside-lane/compose.override.yml)
+on top. The override swaps the demo's qemu for a placeholder, points
+kerbside's static source at andris with a ticket made for the run,
+puts the stack on an internal network, and publishes no port.
+
+Andris, ryll, Xvfb and PulseAudio run together in one `andris-dev`
+container, in the kerbside container's network namespace. Andris then
+listens on `127.0.0.1:5910`, as it must without TLS, and ryll reaches
+kerbside's TLS port on the same loopback with a `.vv` file from the
+demo's `get-console.sh`. [`scripts/e2e.sh`](https://github.com/shakenfist/andris/blob/develop/scripts/e2e.sh)
+runs in its `E2E_VIA=kerbside` mode, which drives every channel: a
+frame, keys, the clipboard both ways, one H.264 stream and one Opus
+stream. Kerbside's log must then show "hypervisor connection
+successful" for all five channels, and no firewall verdict, denial or
+termination. The script is
+[`scripts/e2e-kerbside.sh`](https://github.com/shakenfist/andris/blob/develop/scripts/e2e-kerbside.sh);
+it redacts the run's secrets from the logs it keeps in
+`target/kerbside-lane/`, and removes the stack with
+`docker compose down -v` however it ends.
+
+It needs Docker Compose 2.24 or newer, for `!reset`, and the network
+to build the stack's images and fetch kerbside, but not to run it.
+
+Bump the kerbside pin by hand, since Renovate tracks neither value:
+set `KERBSIDE_VERSION` to the new release and `KERBSIDE_REV` to the
+full commit its tag `v<version>` names, together. The fetch fails if
+the tag names another commit.
+
+### The wheel
+
+`make wheel ARCH=x86_64` (or `aarch64`, on a host of that
+architecture) builds andris into a `manylinux_2_28` wheel in
+`target/wheels/`, with openh264 compiled in and checked for its SIMD
+code. It builds in its own image, on the manylinux base, with the same
+offline split as the targets above. The tag is earned: maturin's
+policy check runs without an exception list, and fails if the binary
+links a library outside the policy.
+[`scripts/wheel-smoke.sh`](https://github.com/shakenfist/andris/blob/develop/scripts/wheel-smoke.sh)
+then installs the wheel as pipx would in a stock `python:3-slim`
+container, which has no libpulse, no X server and no systemd, and
+checks that the binary runs, that `install-unit` writes a unit naming
+it, and that andris serves without sound. How a release publishes
+the wheels is in [releasing.md](releasing.md).
 
 ### The xrdp test bed
 
@@ -370,19 +424,27 @@ reviewing its code.
 
 ### The merge tier
 
-Runs only on `merge_group` and gates `Can merge`. Two jobs run.
+Runs only on `merge_group` and gates `Can merge`. Four jobs run.
 `Build and test the merge commit` runs `make release test` against
 the commit the queue has built from the pull request and the current
 tip of `develop`. The smoke tier's jobs do not run on `merge_group`.
 
-The other, `End to end`, runs `make e2e` on `merge_group` and on
-`workflow_dispatch`, and `Can merge` requires it too. It is in the
-merge tier because building ryll would add over a minute to every
-push; its cargo cache has a key prefix of its own, so that only a new
-ryll pin pays for the build, and so that the offline jobs never
-restore a cache the networked ryll build wrote. A retest
-of a branch dispatches it, so it can be tried before the branch is
-enqueued; nothing gates on that run.
+The other three also run on `workflow_dispatch`, and `Can merge`
+requires each of them. A retest of a branch dispatches them, so they
+can be tried before the branch is enqueued; nothing gates on that run.
+
+- `End to end` runs `make e2e`. It is in the merge tier because
+  building ryll would add over a minute to every push; its cargo cache
+  has a key prefix of its own, so that only a new ryll pin pays for
+  the build, and so that the offline jobs never restore a cache the
+  networked ryll build wrote.
+- `Through kerbside` runs `make e2e-kerbside` (see
+  [the kerbside lane](#the-kerbside-lane)), and uploads its redacted
+  logs.
+- `Build the wheel` runs `make wheel ARCH=x86_64` and then
+  `scripts/wheel-smoke.sh` (see [the wheel](#the-wheel)), and uploads
+  the wheel. Only the x86_64 wheel is built on a merge; the release
+  workflow builds both.
 
 ### Gates and path filtering
 
@@ -392,7 +454,7 @@ Three jobs are the required status checks on `develop`:
 |------|---------|-------------|
 | `Can see status` | every event | always; it only proves status reporting works |
 | `Can enqueue` | not `merge_group` | every smoke job succeeded or was skipped |
-| `Can merge` | `merge_group` | both merge-tier jobs succeeded or were skipped |
+| `Can merge` | `merge_group` | all four merge-tier jobs succeeded or were skipped |
 
 A `Check paths` job skips the lint, build and supply-chain jobs
 when a pull request changes only `docs/**` and `LICENSE`. Other
@@ -410,6 +472,7 @@ The gates treat a skipped job as success for the same reason.
 | `supply-chain.yml` | Mondays 09:00 UTC, and on demand | `cargo audit` and `cargo deny` against `develop`, so a newly published advisory is noticed without waiting for a pull request |
 | `codeql-analysis.yml` | pull requests, pushes to `main` and `develop`, Tuesdays 17:00 UTC | CodeQL; skipped for documentation-only changes |
 | `renovate.yml` | hourly | self-hosted Renovate dependency updates |
+| `release.yml` | a pushed `vX.Y.Z` tag; a manual dispatch builds and tests both wheels without publishing | builds the x86_64 and aarch64 wheels, signs the tag, creates the GitHub release and publishes to PyPI; see [releasing.md](releasing.md) |
 | `export-repo-config.yml` | nightly | exports repository settings into the repository |
 | `pr-re-review.yml`, `pr-retest.yml` | comments on a pull request | the bot phrases below |
 
@@ -429,8 +492,9 @@ pass. The sequence is:
 1. The pull request's smoke tier passes, so `Can enqueue` is green.
 2. The pull request is added to the queue.
 3. The queue builds a merge commit and runs `ci.yml` on
-   `merge_group`. `Build and test the merge commit`, `End to end`
-   and `Can merge` run against it.
+   `merge_group`. `Build and test the merge commit`, `End to end`,
+   `Through kerbside`, `Build the wheel` and `Can merge` run against
+   it.
 4. If they pass, the queue merges. If not, the pull request is
    ejected and the failure is in the `merge_group` run's log.
 

@@ -36,11 +36,19 @@ time, with the main, display, inputs, cursor and playback channels:
 you get the desktop, a keyboard, a mouse, a pointer shape, text
 clipboard and resizing where the X server allows it, video areas as
 H.264 streams to clients that support it, and the desktop's sound.
-Build it with `make release` and run it against a display:
+Install it from PyPI and run it against a display:
 
 ```bash
-DISPLAY=:10 target/release/andris --ticket-file ticket
+pipx install andris
+(umask 077; head -c 24 /dev/urandom | base64 > ticket)
+DISPLAY=:10 andris --ticket-file ticket
 ```
+
+To run it as a service beside xrdp, `andris install-unit` sets up its
+systemd unit; see
+[Running andris alongside xrdp](https://github.com/shakenfist/andris/blob/develop/docs/xrdp.md).
+To build it from source, see
+[Running andris](https://github.com/shakenfist/andris/blob/develop/docs/running.md#installing-and-building).
 
 What andris is meant to become, and the order in which it is being
 built, is set out in the

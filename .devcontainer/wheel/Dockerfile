@@ -49,8 +49,27 @@ ENV CARGO_HOME=/build/.cargo
 ENV RUSTUP_HOME=/build/.rustup
 # renovate: datasource=github-releases depName=rust-lang/rust
 ARG RUST_VERSION=1.99.1
-RUN umask 0000 && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --default-toolchain "${RUST_VERSION}" --profile minimal
+# rustup-init, at an exact rustup version and checked against a hash held
+# here rather than one fetched beside it. Renovate does not track these:
+# the version and both hashes move together, by hand, taken from
+# static.rust-lang.org's rustup-init.sha256 and checked against a
+# download of each binary.
+ARG RUSTUP_VERSION=1.29.1
+ARG RUSTUP_SHA256_x86_64=dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71
+ARG RUSTUP_SHA256_aarch64=15f6e4ce9f583b929c996c91562bad6d4454f3281de858b02cdfdef615fac433
+ARG ARCH
+RUN case "${ARCH}" in \
+        x86_64) sha256="${RUSTUP_SHA256_x86_64}" ;; \
+        aarch64) sha256="${RUSTUP_SHA256_aarch64}" ;; \
+        *) echo "no rustup-init hash for ${ARCH}" >&2; exit 1 ;; \
+    esac \
+    && curl --proto '=https' --tlsv1.2 -sSf -o /tmp/rustup-init \
+        "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${ARCH}-unknown-linux-gnu/rustup-init" \
+    && echo "${sha256}  /tmp/rustup-init" | sha256sum --strict -c - \
+    && chmod +x /tmp/rustup-init \
+    && umask 0000 \
+    && /tmp/rustup-init -y --default-toolchain "${RUST_VERSION}" --profile minimal \
+    && rm /tmp/rustup-init
 ENV PATH="/build/.cargo/bin:/opt/python/cp311-cp311/bin:${PATH}"
 
 # maturin, at an exact version and checked against PyPI's hashes for it.

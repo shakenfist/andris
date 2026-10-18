@@ -258,7 +258,10 @@ Later steps need not redo this.
      and the `enable --now` line. The display number comes from
      `$DISPLAY` when that names a local display, and is otherwise a
      placeholder with a pointer to `docs/xrdp.md`. It only reads
-     `$DISPLAY`; it never connects to it.
+     `$DISPLAY`; it never connects to it. *(Step 7 replaced the
+     `enable --now` line with `enable` followed by `restart`: `--now`
+     does nothing to an instance that is already running, which left
+     the old binary serving after a reinstall. See the step 7 Result.)*
 
    Running systemctl itself would make the command's tests touch a
    real user manager, and would make enabling a side effect of
@@ -787,7 +790,8 @@ for shape and convention.
 
 - **`docs/xrdp.md` *Installing*.**
   - Lead with `pipx install andris` (or `pip install --user andris`),
-    then `andris install-unit`, then the `enable --now` line.
+    then `andris install-unit`, then the `enable --now` line
+    (since step 7, `enable` and `restart`).
   - Keep the build-from-source route second, with
     `install-unit` working for it too.
   - Fold *Configuring*'s ticket recipe into "install-unit makes one

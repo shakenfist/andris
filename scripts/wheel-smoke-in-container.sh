@@ -56,7 +56,10 @@ ANDRIS="${WORK}/venv/bin/andris"
 pass "pip installed ${WHEEL_NAME}"
 
 # A check is only worth something if libpulse really is missing here.
-if ldconfig -p | grep -q libpulse; then
+# The list is captured first: under pipefail, grep -q exiting on its
+# first match could SIGPIPE ldconfig and turn a match into a miss.
+LIBRARIES="$(ldconfig -p)"
+if grep -q libpulse <<< "${LIBRARIES}"; then
     fail 'this image has libpulse, so the no-libpulse check would prove nothing'
 fi
 

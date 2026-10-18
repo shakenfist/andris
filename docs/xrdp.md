@@ -55,6 +55,7 @@ upgrade restart each instance to run the new one:
 pipx upgrade andris
 systemctl --user restart andris@10
 ```
+
 Systemd cannot run a binary whose path holds a quote, a backslash or a
 control character, so `install-unit` refuses one; install andris
 elsewhere if yours does. It also refuses to run as root, sudo
@@ -68,7 +69,7 @@ them.
 ### Building from source
 
 To run a build of your own instead, build the release binary (see
-[running.md](running.md#building)) and run `install-unit` with it:
+[running.md](running.md#installing-and-building)) and run `install-unit` with it:
 
 ```bash
 make release

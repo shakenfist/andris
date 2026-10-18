@@ -274,9 +274,11 @@ pub fn install(config_home: &Path, exe: &Path) -> Result<Report> {
 /// Write `contents` to the unit file at `path`, unless it already holds
 /// exactly that.
 ///
-/// Whatever is at `path` is removed first, rather than written through,
-/// so that a symbolic link to the template in a checkout (as `systemctl
-/// link` makes) is replaced by a file, and the checkout is not rewritten.
+/// The new unit is written to a sibling file and renamed over `path`.
+/// rename(2) replaces whatever is at `path` rather than writing through
+/// it, so a symbolic link to the template in a checkout (as `systemctl
+/// link` makes) becomes a file and the checkout is not rewritten; and the
+/// swap is atomic, so a failed write leaves the old unit in place.
 fn write_unit(path: &Path, contents: &str) -> Result<UnitState> {
     let shown = path.display();
     let state = match fs::symlink_metadata(path) {
@@ -290,19 +292,33 @@ fn write_unit(path: &Path, contents: &str) -> Result<UnitState> {
             {
                 return Ok(UnitState::Unchanged);
             }
-            fs::remove_file(path).with_context(|| format!("cannot replace {shown}"))?;
             UnitState::Replaced
         }
         Err(err) if err.kind() == ErrorKind::NotFound => UnitState::Written,
         Err(err) => return Err(err).with_context(|| format!("cannot read {shown}")),
     };
-    OpenOptions::new()
+    let mut staged = path.as_os_str().to_owned();
+    staged.push(".new");
+    let staged = PathBuf::from(staged);
+    // Left over from an interrupted run, if it is there at all.
+    match fs::remove_file(&staged) {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| format!("cannot remove {}", staged.display()));
+        }
+    }
+    let written = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o644)
-        .open(path)
+        .open(&staged)
         .and_then(|mut file| file.write_all(contents.as_bytes()))
-        .with_context(|| format!("cannot write {shown}"))?;
+        .and_then(|()| fs::rename(&staged, path));
+    if let Err(err) = written {
+        let _ = fs::remove_file(&staged);
+        return Err(err).with_context(|| format!("cannot write {shown}"));
+    }
     Ok(state)
 }
 
@@ -350,8 +366,12 @@ fn make_ticket(path: &Path) -> Result<TicketState> {
             return Err(err).with_context(|| format!("cannot create {}", path.display()));
         }
     };
-    file.write_all(new_ticket().as_bytes())
-        .with_context(|| format!("cannot write {}", path.display()))?;
+    if let Err(err) = file.write_all(new_ticket().as_bytes()) {
+        // An empty or partial ticket would be refused by every later
+        // run, and never replaced, so take it away again.
+        let _ = fs::remove_file(path);
+        return Err(err).with_context(|| format!("cannot write {}", path.display()));
+    }
     Ok(TicketState::Created)
 }
 
@@ -715,6 +735,36 @@ mod tests {
         let unit = fs::read_to_string(&report.unit_path).unwrap();
         assert!(unit.contains(&format!("ExecStart=\"{}\" ", moved.display())));
         assert!(report.to_string().contains("drop-in"));
+    }
+
+    #[test]
+    fn a_failed_replacement_keeps_the_old_unit() {
+        let (dir, exe) = home();
+        let first = install(dir.path(), &exe).unwrap();
+        let old = fs::read(&first.unit_path).unwrap();
+        // A directory where the new unit is staged makes the write fail.
+        let mut staged = first.unit_path.as_os_str().to_owned();
+        staged.push(".new");
+        fs::create_dir(&staged).unwrap();
+        fs::write(Path::new(&staged).join("x"), "").unwrap();
+
+        let moved = dir.path().join("elsewhere").join("andris");
+        assert!(install(dir.path(), &moved).is_err());
+        assert_eq!(fs::read(&first.unit_path).unwrap(), old);
+    }
+
+    #[test]
+    fn a_leftover_staged_unit_is_cleared() {
+        let (dir, exe) = home();
+        let first = install(dir.path(), &exe).unwrap();
+        let mut staged = first.unit_path.as_os_str().to_owned();
+        staged.push(".new");
+        fs::write(&staged, "left over").unwrap();
+
+        let moved = dir.path().join("elsewhere").join("andris");
+        let report = install(dir.path(), &moved).unwrap();
+        assert_eq!(report.unit, UnitState::Replaced);
+        assert!(!Path::new(&staged).exists());
     }
 
     #[test]

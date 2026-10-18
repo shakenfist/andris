@@ -366,7 +366,7 @@ tag-release:
 	fi
 	scripts/tag-release.sh $(RELEASE_VERSION)
 
-ifneq ($(filter propose-release tag-release,$(MAKECMDGOALS)),)
+ifneq ($(and $(RELEASE_VERSION),$(filter propose-release tag-release,$(MAKECMDGOALS))),)
 $(RELEASE_VERSION):
 	@:
 endif

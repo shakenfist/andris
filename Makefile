@@ -46,6 +46,13 @@ KERBSIDE_REV := 2d9ee91e29095e4566b8452d50fbc1ca521ba4f8
 KERBSIDE_VERSION := 0.7.0
 KERBSIDE_ROOT := $(CARGO_CACHE_DIR)/kerbside
 
+# The architecture `make wheel` builds for: the host's by default, since
+# the wheel is built natively, not under emulation. Set on the command
+# line (`make wheel ARCH=x86_64`), which overrides this; an ARCH in the
+# environment does not, since some build environments export one of
+# their own (amd64, say).
+ARCH := $(shell uname -m)
+
 # Detect user/group for permission-safe container builds
 UID := $(shell id -u)
 GID := $(shell id -g)
@@ -143,7 +150,7 @@ DOCKER_RUN_OFFLINE_RW := docker run --rm --network none \
 
 .PHONY: all build release clean devcontainer ensure-cache fetch lock \
 	target-dir lint lint-fix test ryll-headless e2e e2e-xrdp \
-	kerbside-demo e2e-kerbside help
+	kerbside-demo e2e-kerbside wheel help
 
 all: build
 
@@ -159,6 +166,7 @@ help:
 	@echo "  make e2e                    - Run the end-to-end test against Xvfb and ryll"
 	@echo "  make e2e-xrdp               - Run andris against a real xrdp session, in a container"
 	@echo "  make e2e-kerbside           - Run the end-to-end checks through kerbside's demo stack"
+	@echo "  make wheel [ARCH=x86_64]    - Build the manylinux_2_28 wheel for PyPI into target/wheels"
 	@echo "  make lint                   - Run rustfmt and clippy checks"
 	@echo "  make lint-fix               - Run rustfmt and clippy with auto-fix"
 	@echo "  make clean                  - Remove build artifacts"
@@ -321,7 +329,16 @@ e2e-kerbside: build ryll-headless kerbside-demo
 e2e-xrdp: release ryll-headless
 	RYLL="$(RYLL_BIN)" ANDRIS=target/release/andris scripts/e2e-xrdp.sh
 
-# Clean build artifacts.
+# Build andris into a manylinux_2_28 wheel for ARCH, in target/wheels;
+# see scripts/build-andris-wheel.sh. It uses its own image, built on
+# the manylinux base, rather than the devcontainer, and splits the
+# build as the targets above do: `cargo fetch` with the network up,
+# then the compile with --network none, the cargo cache read-only and
+# the checkout read-only apart from target/.
+wheel:
+	CARGO_CACHE="$(CARGO_CACHE_DIR)" scripts/build-andris-wheel.sh $(ARCH)
+
+# Clean build artifacts. target/ holds the wheels too.
 #
 # The cargo cache is only removed when it lives inside the checkout.
 # CARGO_CACHE may point at a shared directory that outlives this

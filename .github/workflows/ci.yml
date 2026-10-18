@@ -377,6 +377,56 @@ jobs:
           if-no-files-found: ignore
           path: target/kerbside-lane/
 
+  # The x86_64 PyPI wheel: `make wheel`, which runs
+  # scripts/build-andris-wheel.sh, then scripts/wheel-smoke.sh, which
+  # installs it in a python:3-slim container with no libpulse and no
+  # network and runs it there. The build fails if maturin's policy check
+  # finds a library outside manylinux_2_28, or if openh264's SIMD code is
+  # missing. It runs where `End to end` does, so that a change to the
+  # wheel can be tried on a branch with workflow_dispatch; the aarch64
+  # wheel is built only by the release workflow.
+  #
+  # The default cache key-prefix is right: like `make fetch`, the build's
+  # `cargo fetch` writes the cache with the network up but compiles
+  # nothing, and the compile reads it read-only, offline.
+  #
+  # The concurrency group follows merge-build's, for the same reason.
+  wheel:
+    name: Build the wheel
+    runs-on: [self-hosted, vm, debian-13-docker, l]
+    timeout-minutes: 45
+    needs: [check_paths]
+    if: >-
+      (github.event_name == 'merge_group'
+       || github.event_name == 'workflow_dispatch')
+      && needs.check_paths.outputs.code_changed != 'false'
+    concurrency:
+      group: >-
+        ${{ github.workflow }}-wheel-${{
+        github.event_name == 'merge_group'
+        && format('merge_group-{0}', github.event.merge_group.base_ref)
+        || github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v7
+
+      # Must stay directly after checkout; see the action for why.
+      - uses: ./.github/actions/cargo-cache
+
+      - name: Build the wheel
+        run: make wheel ARCH=x86_64
+
+      - name: Smoke-test the wheel
+        run: scripts/wheel-smoke.sh
+
+      - name: Upload the wheel
+        uses: actions/upload-artifact@v7
+        with:
+          name: andris-wheel-x86_64-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 14
+          if-no-files-found: error
+          path: target/wheels/*.whl
+
   automated_reviewer:
     name: "Automated reviewer"
     # The needs: list is the "review only once CI has passed" gate: a
@@ -454,6 +504,7 @@ jobs:
       - merge-build
       - e2e
       - e2e-kerbside
+      - wheel
     if: always() && github.event_name == 'merge_group'
     permissions:
       actions: read

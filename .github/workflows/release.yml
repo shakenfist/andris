@@ -1,0 +1,214 @@
+name: Release
+
+# Builds andris's two wheels, signs the release tag, creates the GitHub
+# release and publishes the wheels to PyPI, when a vX.Y.Z tag is pushed.
+# scripts/tag-release.sh pushes that tag; docs/releasing.md describes
+# the whole process and the settings it needs.
+#
+# workflow_dispatch builds and smoke-tests both wheels on any ref, and
+# publishes nothing, so a change to the wheel build can be tried before
+# a tag exists: the merge tier builds only the x86_64 wheel, so this is
+# the only way to build the aarch64 one early. Every job that has an
+# effect outside the run -- sign-tag, github-release and publish-pypi --
+# is therefore confined to a tag *pushed*, by testing both the ref and
+# the event. Testing the ref alone is not enough, because a dispatch can
+# be aimed at a tag, and sign-tag would then re-sign and force-push a
+# tag someone may already have verified. Re-running a failed release
+# with "Re-run jobs" keeps the original push event, so the guard costs
+# nothing there.
+#
+# The order is: check-version, then build-wheels, then sign-tag (which
+# waits for approval on the `release` environment), then github-release,
+# then publish-pypi (which waits for a second approval, because it names
+# the environment too, as PyPI's trusted publisher requires).
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions: {}
+
+# One run per tag at a time, never cancelled part way: a release that
+# has signed its tag or begun uploading must finish.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # The tag must name the version in [workspace.package], and Cargo.lock
+  # must agree, since the build is --frozen. On a dispatch to a branch
+  # there is no tag, and the script only checks the two files agree.
+  check-version:
+    name: Check the version matches the tag
+    runs-on: [self-hosted, static]
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Check the version
+        run: scripts/check-release-version.sh "${GITHUB_REF}"
+
+  # Each wheel is built natively on a runner of its own architecture,
+  # not under QEMU, by scripts/build-andris-wheel.sh, the script `make
+  # wheel` runs. Its checks run here too: maturin's manylinux_2_28 policy
+  # check (the tag is earned, not asserted) and the check that openh264's
+  # SIMD code went in. Then scripts/wheel-smoke.sh installs the wheel in
+  # python:3-slim, which is pinned by a multi-architecture digest and so
+  # runs on both, and runs it there with no libpulse and no network.
+  #
+  # The cargo cache is deliberately not restored. A release builds from
+  # a cold cache, downloading only what Cargo.lock names, so that nothing
+  # saved by an earlier run, on a pull request or elsewhere, goes into
+  # what is published.
+  build-wheels:
+    name: Build the wheel (${{ matrix.arch }})
+    needs: check-version
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    strategy:
+      # A dispatch is for seeing what fails, so let both legs finish.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runs-on: [self-hosted, vm, debian-13-docker, l]
+          - arch: aarch64
+            # audit-ok: github-hosted-runner -- no self-hosted aarch64 Linux hardware, and the wheel must build natively, not under QEMU
+            runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Build the wheel
+        run: scripts/build-andris-wheel.sh ${{ matrix.arch }}
+
+      - name: Smoke-test the wheel
+        run: scripts/wheel-smoke.sh
+
+      - name: Upload the wheel
+        uses: actions/upload-artifact@v7
+        with:
+          name: andris-wheel-${{ matrix.arch }}
+          if-no-files-found: error
+          path: target/wheels/*.whl
+
+  # Keyless Sigstore signing of the tag, gated on approval of the
+  # `release` environment. Every publishing job needs this one, so
+  # nothing is published until the operator approves, and it needs both
+  # builds, so the tag is never re-pushed while a build is running or
+  # after one has failed.
+  sign-tag:
+    name: Sign the release tag with Sigstore
+    needs: build-wheels
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+    # audit-ok: github-hosted-runner -- ephemeral runner for tag signing; it installs gitsign with sudo and writes global git config, so it must be thrown away rather than the shared self-hosted pool
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Sign and push the release tag
+        run: scripts/sign-release-tag.sh "${GITHUB_REF_NAME}" "${GITHUB_SHA}"
+
+  # The GitHub release carries the two wheels and their SHA256SUMS, and
+  # scripts/release-checksums.sh refuses anything else. The job checks
+  # out only scripts/, into src/, to run that script. That cleans src/
+  # alone, not the workspace around it, and on the persistent static
+  # pool the workspace holds whatever the last job left, so the wheels
+  # are downloaded into runner.temp, which is per job, where no stale
+  # file can join the release.
+  github-release:
+    name: Create the GitHub release
+    needs: [build-wheels, sign-tag]
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+    runs-on: [self-hosted, static]
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: src
+          sparse-checkout: scripts
+          persist-credentials: false
+
+      - name: Download the wheels
+        uses: actions/download-artifact@v8
+        with:
+          pattern: andris-wheel-*
+          path: ${{ runner.temp }}/dist/
+          merge-multiple: true
+
+      - name: Check the wheels and write SHA256SUMS
+        run: src/scripts/release-checksums.sh "${RUNNER_TEMP}/dist" "${GITHUB_REF_NAME#v}"
+
+      - name: Create the GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: ${{ runner.temp }}/dist/*
+
+  # Publishes both wheels to PyPI through a trusted publisher: GitHub's
+  # OIDC token, no stored secret. PyPI matches the owner, repository,
+  # workflow file name and environment name exactly, so renaming this
+  # file or the environment breaks publishing until pypi.org is changed
+  # to match. It runs after github-release, so the release's assets are
+  # public before the version can be installed.
+  #
+  # gh-action-pypi-publish runs in a Docker container, which sees only
+  # the workspace, so the wheels go to a workspace-relative dist/, and
+  # the job checks out first so that the workspace is a cleaned one. It
+  # needs a Docker runner, so not the static pool.
+  publish-pypi:
+    name: Publish the wheels to PyPI
+    needs: [build-wheels, sign-tag, github-release]
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+    # The vm pool's runners are VMs made for one job and then destroyed,
+    # so no earlier job can have tampered with the one holding this
+    # job's OIDC token; the static pool, which persists, never does this.
+    runs-on: [self-hosted, vm, debian-13-docker, s]
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Download the wheels
+        uses: actions/download-artifact@v8
+        with:
+          pattern: andris-wheel-*
+          path: dist/
+          merge-multiple: true
+
+      - name: Attest the wheels' build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: 'dist/*'
+
+      # skip-existing makes a re-run after a partial upload send only
+      # what is missing, rather than fail on what PyPI already has.
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          skip-existing: true

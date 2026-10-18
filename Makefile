@@ -35,6 +35,24 @@ RYLL_REV := $(shell sed -nE '/^name = "shakenfist-spice-protocol"$$/,/^$$/ s/^so
 RYLL_DIR := $(CARGO_CACHE_DIR)/ryll
 RYLL_BIN := $(RYLL_DIR)/$(RYLL_REV)/bin/ryll
 
+# Kerbside, for `make e2e-kerbside`: the commit whose demo stack (demo/)
+# the lane runs, and the release on PyPI that commit is tagged as, which
+# the demo's image installs. Renovate does not track either. To bump
+# them, take a newer kerbside release, set KERBSIDE_VERSION to it and
+# KERBSIDE_REV to the full commit its tag v<version> names, together:
+# the fetch fails if the tag names another commit. Kerbside is fetched
+# per commit under the cargo cache, as ryll is, so CI's cache keeps it.
+KERBSIDE_REV := 2d9ee91e29095e4566b8452d50fbc1ca521ba4f8
+KERBSIDE_VERSION := 0.7.0
+KERBSIDE_ROOT := $(CARGO_CACHE_DIR)/kerbside
+
+# The architecture `make wheel` builds for: the host's by default, since
+# the wheel is built natively, not under emulation. Set on the command
+# line (`make wheel ARCH=x86_64`), which overrides this; an ARCH in the
+# environment does not, since some build environments export one of
+# their own (amd64, say).
+ARCH := $(shell uname -m)
+
 # Detect user/group for permission-safe container builds
 UID := $(shell id -u)
 GID := $(shell id -g)
@@ -131,7 +149,8 @@ DOCKER_RUN_OFFLINE_RW := docker run --rm --network none \
 	$(DOCKER_BASE_ARGS) $(WORKSPACE_MOUNT_RW) $(CACHE_MOUNTS_RO)
 
 .PHONY: all build release clean devcontainer ensure-cache fetch lock \
-	target-dir lint lint-fix test ryll-headless e2e e2e-xrdp help
+	target-dir lint lint-fix test ryll-headless e2e e2e-xrdp \
+	kerbside-demo e2e-kerbside wheel propose-release tag-release help
 
 all: build
 
@@ -146,6 +165,10 @@ help:
 	@echo "  make ryll-headless          - Build ryll's headless client at the pinned revision"
 	@echo "  make e2e                    - Run the end-to-end test against Xvfb and ryll"
 	@echo "  make e2e-xrdp               - Run andris against a real xrdp session, in a container"
+	@echo "  make e2e-kerbside           - Run the end-to-end checks through kerbside's demo stack"
+	@echo "  make wheel [ARCH=x86_64]    - Build the manylinux_2_28 wheel for PyPI into target/wheels"
+	@echo "  make propose-release X.Y.Z  - Branch, bump the version, test and push for review"
+	@echo "  make tag-release X.Y.Z      - After the release PR lands: tag develop, start the release"
 	@echo "  make lint                   - Run rustfmt and clippy checks"
 	@echo "  make lint-fix               - Run rustfmt and clippy with auto-fix"
 	@echo "  make clean                  - Remove build artifacts"
@@ -283,6 +306,24 @@ e2e: build ryll-headless
 		$(ANDRIS_IMAGE) \
 		sh -c "cargo test --frozen --no-run --test x11 --test pulse && scripts/e2e.sh"
 
+# Fetch kerbside's repository at KERBSIDE_REV, for its demo stack; see
+# scripts/kerbside-lane/fetch.sh. Needs the network, and fetches afresh
+# every time.
+kerbside-demo:
+	scripts/kerbside-lane/fetch.sh $(KERBSIDE_REV) $(KERBSIDE_VERSION) "$(KERBSIDE_ROOT)"
+
+# Run the end-to-end checks with ryll connected through kerbside's demo
+# stack, so that every channel crosses kerbside's allowlist; see
+# scripts/e2e-kerbside.sh. It builds the demo's images with the network
+# up, then runs the stack on an internal compose network, and the test
+# container, from the devcontainer image, in the kerbside container's
+# network namespace, with the checkout read-only as `e2e` has it. It
+# always removes the stack (`docker compose down -v`) when it ends.
+e2e-kerbside: build ryll-headless kerbside-demo
+	ANDRIS_IMAGE=$(ANDRIS_IMAGE) RYLL="$(RYLL_BIN)" ANDRIS=target/debug/andris \
+		KERBSIDE_DIR="$(KERBSIDE_ROOT)/$(KERBSIDE_REV)" KERBSIDE_VERSION=$(KERBSIDE_VERSION) \
+		scripts/e2e-kerbside.sh
+
 # Share a real xrdp session with andris, in a throwaway container built
 # from the devcontainer image, and drive it with ryll's headless client;
 # see scripts/e2e-xrdp.sh. Local only, not run in CI. The release build is
@@ -290,7 +331,47 @@ e2e: build ryll-headless
 e2e-xrdp: release ryll-headless
 	RYLL="$(RYLL_BIN)" ANDRIS=target/release/andris scripts/e2e-xrdp.sh
 
-# Clean build artifacts.
+# Build andris into a manylinux_2_28 wheel for ARCH, in target/wheels;
+# see scripts/build-andris-wheel.sh. It uses its own image, built on
+# the manylinux base, rather than the devcontainer, and splits the
+# build as the targets above do: `cargo fetch` with the network up,
+# then the compile with --network none, the cargo cache read-only and
+# the checkout read-only apart from target/.
+wheel:
+	CARGO_CACHE="$(CARGO_CACHE_DIR)" scripts/build-andris-wheel.sh $(ARCH)
+
+# A release is two stages; see docs/releasing.md. First, `make
+# propose-release X.Y.Z` runs scripts/propose-release.sh, which creates a
+# release-X.Y.Z branch off develop, bumps the version (refreshing
+# Cargo.lock through `make lock`), tests, and pushes the branch for a pull
+# request. Then, once that pull request has landed, `make tag-release
+# X.Y.Z` runs scripts/tag-release.sh, which tags the merged commit and
+# pushes the tag, starting .github/workflows/release.yml.
+#
+# The version is the second word on the command line. The rule below
+# absorbs it as a do-nothing target, so make does not complain that it
+# has no rule to make "0.1.0"; it applies only when one of these two
+# targets is asked for, so a mistyped target still fails.
+RELEASE_VERSION := $(word 2,$(MAKECMDGOALS))
+
+propose-release:
+	@if [ -z "$(RELEASE_VERSION)" ]; then \
+		echo "usage: make propose-release X.Y.Z" >&2; exit 1; \
+	fi
+	scripts/propose-release.sh $(RELEASE_VERSION)
+
+tag-release:
+	@if [ -z "$(RELEASE_VERSION)" ]; then \
+		echo "usage: make tag-release X.Y.Z" >&2; exit 1; \
+	fi
+	scripts/tag-release.sh $(RELEASE_VERSION)
+
+ifneq ($(and $(RELEASE_VERSION),$(filter propose-release tag-release,$(MAKECMDGOALS))),)
+$(RELEASE_VERSION):
+	@:
+endif
+
+# Clean build artifacts. target/ holds the wheels too.
 #
 # The cargo cache is only removed when it lives inside the checkout.
 # CARGO_CACHE may point at a shared directory that outlives this

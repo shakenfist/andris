@@ -8,6 +8,13 @@ repos:
         language: script
         pass_filenames: false
         files: \.rs$|Cargo\.(toml|lock)$
+      # The release workflow's version check, against fixtures.
+      - id: check-release-version
+        name: check-release-version.sh fixtures
+        entry: ./scripts/test-check-release-version.sh
+        language: script
+        pass_filenames: false
+        files: ^scripts/(test-check-|check-)?release-version\.sh$
 
   # GitHub Actions workflow linter. The config declares the self-hosted
   # runner labels the workflows use.
@@ -23,6 +30,14 @@ repos:
       - id: trailing-whitespace
       - id: end-of-file-fixer
       - id: check-yaml
+        exclude: ^scripts/kerbside-lane/compose\.override\.yml$
+      # A compose override's `!reset` tag is not one PyYAML can
+      # construct, so that file is checked for syntax alone; `docker
+      # compose config` checks the rest when the lane runs.
+      - id: check-yaml
+        name: check yaml (syntax only, for compose's tags)
+        files: ^scripts/kerbside-lane/compose\.override\.yml$
+        args: ['--unsafe']
       - id: check-merge-conflict
 
   - repo: https://github.com/shellcheck-py/shellcheck-py

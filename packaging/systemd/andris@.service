@@ -10,15 +10,21 @@ Documentation=https://github.com/shakenfist/andris/blob/develop/docs/xrdp.md
 StartLimitIntervalSec=0
 
 [Service]
+# %E is the user's configuration directory: "the path $XDG_CONFIG_HOME
+# resolves to" for a user manager (systemd.unit(5), "Specifiers"), which
+# is ~/.config when XDG_CONFIG_HOME is unset. `andris install-unit`
+# makes andris/ and its ticket in the same place, so the two agree.
 # An empty default, which andris.env overrides, so that an unset
 # ANDRIS_ARGS draws no warning from systemd.
 Environment=ANDRIS_ARGS=
 # Optional. Sets ANDRIS_ARGS (listen address, TLS options) and, if the
 # session's cookie is not in ~/.Xauthority, XAUTHORITY.
-EnvironmentFile=-%h/.config/andris/andris.env
+EnvironmentFile=-%E/andris/andris.env
 # A bare name is looked up in systemd's standard binary search path, so
 # this works for /usr/local/bin/andris and /usr/bin/andris alike.
-ExecStart=andris --display :%i --ticket-file %h/.config/andris/ticket $ANDRIS_ARGS
+# `andris install-unit` installs this unit with the bare name replaced
+# by the running binary's absolute path, wherever it was installed.
+ExecStart=andris --display :%i --ticket-file %E/andris/ticket $ANDRIS_ARGS
 # Andris exits 1 when the desktop goes away, and 0 when stopped.
 Restart=on-failure
 # Status 2 means the configuration was refused (a bad option, or a
@@ -37,6 +43,18 @@ LockPersonality=yes
 RestrictRealtime=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 MemoryDenyWriteExecute=yes
+# Only the system calls a typical system service makes. A call outside
+# the set kills andris with SIGSYS, which the journal shows as
+# status=31/SYS, rather than failing it with EPERM somewhere deep in
+# MIT-SHM or libpulse. A user unit can filter system calls only with
+# NoNewPrivileges=yes, set above. On trial, pending a week of daily use
+# with MIT-SHM capture and sound, which decides whether it stays; see
+# https://github.com/shakenfist/andris/blob/develop/docs/plans/PLAN-x11-desktop.md
+SystemCallFilter=@system-service
+# Only the native ABI's system calls, so that another ABI (on x86_64,
+# i386's or x32's) cannot reach calls the filter above would refuse; the
+# pairing systemd.exec(5) recommends.
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=default.target

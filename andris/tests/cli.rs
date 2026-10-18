@@ -6,6 +6,7 @@
 
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::process::{Command, Output};
 
 use tempfile::NamedTempFile;
@@ -141,4 +142,100 @@ fn ticket_over_sixty_bytes_is_refused() {
     let stderr = refused(&ticket, &[]);
     assert!(stderr.contains("--ticket-file"), "{stderr}");
     assert!(stderr.contains("at most 60"), "{stderr}");
+}
+
+/// Run `andris install-unit` with `config_home` as both `XDG_CONFIG_HOME`
+/// and `HOME`, and no display, so that it can write nowhere else and the
+/// next steps it prints carry the placeholder instance.
+fn install_unit(config_home: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_andris"))
+        .arg("install-unit")
+        .env_remove("DISPLAY")
+        .env_remove("XAUTHORITY")
+        .env_remove("RUST_LOG")
+        .env("XDG_CONFIG_HOME", config_home)
+        .env("HOME", config_home)
+        .output()
+        .expect("andris could not be run")
+}
+
+fn mode(path: &Path) -> u32 {
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+/// Through the built binary, not the library, so that what is checked is
+/// what an operator runs. `install-unit` refuses to run as root, so this
+/// fails, with that refusal in its message, if the tests run as root.
+#[test]
+fn install_unit_installs_for_the_running_binary() {
+    let home = tempfile::tempdir().unwrap();
+    let output = install_unit(home.path());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "andris install-unit exited with {}: {stderr}",
+        output.status
+    );
+
+    let unit = std::fs::read_to_string(home.path().join("systemd/user/andris@.service")).unwrap();
+    let exec_start = unit
+        .lines()
+        .find(|line| line.starts_with("ExecStart="))
+        .unwrap_or_else(|| panic!("no ExecStart= in {unit}"));
+    let exe = env!("CARGO_BIN_EXE_andris");
+    assert!(
+        exec_start.starts_with(&format!("ExecStart=\"{exe}\" --display :%i ")),
+        "{exec_start}"
+    );
+
+    let config_dir = home.path().join("andris");
+    assert_eq!(mode(&config_dir), 0o700);
+    assert_eq!(mode(&config_dir.join("ticket")), 0o600);
+    assert!(
+        stdout.contains("systemctl --user restart andris@N\n"),
+        "{stdout}"
+    );
+}
+
+/// `--display` takes its default from `DISPLAY`, and serving options may
+/// not be mixed with a subcommand, so a clap that counted a value from
+/// the environment as an option given would refuse `install-unit` on
+/// every desktop. `:99` is only read, never opened.
+#[test]
+fn install_unit_works_with_display_set_and_names_its_instance() {
+    let home = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_andris"))
+        .arg("install-unit")
+        .env("DISPLAY", ":99")
+        .env_remove("XAUTHORITY")
+        .env_remove("RUST_LOG")
+        .env("XDG_CONFIG_HOME", home.path())
+        .env("HOME", home.path())
+        .output()
+        .expect("andris could not be run");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "andris install-unit exited with {}: {stderr}",
+        output.status
+    );
+    assert!(
+        stdout.contains("systemctl --user restart andris@99\n"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn install_unit_fails_on_an_unusable_config_home() {
+    // A file where the configuration directory should be.
+    let file = NamedTempFile::new().unwrap();
+    let output = install_unit(file.path());
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("cannot create the unit directory"),
+        "{stderr}"
+    );
 }

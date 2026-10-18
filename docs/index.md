@@ -27,6 +27,8 @@ is meant to become.
   clipboard and resizing interact, and how to give both clients sound
 - [Development](development.md) - Building, testing, pre-commit, CI
   and the merge queue
+- [Releasing andris](releasing.md) - Publishing the wheels to PyPI:
+  the one-time setup, the two-stage release, and what it produces
 - [Plans index](plans/index.md) - Every planning document, with its
   intent and status
 - [X11 desktop over SPICE](plans/PLAN-x11-desktop.md) - The master

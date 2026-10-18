@@ -101,10 +101,13 @@ locally:
   scancodes or X keycodes.
 - **`platform/` carries no SPICE or ryll types.** Mapping to and from
   SPICE happens in `server/`.
-- **No `unsafe` outside `platform/x11/shm.rs`.** The crate has
-  `#![deny(unsafe_code)]`; that module alone opts out, for the
-  MIT-SHM mapping, and every `unsafe` block there carries a `SAFETY:`
-  comment.
+- **No `unsafe` outside `platform/x11/shm.rs` and
+  `platform/pulse/ffi.rs`.** The crate has `#![deny(unsafe_code)]`;
+  those two modules alone opt out, for the MIT-SHM mapping and for
+  the bindings to libpulse, which andris loads at run time rather
+  than links. Every `unsafe` block there carries a `SAFETY:` comment.
+  The libpulse bindings are hand-written from the headers, and a test
+  checks them against `libpulse-sys`, a dev-dependency only.
 - **No `unwrap()` in production code.** `clippy::unwrap_used` is on
   for the workspace; tests may unwrap.
 - **Commits go through `pre-commit run --all-files`.** Run it, and

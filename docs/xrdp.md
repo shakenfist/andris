@@ -16,43 +16,85 @@ other noticing.
 
 ## Installing
 
-Build the release binary (see [running.md](running.md#building)) and
-install it where systemd will find it:
+Install andris from PyPI, as the user whose desktop it will export:
 
 ```bash
-make release
-sudo install -m 755 target/release/andris /usr/local/bin/
+pipx install andris        # or: pip install --user andris
+andris install-unit
 ```
+
+The wheel carries the compiled binary, with the H.264 encoder built
+in, for x86_64 and aarch64 Linux with glibc 2.28 or newer. It needs
+nothing else to run, though sound needs libpulse (see
+[Sound](#sound)). `andris install-unit` then sets up the service. It
+writes the unit to `$XDG_CONFIG_HOME/systemd/user/andris@.service`
+(`~/.config/systemd/user/` when that is unset), naming the absolute
+path of the binary that ran it, and makes `~/.config/andris/`, with
+mode 0700, if it is missing. If `~/.config/andris/ticket` does not
+exist, it writes a random ticket there, readable only by the user. It
+never runs systemctl: it prints the commands to run next, which
+[Starting it](#starting-it) explains.
 
 The unit is a systemd *user* unit, so it runs as the session's user,
 which is the user the X server accepts. It needs systemd 254 or newer,
 for its `RestartSteps=` and `RestartMaxDelaySec=` settings; Debian 13
-has 257. It is a template: the part
-after the `@` in the instance name is the display number it exports.
-Copy
-[`andris@.service`](https://github.com/shakenfist/andris/blob/develop/packaging/systemd/andris@.service)
-into the user's unit directory:
+has 257. It is a template: the part after the `@` in the instance name
+is the display number it exports. Its source is
+[`andris@.service`](https://github.com/shakenfist/andris/blob/develop/packaging/systemd/andris@.service).
+
+`install-unit` reports whether it wrote, replaced or left the unit
+unchanged, and always overwrites it, so run it again whenever the
+binary moves, after reinstalling andris with a different pipx or pip,
+say. Do not edit the installed unit: the next run replaces it. Put
+local changes in a drop-in, with `systemctl --user edit andris@`.
+
+A running andris keeps running the binary it started from, so after an
+upgrade restart each instance to run the new one:
 
 ```bash
-mkdir -p ~/.config/systemd/user
-cp packaging/systemd/andris@.service ~/.config/systemd/user/
+pipx upgrade andris
+systemctl --user restart andris@10
 ```
 
-The unit starts a bare `andris`, which systemd looks up in its
-standard binary path (`/usr/local/bin`, `/usr/bin` and their `sbin`
-siblings). A binary anywhere else needs the unit's `ExecStart=` edited
-to give a full path.
+Systemd cannot run a binary whose path holds a quote, a backslash or a
+control character, so `install-unit` refuses one; install andris
+elsewhere if yours does. It also refuses to run as root, sudo
+included: run it as the user whose desktop andris will export.
+
+It reports an `andris/` directory that is open to other users, and a
+ticket andris would refuse (see
+[the ticket file](running.md#the-ticket-file)), rather than changing
+them.
+
+### Building from source
+
+To run a build of your own instead, build the release binary (see
+[running.md](running.md#installing-and-building)) and run `install-unit` with it:
+
+```bash
+make release
+target/release/andris install-unit
+```
+
+The unit then runs that binary, wherever the checkout is. The binary
+is dynamically linked, so build it for, or on, a machine like the one
+that will run it.
 
 ## Configuring
 
-The unit reads two things from `~/.config/andris/`.
+The unit reads two things from `~/.config/andris/`, which it finds
+through systemd's `%E`, the user manager's `$XDG_CONFIG_HOME`.
+`install-unit` writes them under the shell's `$XDG_CONFIG_HOME`, so
+if you set that, it must match what `systemctl --user
+show-environment` reports; otherwise systemd finds neither the unit
+nor the ticket.
 
 The ticket file, `ticket`, holds the password SPICE clients must
-present. It must be private to the user, so make it, and the directory
-holding it, as you would for a manual run:
+present. `andris install-unit` made one if there was none. It must be
+private to the user. To replace it, for instance after it may have
+leaked, write a new one as you would for a manual run:
 
 ```bash
-mkdir -m 700 -p ~/.config/andris
 (umask 077; head -c 24 /dev/urandom | base64 > ~/.config/andris/ticket)
 ```
 
@@ -76,11 +118,11 @@ server's cookie is not in `~/.Xauthority`. xrdp's Xorg uses
 unset, so a stock xrdp setup needs no `XAUTHORITY` at all. Leave the
 file out altogether if you need neither.
 
-Make the ticket file, and any TLS certificate and key, before enabling
-the instance. Andris reads them all at startup, and a missing or
-unreadable one is a refused configuration: the instance stops and stays
-stopped (see the exit statuses below) until you fix it and start it
-again with `systemctl --user start andris@10`.
+Make any TLS certificate and key before enabling the instance. Andris
+reads them, and the ticket, at startup, and a missing or unreadable
+one is a refused configuration: the instance stops and stays stopped
+(see the exit statuses below) until you fix it and start it again with
+`systemctl --user start andris@10`.
 
 ## Starting it
 
@@ -96,16 +138,25 @@ X10
 ```
 
 `X10` is display `:10`. xrdp gives a user's session the same number
-each time while the session lives, so you name it once. Then:
+each time while the session lives, so you name it once. `andris
+install-unit` printed these commands, with the number of the
+display `DISPLAY` named if it named a local one; use the number you
+found:
 
 ```bash
 systemctl --user daemon-reload
-systemctl --user enable --now andris@10
+systemctl --user enable andris@10
+systemctl --user restart andris@10
 ```
 
 `enable` makes the instance start whenever the user's systemd manager
-does, and `--now` starts it straight away. Check it, and read its log,
-with:
+does, and `restart` starts it straight away. `install-unit` prints
+`restart` rather than `enable --now` because `--now` does nothing to an
+instance that is already running: after a reinstall, the old binary
+would carry on serving, from its deleted file if the reinstall removed
+it, under a unit that names the new one. `restart` starts a stopped
+instance, and replaces a running one, dropping any client connected to
+it. Check it, and read its log, with:
 
 ```bash
 systemctl --user status andris@10
@@ -283,6 +334,12 @@ to SPICE clients (see [running.md](running.md#audio)). An xrdp session
 has no sound card, so unless something gives it a sink, there is
 nothing worth capturing. The same sink is what gives RDP clients
 sound, so one install serves both.
+
+Andris loads libpulse when it first needs it. Without it, andris logs
+`cannot load libpulse, so andris serves without sound`, naming the
+package to install (`libpulse0` on Debian and Ubuntu, `pulseaudio-libs`
+on Fedora and RHEL), and offers clients no playback channel, as with
+`--no-audio`. The rest of the desktop works.
 
 Install the xrdp sink module for the session's sound server. On Debian
 13 with PipeWire that is `pipewire-module-xrdp`:

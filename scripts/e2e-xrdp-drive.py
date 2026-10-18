@@ -27,10 +27,10 @@ The checks, each printing PASS or FAIL with what it saw:
       neither side's next key is shifted.
   X3  Caps Lock from RDP, then a ryll restart, whose inputs channel sends
       KEY_MODIFIERS as it opens. Asserted: the RDP key turns Caps Lock on,
-      and ryll's synchronisation turns it off again, since it came last
-      (decision 6). Recorded: whether FreeRDP synchronises again when its
-      window takes the focus, and what ryll's idle keepalive does to a
-      lock state RDP set.
+      and ryll's synchronisation turns it off again: the last client to
+      synchronise the lock state wins. Recorded: whether FreeRDP
+      synchronises again when its window takes the focus, and what ryll's
+      idle keepalive does to a lock state RDP set.
   X4  The FreeRDP window resized, so that xrdp resizes the session through
       RandR: ryll gets a surface of the new size, and a screenshot of it.
   X5  FreeRDP killed, 5 s without it, and started again: andris and ryll

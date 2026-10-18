@@ -1,0 +1,56 @@
+# Packaging manifest for the `andris` PyPI wheel.
+#
+# The wheel embeds the compiled andris binary: maturin with
+# bindings = "bin" lays the `andris` executable into the wheel's
+# *.data/scripts/ directory, which pip installs onto PATH, so
+# `pipx install andris` puts a working `andris` on PATH with nothing
+# downloaded at run time. Because it carries a compiled binary, the wheel
+# is platform-tagged, one per architecture (manylinux_2_28_x86_64 and
+# manylinux_2_28_aarch64); scripts/build-andris-wheel.sh builds it.
+#
+# The manylinux_2_28 tag is earned, not asserted. The binary links only
+# glibc and the C++ runtime, which the policy allows: libpulse, for
+# sound, is loaded at run time instead of linked, and andris serves
+# without sound where it is missing. So the build lets maturin's own
+# policy check refuse any library outside the policy, with no exception
+# to allow.
+#
+# The version is the crate's (version.workspace = true, so the root
+# Cargo.toml's [workspace.package] version), through
+# dynamic = ["version"].
+
+[build-system]
+requires = ["maturin>=1.7.1,<2"]
+build-backend = "maturin"
+
+[project]
+name = "andris"
+description = "A SPICE server that exports an existing X11 desktop"
+# PyPI's project page shows the repository's README. maturin resolves the
+# path from this file's directory, and accepts one that leaves it as long
+# as it stays inside the cargo workspace, as the root README.md does. Its
+# links are absolute, as the repository's documentation rules require,
+# so they work on PyPI too.
+readme = "../README.md"
+requires-python = ">=3.9"
+license = "Apache-2.0"
+dynamic = ["version"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: X11 Applications",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Rust",
+    "Topic :: Desktop Environment",
+    "Topic :: System :: Networking",
+]
+
+[project.urls]
+"Homepage" = "https://shakenfist.com"
+"Source" = "https://github.com/shakenfist/andris"
+"Bug Tracker" = "https://github.com/shakenfist/andris/issues"
+
+[tool.maturin]
+# Package the [[bin]] target, not a Python extension module, into the
+# wheel's *.data/scripts/ directory, which pip installs onto PATH.
+bindings = "bin"

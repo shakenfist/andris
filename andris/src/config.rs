@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use tracing::warn;
 
 use crate::platform::Size;
@@ -44,7 +44,54 @@ pub enum PlatformKind {
     Synthetic,
 }
 
-/// Andris's command line.
+/// Andris's whole command line: either a subcommand, or the options of
+/// [`Args`] for serving a desktop, never both.
+///
+/// Serving takes no subcommand, so `andris --display :10 --ticket-file
+/// ...` reads as it always has. Once any of [`Args`]'s options has been
+/// given, a later word is never taken for a subcommand
+/// (`args_conflicts_with_subcommands`), and a subcommand frees the
+/// command line from the options serving requires, `--ticket-file`
+/// among them (`subcommand_negates_reqs`).
+///
+/// `--help` describes andris with the package's description, not with
+/// this comment (`long_about = None`).
+#[derive(Debug, Clone, Parser)]
+#[command(
+    name = "andris",
+    version,
+    about,
+    long_about = None,
+    args_conflicts_with_subcommands = true,
+    subcommand_negates_reqs = true
+)]
+pub struct Cli {
+    /// What to do instead of serving, if anything.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
+    /// The options for serving a desktop, used when there is no
+    /// subcommand.
+    #[command(flatten)]
+    pub serve: Args,
+}
+
+/// Andris's subcommands. Each runs instead of the server, and none reads
+/// a ticket, opens a display or starts the async runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum Command {
+    /// Install the systemd user unit, and a ticket if there is none.
+    ///
+    /// Writes andris@.service to the user's systemd unit directory, naming
+    /// this binary by its absolute path, and creates ~/.config/andris and
+    /// a ticket in it if they are missing. It prints the systemctl
+    /// commands to run next, and runs none itself. Run it again after
+    /// moving andris, so that the unit follows.
+    InstallUnit,
+}
+
+/// The options for serving a desktop: andris's command line when no
+/// subcommand is given. It parses on its own too, as tests do.
 #[derive(Debug, Clone, Parser)]
 #[command(name = "andris", version, about)]
 pub struct Args {
@@ -70,8 +117,11 @@ pub struct Args {
     /// A file holding the SPICE ticket (password) clients must present.
     /// It must be owned by andris's user, give group and other no access,
     /// and hold at most 60 bytes, plus an optional trailing newline.
-    #[arg(long, value_name = "PATH")]
-    pub ticket_file: PathBuf,
+    // Required, but an Option: a subcommand lifts the requirement (see
+    // `Cli`), and clap's derive can only leave a field out that is an
+    // Option.
+    #[arg(long, value_name = "PATH", required = true)]
+    pub ticket_file: Option<PathBuf>,
 
     /// The X display to export, for `--platform x11`.
     #[arg(long, value_name = "DISPLAY", env = "DISPLAY")]
@@ -216,7 +266,12 @@ impl Args {
             );
         }
 
-        let ticket = read_ticket_file(&self.ticket_file)?;
+        // clap requires --ticket-file when there is no subcommand, so it
+        // is missing only from an `Args` built by hand.
+        let Some(ticket_file) = self.ticket_file else {
+            bail!("--ticket-file is required: name the file holding the SPICE ticket");
+        };
+        let ticket = read_ticket_file(&ticket_file)?;
 
         let audio = match (self.no_audio, self.platform, self.audio_source) {
             // clap refuses --no-audio with --audio-source.
@@ -321,8 +376,9 @@ fn check_private(
 }
 
 /// The process's effective uid, from `/proc/self/status`. Andris is
-/// Linux-only, and this needs no new dependency.
-fn effective_uid() -> Result<u32> {
+/// Linux-only, and this needs no new dependency, nor an `unsafe` call to
+/// libc's `geteuid`.
+pub fn effective_uid() -> Result<u32> {
     let status = std::fs::read_to_string("/proc/self/status")
         .context("reading /proc/self/status for andris's effective uid")?;
     parse_effective_uid(&status).context("/proc/self/status names no effective uid")
@@ -802,6 +858,75 @@ mod tests {
     fn clap_definition_is_consistent() {
         use clap::CommandFactory;
         Args::command().debug_assert();
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn serving_options_parse_as_before_the_subcommand() {
+        let ticket = ticket_file(b"secret", 0o600);
+        let path = ticket.path().to_str().unwrap();
+        let cli = Cli::try_parse_from([
+            "andris",
+            "--display",
+            ":10",
+            "--ticket-file",
+            path,
+            "--listen",
+            "127.0.0.1:5910",
+            "--no-audio",
+        ])
+        .unwrap();
+        assert_eq!(cli.command, None);
+        let config = cli.serve.validate().unwrap();
+        assert_eq!(config.listen, "127.0.0.1:5910".parse().unwrap());
+        assert_eq!(
+            config.platform,
+            PlatformConfig::X11 {
+                display: ":10".into()
+            }
+        );
+        assert_eq!(config.audio, AudioConfig::Off);
+    }
+
+    #[test]
+    fn serving_still_requires_a_ticket_file() {
+        let message = Cli::try_parse_from(["andris", "--display", ":10"])
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("--ticket-file"), "{message}");
+        assert!(Cli::try_parse_from(["andris"]).is_err());
+    }
+
+    #[test]
+    fn install_unit_needs_no_serving_options() {
+        let cli = Cli::try_parse_from(["andris", "install-unit"]).unwrap();
+        assert_eq!(cli.command, Some(Command::InstallUnit));
+        assert_eq!(cli.serve.ticket_file, None);
+    }
+
+    #[test]
+    fn install_unit_takes_no_options_and_mixes_with_none() {
+        let ticket = ticket_file(b"secret", 0o600);
+        let path = ticket.path().to_str().unwrap();
+        // Serving options before it make it a stray word, not a
+        // subcommand; options after it are not its own.
+        for argv in [
+            &["andris", "--ticket-file", path, "install-unit"][..],
+            &["andris", "install-unit", "--ticket-file", path][..],
+            &["andris", "install-unit", "--display", ":10"][..],
+            &["andris", "install-unit", "extra"][..],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_err(), "{argv:?} parsed");
+        }
+    }
+
+    #[test]
+    fn a_hand_built_args_without_a_ticket_file_is_refused() {
+        let ticket = ticket_file(b"secret", 0o600);
+        let mut args = parse(&ticket, &[]);
+        args.ticket_file = None;
+        let message = error(args);
+        assert!(message.contains("--ticket-file is required"), "{message}");
     }
 
     /// Parse `extra` after a good ticket file and `--platform x11

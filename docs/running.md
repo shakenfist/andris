@@ -9,7 +9,19 @@ configures a desktop: it connects to the X server as an ordinary
 client, captures the root window, and injects keys and pointer events
 with the XTEST extension.
 
-## Building
+## Installing and building
+
+Most people should install the wheel from PyPI:
+
+```bash
+pipx install andris        # or: pip install --user andris
+```
+
+It holds the compiled binary, with the H.264 encoder built in, for
+x86_64 and aarch64 Linux with glibc 2.28 or newer. To run it as a
+service beside xrdp, continue at [xrdp.md](xrdp.md#installing).
+
+To build it yourself:
 
 ```bash
 make release
@@ -19,8 +31,13 @@ builds `target/release/andris` inside the devcontainer; `make build`
 makes a debug binary at `target/debug/andris`. See
 [development.md](development.md) for why the build runs in Docker.
 The binary is an ordinary dynamically linked executable, so copy it
-to the machine whose desktop you want to export. Besides the C
-library it needs only libpulse at run time (`libpulse0` on Debian).
+to the machine whose desktop you want to export. It needs only the C
+and C++ runtime libraries. libpulse is optional: andris loads it when
+it first needs sound, and without it logs `cannot load libpulse, so
+andris serves without sound`, naming the package to install
+(`libpulse0` on Debian and Ubuntu, `pulseaudio-libs` on Fedora and
+RHEL), and offers no playback channel, as `--no-audio` does. Everything
+else works.
 
 Ryll's `shakenfist-spice-compression` crate bundles openh264, so the
 first build also compiles it even though andris only encodes images
@@ -305,7 +322,7 @@ desktop. The agent carries the clipboard and desktop resizing, and is
 what makes a client's "share clipboard" and "resize guest to window"
 options work. A client must reassemble agent messages that span several
 chunks, which ryll does only from a revision with agent reassembly, so
-use ryll from `develop` as described in
+use ryll 0.3.0 or newer, as described in
 [Connecting with ryll](#connecting-with-ryll).
 
 **Copy and paste.** The desktop's `CLIPBOARD` selection and the
@@ -423,10 +440,10 @@ bitrate change. The [metrics](#metrics) line counts streams.
 **Patents.** The H.264 encoder is Cisco's openh264, whose code is
 BSD-2-Clause. Andris builds it from source, as ryll does, and a build
 from source carries none of Cisco's patent licence, which covers only
-Cisco's own binary downloaded onto the user's machine. Whether
-andris's packages ship the compiled encoder is undecided. This is a
-statement of the position, not legal advice; if H.264 patents matter
-to you, check them for your use.
+Cisco's own binary downloaded onto the user's machine. The wheels on
+PyPI carry the encoder compiled from source, so the same holds for
+them. This is a statement of the position, not legal advice; if H.264
+patents matter to you, check them for your use.
 
 ### Not supported
 
@@ -528,11 +545,19 @@ capability but sends neither `VOLUME` nor `MUTE`, and does not apply
 the client's volume to the desktop. The client plays at its own
 volume.
 
-**Without a sound server.** Andris needs `libpulse0` at run time. If
-it cannot reach a sound server, or the source is gone, it logs one
-warning each time a client links the channel and carries on: the playback channel stays
-linked and silent, every other channel works, and capture is tried
-again each time a client links the channel. Where PulseAudio is
+**Without libpulse.** Andris loads libpulse, `libpulse-simple.so.0`,
+when it starts with `--platform x11` and sound enabled. If it is not
+installed, andris logs one warning, `cannot load libpulse, so andris
+serves without sound`, naming the package to install (`libpulse0` on
+Debian and Ubuntu, `pulseaudio-libs` on Fedora and RHEL), and carries
+on as with `--no-audio`: clients are offered no playback channel. It
+does not try again until it restarts.
+
+**Without a sound server.** If libpulse is there but andris cannot
+reach a sound server, or the source is gone, it logs one warning each
+time a client links the channel and carries on: the playback channel
+stays linked and silent, every other channel works, and capture is
+tried again each time a client links the channel. Where PulseAudio is
 installed and none is running, libpulse may start a daemon of its
 own. Set `PULSE_SERVER` to name a server, or use `--no-audio`, if that
 is not wanted.
@@ -628,12 +653,12 @@ line and the startup log:
 
 ## Connecting with ryll
 
-Use a ryll built from its `develop` branch, at or after the revision
-andris's `Cargo.lock` pins, until a ryll release after 0.1.7 carries
-the same changes. Ryll 0.1.7 and earlier decode LZ4 images differently
-from how spice-server and andris send them (shakenfist/ryll#475): the
-pointer moves, but the display never paints, and ryll logs
-`LZ4 unsupported spice format` for every draw.
+Use ryll 0.3.0 or newer. Ryll 0.1.7 and earlier decode LZ4 images
+differently from how spice-server and andris send them
+(shakenfist/ryll#475): the pointer moves, but the display never
+paints, and ryll logs `LZ4 unsupported spice format` for every draw.
+Earlier releases also lack the agent reassembly that the clipboard
+needs.
 
 Ryll's `--direct` option has no password, so a ticket needs a
 virt-viewer `.vv` file. Write one:
@@ -693,3 +718,163 @@ Every connection through kerbside comes from kerbside's address, so
 the limit of 4 handshakes in progress per address applies to all of
 kerbside's clients together; that is enough for one client linking
 its channels in parallel.
+
+### Trying it with kerbside's demo stack
+
+Kerbside ships a demo stack, a compose file with a database, kerbside
+from PyPI and a static source, which can front a live desktop for a
+trial. The demo's own arrangement does not fit: it reaches its target
+over the compose network, and andris refuses a listener beyond
+loopback without TLS. So this recipe runs kerbside's container on the
+host's network, with every listener it opens bound to `127.0.0.1`, and
+points its static source at andris on loopback too. Nothing then
+listens beyond the machine, and a remote client reaches it through an
+SSH tunnel.
+
+**Read this first.** Kerbside's demo has no real authentication. It
+mints a bearer token for anyone who can run `kerbside demo token`,
+because interactive login works only with Keystone, and its compose
+file binds its ports to loopback for that reason (see its
+[demo README](https://github.com/shakenfist/kerbside/blob/develop/demo/README.md)).
+Binding the listeners more widely would put an unauthenticated console
+proxy in front of your desktop. Nothing here may listen on any
+address but `127.0.0.1`: check with `ss -ltn` before you rely on it,
+and remember that loopback is open to every account on the machine
+(see [On a shared host](xrdp.md#on-a-shared-host)). Run the demo only
+for a trial, and remove it afterwards.
+
+Kerbside can bind the two SPICE listeners and the REST API to
+loopback, but not by the same means:
+
+- **The SPICE listeners**, 5900 for TLS and 5901 for redirects,
+  share one setting, `KERBSIDE_VDI_ADDRESS`.
+- **The REST API**, 13002, has no setting. The demo's entrypoint
+  starts gunicorn with `--bind 0.0.0.0:13002`, so the recipe mounts a
+  copy of the entrypoint with that address changed.
+
+Kerbside's database must also be reachable from a container on the
+host's network, so the recipe publishes it on loopback.
+
+You need Docker Compose 2.24 or newer, for the `!reset` tag.
+
+1. **Make andris listen on port 5910.** The unit's default, 5900, is
+   the port kerbside's TLS listener takes. Put this in
+   `~/.config/andris/andris.env`, and restart the instance (here
+   `andris@10`):
+
+   ```bash
+   ANDRIS_ARGS=--listen 127.0.0.1:5910
+   ```
+
+   ```bash
+   systemctl --user restart andris@10
+   ```
+
+2. **Fetch kerbside's demo at v0.7.0**, the release the andris tests
+   run against:
+
+   ```bash
+   git clone --branch v0.7.0 --depth 1 https://github.com/shakenfist/kerbside
+   cd kerbside/demo
+   ```
+
+3. **Write a source for andris**, with the ticket from the ticket
+   file, and a copy of the entrypoint that binds gunicorn to
+   loopback:
+
+   ```bash
+   (umask 077; cat > sources-andris.yaml <<YAML
+   - source: andris
+     type: static
+     consoles:
+       - uuid: "6f4e2c1a-0000-0000-0000-0000000000a1"
+         name: "xrdp-desktop"
+         hypervisor: "localhost"
+         hypervisor_ip: "127.0.0.1"
+         insecure_port: 5910
+         ticket: "$(cat ~/.config/andris/ticket)"
+   YAML
+   )
+   sed 's/0\.0\.0\.0:\${API_PORT}/127.0.0.1:${API_PORT}/' entrypoint.sh \
+       > entrypoint-loopback.sh
+   chmod +x entrypoint-loopback.sh
+   grep -q '127\.0\.0\.1:\${API_PORT}' entrypoint-loopback.sh \
+       && ! grep -q '0\.0\.0\.0' entrypoint-loopback.sh \
+       || { echo 'entrypoint-loopback.sh still binds 0.0.0.0: stop' >&2; false; }
+   ```
+
+   The check matters: if a later kerbside changes that line, `sed`
+   matches nothing, and under host networking the copy would put
+   kerbside's API, which mints console tokens, on every interface.
+
+4. **Write a compose override**, `compose.host.yml`, beside the
+   demo's `docker-compose.yml`:
+
+   ```yaml
+   services:
+     db:
+       ports:
+         - '127.0.0.1:3306:3306'
+
+     kerbside:
+       network_mode: host
+       ports: !reset []
+       environment:
+         KERBSIDE_SQL_URL: mysql://kerbside:kerbside@127.0.0.1/kerbside
+         KERBSIDE_VDI_ADDRESS: 127.0.0.1
+       volumes:
+         - ./sources-andris.yaml:/etc/kerbside/sources.yaml:ro
+         - ./entrypoint-loopback.sh:/usr/local/bin/kerbside-demo-entrypoint:ro
+   ```
+
+   The demo's `spice-target` container still starts, and nothing uses
+   it. Kerbside's own `KERBSIDE_PUBLIC_FQDN`, `127.0.0.1`, is already
+   what the `.vv` file names.
+
+5. **Bring it up.** Naming the override in `COMPOSE_FILE` makes the
+   demo's `get-console.sh`, which runs `docker compose` itself, use
+   it too. Pin the kerbside release the image installs to the tag you
+   fetched:
+
+   ```bash
+   export COMPOSE_FILE=docker-compose.yml:compose.host.yml
+   KERBSIDE_SOURCE=kerbside==0.7.0 docker compose up -d --build
+   ss -Hltn | awk '$4 ~ /:(5900|5901|13002|3306|5910)$/ { print }
+       $4 ~ /:(5900|5901|13002|3306|5910)$/ && $4 !~ /^127\.0\.0\.1:/ { bad = 1 }
+       END { if (bad) { print "a port above is not on loopback: stop"; exit 1 } }'
+   ```
+
+   It lists the stack's listening sockets, and fails if any of them
+   is bound to an address other than `127.0.0.1`. Stop if it does.
+
+6. **Fetch a `.vv` file.** The script waits for the stack, mints a
+   token and writes `demo-console.vv`:
+
+   ```bash
+   ./get-console.sh
+   ```
+
+   The file holds a token that works for five minutes, so connect
+   soon, and ryll deletes it once it has read it.
+
+7. **Connect from the remote machine.** Copy the `.vv` file there,
+   and forward kerbside's ports to the host, so that the `.vv`'s
+   `127.0.0.1`, and the certificate kerbside's demo issues for it,
+   are right:
+
+   ```bash
+   ssh -L 5900:127.0.0.1:5900 -L 5901:127.0.0.1:5901 \
+       -L 13002:127.0.0.1:13002 host
+   ryll --file demo-console.vv
+   ```
+
+   Port 13002 is the web UI, which you cannot log into; ryll needs
+   only 5900, and a spice-gtk client such as `remote-viewer` 5901
+   too. The `.vv` carries the demo's CA and the certificate subject to
+   expect, so there is nothing to install.
+
+To remove the trial, run `docker compose down -v` in the demo
+directory, delete `sources-andris.yaml`, which holds the ticket, and
+take the `ANDRIS_ARGS` line out of `andris.env` if you do not want it.
+The ticket was copied into kerbside's container too, so if you
+want it gone, replace it as [xrdp.md](xrdp.md#configuring) says.

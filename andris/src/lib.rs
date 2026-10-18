@@ -4,17 +4,22 @@
 //! drive the server in-process.
 //!
 //! - [`config`] holds the command line and its validation;
+//! - [`install`] holds `andris install-unit`, which installs the systemd
+//!   user unit;
 //! - [`platform`] holds the seams between the server and the desktop,
 //!   and their implementations;
 //! - [`server`] holds the SPICE server.
 //!
-//! Unsafe code is denied crate-wide. The one exception is the X11
-//! backend's MIT-SHM capture, `platform::x11::shm`, which maps memory the
-//! X server writes; it alone allows it, and justifies each block.
+//! Unsafe code is denied crate-wide. There are two exceptions, which
+//! alone allow it and justify each block: the X11 backend's MIT-SHM
+//! capture, `platform::x11::shm`, which maps memory the X server writes,
+//! and the bindings to libpulse, `platform::pulse::ffi`, which andris
+//! loads at run time rather than links.
 
 #![deny(unsafe_code)]
 
 pub mod config;
+pub mod install;
 pub mod platform;
 pub mod server;
 
@@ -26,7 +31,7 @@ use tokio::signal::unix::{Signal, SignalKind, signal};
 use tracing::{error, info, warn};
 
 use config::{AudioConfig, Config, PlatformConfig};
-use platform::pulse::PulseSource;
+use platform::pulse::{self, PulseSource};
 use platform::synthetic::{SyntheticPlatform, ToneSource};
 use platform::x11::X11Platform;
 use platform::{AudioSource, GoneSignal, Platform};
@@ -46,7 +51,11 @@ pub fn banner() -> String {
 /// configuration names, start the listeners, and serve until SIGINT or
 /// SIGTERM, or until the desktop goes. Fails, naming why, if the desktop
 /// went.
+///
+/// Sound is resolved before the desktop is opened, so that a missing
+/// libpulse is reported even when opening the desktop then fails.
 pub fn run(config: Config) -> Result<()> {
+    let audio = audio_source(&config.audio);
     let mut platform = match &config.platform {
         PlatformConfig::Synthetic { size } => {
             info!("exporting a synthetic {size} desktop");
@@ -57,7 +66,7 @@ pub fn run(config: Config) -> Result<()> {
             X11Platform::connect(name)?.platform()
         }
     };
-    platform.audio = audio_source(&config.audio);
+    platform.audio = audio;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -67,13 +76,30 @@ pub fn run(config: Config) -> Result<()> {
 
 /// The sound source `audio` names, saying which in the log. Nothing is
 /// captured yet: capture starts when a client listens.
+///
+/// PulseAudio capture needs libpulse, which is loaded here. If it cannot
+/// be, andris logs why, with the package to install, and serves without
+/// sound, as with `--no-audio`: no source, so no playback channel.
 fn audio_source(audio: &AudioConfig) -> Option<Arc<dyn AudioSource>> {
+    audio_source_from(audio, pulse::LIBRARY)
+}
+
+/// [`audio_source`], loading libpulse from the library `file`, which
+/// tests name to see it missing.
+fn audio_source_from(audio: &AudioConfig, file: &str) -> Option<Arc<dyn AudioSource>> {
     match audio {
         AudioConfig::Off => {
             info!("sound is off");
             None
         }
         AudioConfig::Pulse { source } => {
+            if let Err(err) = pulse::load_from(file) {
+                warn!(
+                    "cannot load libpulse, so andris serves without sound; install libpulse0 \
+                     (Debian, Ubuntu) or pulseaudio-libs (Fedora, RHEL) for sound: {err}"
+                );
+                return None;
+            }
             info!("sound comes from PulseAudio source {source}, captured while a client listens");
             Some(Arc::new(PulseSource::new(source.as_str())))
         }
@@ -183,7 +209,8 @@ mod tests {
     fn the_audio_configuration_picks_the_source() {
         assert!(audio_source(&AudioConfig::Off).is_none());
         // Neither starts capturing until opened, so neither needs a sound
-        // server or a runtime here.
+        // server or a runtime here. PulseAudio capture does need libpulse,
+        // which the development image installs.
         assert!(audio_source(&AudioConfig::Tone).is_some());
         assert!(
             audio_source(&AudioConfig::Pulse {
@@ -191,6 +218,62 @@ mod tests {
             })
             .is_some()
         );
+    }
+
+    /// Log lines, collected for a test to read.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn without_libpulse_there_is_no_sound_and_a_warning_says_why() {
+        let logs = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let source = tracing::subscriber::with_default(subscriber, || {
+            audio_source_from(
+                &AudioConfig::Pulse {
+                    source: "@DEFAULT_MONITOR@".into(),
+                },
+                "libandris-no-such-libpulse.so.0",
+            )
+        });
+        assert!(source.is_none(), "a PulseAudio source without libpulse");
+        let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = logs.lines().collect();
+        assert_eq!(lines.len(), 1, "{logs}");
+        let line = lines[0];
+        assert!(line.contains("WARN"), "{line}");
+        for expected in [
+            "cannot load libpulse",
+            "libandris-no-such-libpulse.so.0",
+            "serves without sound",
+            "libpulse0 (Debian, Ubuntu)",
+            "pulseaudio-libs (Fedora, RHEL)",
+        ] {
+            assert!(line.contains(expected), "{expected:?} missing from {line}");
+        }
     }
 
     #[test]

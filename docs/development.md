@@ -388,9 +388,10 @@ hooks are:
   It runs only when a `.rs` file or a `Cargo.toml`/`Cargo.lock`
   changes.
 - **The release version check's fixtures**,
-  [`scripts/test-check-release-version.sh`](https://github.com/shakenfist/andris/blob/develop/scripts/test-check-release-version.sh),
-  which runs `scripts/check-release-version.sh` against fixture
-  `Cargo.toml` and `Cargo.lock` files.
+  [`tools/test-release-version.sh`](https://github.com/shakenfist/andris/blob/develop/tools/test-release-version.sh),
+  which runs `tools/release-version.sh check` against fixture
+  `Cargo.toml` and `Cargo.lock` files. It runs only when one of the
+  two scripts changes.
 - **actionlint** over the workflows, using
   [`.github/actionlint.yaml`](https://github.com/shakenfist/andris/blob/develop/.github/actionlint.yaml)
   to declare the self-hosted runner labels in use.
@@ -483,7 +484,7 @@ The gates treat a skipped job as success for the same reason.
 | `supply-chain.yml` | Mondays 09:00 UTC, and on demand | `cargo audit` and `cargo deny` against `develop`, so a newly published advisory is noticed without waiting for a pull request |
 | `codeql-analysis.yml` | pull requests, pushes to `main` and `develop`, Tuesdays 17:00 UTC | CodeQL; skipped for documentation-only changes |
 | `renovate.yml` | hourly | self-hosted Renovate dependency updates |
-| `release.yml` | a pushed `vX.Y.Z` tag; a manual dispatch builds and tests both wheels without publishing | builds the x86_64 and aarch64 wheels, signs the tag, creates the GitHub release and publishes to PyPI; see [releasing.md](releasing.md) |
+| `release.yml` | a pushed `vX.Y.Z` tag; a manual dispatch builds and tests both wheels without publishing | checks that `ci.yml` passed on the tagged commit, builds the x86_64 and aarch64 wheels, signs the tag, creates the GitHub release and publishes to PyPI; see [releasing.md](releasing.md) |
 | `export-repo-config.yml` | nightly | exports repository settings into the repository |
 | `pr-re-review.yml`, `pr-retest.yml` | comments on a pull request | the bot phrases below |
 
@@ -513,6 +514,19 @@ A failure on the merge tier is not necessarily the pull request's
 fault: a flaky runner can cause one, so re-enqueue before assuming
 otherwise. A semantic conflict with something merged to `develop`
 since the smoke tier ran fails it too, and needs a rebase.
+
+The queue's `ci.yml` run on the commit it merges is the CI result a
+release requires: the release workflow refuses to publish a commit
+that has none (see [releasing.md](releasing.md#the-ci-gate)). So a
+change merged around the queue, by an administrator bypassing it,
+cannot be released until a later commit has gone through the queue.
+
+The queue builds one entry at a time (`max_entries_to_build: 1` in the
+`Develop branch` ruleset). The merge tier's concurrency groups depend
+on that: a queue run shares a group with whatever the queue builds
+next, so that a superseded run is cancelled. Raising the setting would
+make each entry cancel the one ahead of it, so revisit those groups
+first.
 
 ## Retesting and re-reviewing a pull request
 

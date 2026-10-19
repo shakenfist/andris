@@ -7,16 +7,27 @@ any other change:
 
 1. **Propose.** `make propose-release X.Y.Z` creates a
    `release-X.Y.Z` branch from `develop`, bumps the version, runs
-   pre-commit and the tests, and pushes the branch. You open a pull
-   request from it and land it as usual.
-2. **Tag.** Once that pull request has landed, `make tag-release X.Y.Z`
-   tags the merged commit `vX.Y.Z` and pushes the tag. The tag starts
-   the
+   pre-commit and the tests, pushes the branch and opens a pull
+   request. You land it through the merge queue as usual.
+2. **Tag.** Once that pull request has merged, `make tag-release X.Y.Z`
+   tags the commit the queue merged `vX.Y.Z` and pushes the tag. The
+   tag starts the
    [release workflow](https://github.com/shakenfist/andris/blob/develop/.github/workflows/release.yml),
-   which builds, signs and publishes.
+   which checks that CI passed on that commit, then builds, signs and
+   publishes.
 
 PyPI never accepts the same version twice, even after a release is
 deleted, so the second stage cannot be taken back.
+
+The two scripts, `tools/propose-release.sh` and `tools/tag-release.sh`,
+are the Shaken Fist Rust release template's, as are
+`tools/release-version.sh` and `tools/sign-release-tag.sh`, and the
+workflow's jobs other than `build-wheels` and `publish-pypi`. The
+template, and the invariants a release keeps, are in
+[shakenfist/development](https://github.com/shakenfist/development/tree/main/templates/release-automation-rust).
+Change them there first, then copy them here; only the marked
+per-repository settings at the top of `propose-release.sh` and
+`release-version.sh` are andris's own.
 
 ## Prerequisites
 
@@ -98,8 +109,9 @@ no Rust toolchain. They need:
 
 - `docker`, for those two targets and for pre-commit's `make lint`;
 - `git`, `make`, `curl` and `pre-commit`;
-- `gh`, signed in (`gh auth login`), for `tag-release` to watch the
-  workflow.
+- `gh`, signed in (`gh auth login`), to find the default branch, for
+  `propose-release` to open the pull request, and for `tag-release` to
+  watch the workflow.
 
 ## Stage 1: propose the release
 
@@ -111,35 +123,37 @@ make propose-release 0.1.0
 
 The script:
 
-1. checks the version is `X.Y.Z`, and newer than the current one;
+1. checks the version is `X.Y.Z`;
 2. checks the checkout is on `develop`, clean and in step with
    `origin/develop`, and that neither `v0.1.0` nor `release-0.1.0`
    exists locally or on `origin`;
-3. checks that PyPI does not already have `andris` 0.1.0;
-4. creates and switches to `release-0.1.0`, and runs
-   `pre-commit run --all-files`;
+3. checks the version is newer than the current one, and that PyPI
+   does not already have `andris` 0.1.0;
+4. creates and switches to `release-0.1.0`;
 5. sets `version` in the root `Cargo.toml`'s `[workspace.package]`,
    which the crate inherits, and runs `make lock`, which moves the
-   `andris` entry in `Cargo.lock` to match;
-6. runs the release workflow's own version check against `v0.1.0`,
-   and checks that only `Cargo.toml` and `Cargo.lock` changed;
+   `andris` entry in `Cargo.lock` to match, and refuses to go on if
+   that left an untracked file;
+6. runs `pre-commit run --all-files` over the bumped tree, then the
+   release workflow's own version check against `v0.1.0`;
 7. runs `make test`;
-8. shows the diff and asks `Commit and push release-0.1.0? [y/N]`;
-9. on `y`, commits `Release 0.1.0.` and pushes the branch.
+8. shows the diff and asks
+   `Commit, push release-0.1.0 and open a pull request? [y/N]`;
+9. on `y`, commits `Release 0.1.0.`, pushes the branch and opens a
+   pull request into `develop`.
 
 Nothing reaches `origin` before the prompt. On `N`, or if any step
-fails, the script switches back to `develop` and deletes the branch.
+fails before the push, the script switches back to `develop` and
+deletes the branch.
 
-Open a pull request from `release-0.1.0` into `develop`, and land it
-through the merge queue like any other change. Its merge-tier
-`Build the wheel` job builds and smoke-tests the x86_64 wheel at the
-new version.
+Get the pull request reviewed, and land it through the merge queue
+like any other change. Its merge-tier `Build the wheel` job builds and
+smoke-tests the x86_64 wheel at the new version, and the queue's run
+on the merged commit is the CI result the release checks.
 
 ## Stage 2: tag the merged commit
 
-After the pull request has landed, as a merge commit (the merge
-queue's setting), so that `develop` keeps the commit `Release X.Y.Z.`
-the script looks for:
+After the pull request has merged through the queue:
 
 ```bash
 make tag-release 0.1.0
@@ -149,25 +163,33 @@ The script:
 
 1. fetches `origin/develop` and its tags;
 2. checks that `v0.1.0` does not exist locally or on `origin`;
-3. finds the commit that landed the release: the merge of the pull
-   request holding the commit `Release 0.1.0.`, or that commit itself
-   if it landed directly. It refuses if there is none, which is to say
-   the release pull request has not landed;
-4. checks that this commit's `Cargo.toml` and `Cargo.lock` both say
-   0.1.0;
-5. shows the commit it will tag, lists anything that landed on
+3. finds the commit that merged the release: the first commit on
+   `develop`'s first-parent history that contains the commit
+   `Release 0.1.0.` (or `Release 0.1.0. (#N)`, after a squash merge),
+   which is the queue's merge rather than `develop`'s tip. It refuses
+   if there is none, which is to say the release pull request has not
+   merged;
+4. checks that this commit is on `develop`'s first-parent history,
+   where the release's CI gate looks, and that its `Cargo.toml` and
+   `Cargo.lock` both say 0.1.0;
+5. shows the commit it will tag, lists anything that merged into
    `develop` after it (which is not in the release), and asks
    `Create and push tag v0.1.0? [y/N]`;
-6. on `y`, creates the annotated tag at that commit and pushes it;
+6. on `y`, creates the annotated tag at that commit and pushes it,
+   deleting the local tag again if the push fails;
 7. finds the workflow run the tag started, watches it with
    `gh run watch`, and opens the release page when it finishes.
+
+`tools/tag-release.sh 0.1.0 COMMIT` tags a later commit instead, for
+recovering from a gate failure (see below).
 
 ## What the workflow does
 
 | Job | Runs on | What it does |
 |-----|---------|--------------|
+| `ci-gate` | static pool | Fails the release unless `ci.yml` succeeded on the tagged commit. See [The CI gate](#the-ci-gate). |
 | `check-version` | static pool | The tag must name `[workspace.package]`'s version, and `Cargo.lock` must agree. |
-| `build-wheels` | x86_64: the self-hosted `debian-13-docker` `l` pool; aarch64: GitHub's `ubuntu-24.04-arm` | Builds each wheel natively with `scripts/build-andris-wheel.sh`, the script `make wheel` runs, then smoke-tests it with `scripts/wheel-smoke.sh`. |
+| `build-wheels` | x86_64: the self-hosted `debian-13-docker` `l` pool; aarch64: GitHub's `ubuntu-24.04-arm` | Builds each wheel natively with `scripts/build-andris-wheel.sh`, the script `make wheel` runs, checks its contents with `shakenfist/actions/check-dist`, then smoke-tests it with `scripts/wheel-smoke.sh`. |
 | `sign-tag` | an ephemeral GitHub-hosted runner | After the first approval, replaces the tag with one signed keylessly through Sigstore's gitsign, and force-pushes it. |
 | `github-release` | static pool | Checks that exactly the two wheels arrived, writes `SHA256SUMS`, and creates the GitHub release with generated notes. |
 | `publish-pypi` | the self-hosted `debian-13-docker` `s` pool, whose VMs are made for one job and destroyed | After the second approval, attests the wheels' build provenance and uploads them to PyPI. |
@@ -186,8 +208,25 @@ tagging, after a change to the wheel build or a toolchain bump, start
 the workflow by hand: **Actions → Release → Run workflow**, on any
 branch. It runs `check-version` (which, with no tag, checks only that
 `Cargo.toml` and `Cargo.lock` agree) and both `build-wheels` legs, and
-uploads the wheels as artifacts. `sign-tag`, `github-release` and
-`publish-pypi` run only for a pushed tag, and show as skipped.
+uploads the wheels as artifacts. `ci-gate`, `sign-tag`,
+`github-release` and `publish-pypi` run only for a pushed tag, and show
+as skipped.
+
+### The CI gate
+
+`ci-gate` runs first, and every other job needs it, so nothing is
+built, signed or published from a commit CI did not pass. It uses
+[`shakenfist/actions/require-ci-success`](https://github.com/shakenfist/actions/blob/main/docs/actions.md#require-ci-success),
+which requires a successful `ci.yml` run on the tagged commit. With
+the merge queue, that is the merge tier's run on the commit the queue
+merged, which is the commit `tag-release` picks. A commit with no such
+run, because it was merged around the queue, or is not on `develop`'s
+first-parent history, cannot be released. The gate has no override.
+
+The Rust release template's README in
+[shakenfist/development](https://github.com/shakenfist/development/tree/main/templates/release-automation-rust)
+says what counts as CI, and links the recovery steps for each reason
+the gate fails. The common cases are under Troubleshooting below.
 
 ## The artifacts
 
@@ -244,22 +283,44 @@ it in a container, but never against a real desktop.
 version, or `Cargo.lock` disagrees with `Cargo.toml`. That should not
 happen through `tag-release`, which checks both first. If it does,
 after a tag pushed by hand, say, nothing has been signed or published.
-An administrator deletes the tag, and the version is fixed on
-`develop` through a new release pull request:
+The version is fixed on `develop` through a new release pull request,
+and then an administrator moves the tag:
 
 ```bash
-git push origin :refs/tags/v0.1.0
+git push origin :refs/tags/v0.1.0   # needs the tag ruleset's bypass
 git tag -d v0.1.0
+tools/tag-release.sh 0.1.0
 ```
+
+### The CI gate fails
+
+Nothing has been built, signed or published, since every other job
+needs `ci-gate`. Its log names the reason:
+
+- **CI is still running, or failed because of a flake** on the tagged
+  commit: wait for it, or re-run the failed `ci.yml` jobs, then re-run
+  the failed release jobs.
+- **The tagged commit has no `ci.yml` run**, because it was merged
+  around the merge queue, or is not on `develop`'s first-parent
+  history: move the tag to a later commit that went through the queue
+  and carries the same version:
+
+  ```bash
+  git push origin :refs/tags/v0.1.0   # needs the tag ruleset's bypass
+  git tag -d v0.1.0
+  tools/tag-release.sh 0.1.0 <commit that went through the queue>
+  ```
 
 ### A wheel fails to build
 
 Nothing is signed or published until both legs of `build-wheels`
-pass. Fix the build on `develop` through a pull request (start the
-workflow by hand on its branch to try both architectures), then have
-an administrator delete the tag as above and run
-`make tag-release X.Y.Z` again. The version is unchanged, since
-nothing reached PyPI.
+pass. That includes `check-dist`, which fails a wheel holding a test
+directory, or nothing but its metadata. Fix the build on `develop`
+through a pull request (start the workflow by hand on its branch to
+try both architectures), then have an administrator move the tag to
+the fixed commit as above, with
+`tools/tag-release.sh X.Y.Z <the fixed commit>`. The version is
+unchanged, since nothing reached PyPI.
 
 ### The release waits for approval
 

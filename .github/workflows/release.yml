@@ -2,8 +2,16 @@ name: Release
 
 # Builds andris's two wheels, signs the release tag, creates the GitHub
 # release and publishes the wheels to PyPI, when a vX.Y.Z tag is pushed.
-# scripts/tag-release.sh pushes that tag; docs/releasing.md describes
-# the whole process and the settings it needs.
+# tools/tag-release.sh pushes that tag, once the version bump from
+# tools/propose-release.sh has merged through the merge queue. Nothing is
+# signed or published unless CI passed on the tagged commit and a
+# reviewer approves the `release` environment. docs/releasing.md
+# describes the whole process and the settings it needs.
+#
+# The jobs outside the marked build section are the Rust release
+# template's, from shakenfist/development's
+# templates/release-automation-rust/, whose README lists the invariants
+# they keep. The build section holds andris's own build and publish jobs.
 #
 # workflow_dispatch builds and smoke-tests both wheels on any ref, and
 # publishes nothing, so a change to the wheel build can be tried before
@@ -17,10 +25,11 @@ name: Release
 # with "Re-run jobs" keeps the original push event, so the guard costs
 # nothing there.
 #
-# The order is: check-version, then build-wheels, then sign-tag (which
-# waits for approval on the `release` environment), then github-release,
-# then publish-pypi (which waits for a second approval, because it names
-# the environment too, as PyPI's trusted publisher requires).
+# The order is: ci-gate, then check-version, then build-wheels, then
+# sign-tag (which waits for approval on the `release` environment), then
+# github-release, then publish-pypi (which waits for a second approval,
+# because it names the environment too, as PyPI's trusted publisher
+# requires).
 on:
   push:
     tags:
@@ -36,11 +45,49 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Fails the release unless ci.yml succeeded on the tagged commit, so
+  # that nothing is signed or published from code CI did not pass. With
+  # the merge queue, that is the merge tier's run on the commit the queue
+  # merged. It carries the same push and tag guard as the publishing
+  # jobs, so a workflow_dispatch dry run skips it and still builds. See
+  # docs/releasing.md for what to do when it fails, and
+  # https://github.com/shakenfist/actions/blob/main/docs/actions.md
+  # (the require-ci-success section) for how the gate works.
+  ci-gate:
+    name: Require CI success on the tagged commit
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: [self-hosted, static]
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Require CI success
+        uses: shakenfist/actions/require-ci-success@main
+        # A few API calls per commit, at most 21 commits, and up to
+        # five pages of the default branch's history.
+        timeout-minutes: 5
+        with:
+          workflows: |
+            ci.yml
+
+  # The root of the build graph: every other job needs this one, directly
+  # or through a job that does, so the gate sits upstream of all of them.
+  # A skipped ci-gate would otherwise skip this job too, so the guard lets
+  # a skipped gate through, but only on a run that publishes nothing. A
+  # tag push always runs the gate, and this job then needs its success. A
+  # workflow_dispatch skips the gate by design, and never reaches a
+  # publishing job. The ${{ }} wrapper is required: YAML reads a bare
+  # value starting with "!" as a tag.
+  #
   # The tag must name the version in [workspace.package], and Cargo.lock
   # must agree, since the build is --frozen. On a dispatch to a branch
   # there is no tag, and the script only checks the two files agree.
   check-version:
     name: Check the version matches the tag
+    needs: ci-gate
+    if: >-
+      ${{ !cancelled() && (needs.ci-gate.result == 'success' ||
+      (github.event_name != 'push' && needs.ci-gate.result == 'skipped')) }}
     runs-on: [self-hosted, static]
     timeout-minutes: 10
     permissions:
@@ -51,7 +98,18 @@ jobs:
           persist-credentials: false
 
       - name: Check the version
-        run: scripts/check-release-version.sh "${GITHUB_REF}"
+        run: tools/release-version.sh check "${GITHUB_REF}"
+
+  # ---------------------------------------------------------------------
+  # BEGIN repository build and publish jobs.
+  #
+  # andris's own jobs: build-wheels, which builds and checks the two
+  # wheels, and publish-pypi, which publishes them. build-wheels needs
+  # check-version and is in sign-tag's needs; its wheels are uploaded as
+  # release-* artifacts, which github-release attaches; and publish-pypi
+  # needs sign-tag and github-release, and carries the push and tag
+  # guard.
+  # ---------------------------------------------------------------------
 
   # Each wheel is built natively on a runner of its own architecture,
   # not under QEMU, by scripts/build-andris-wheel.sh, the script `make
@@ -60,6 +118,12 @@ jobs:
   # SIMD code went in. Then scripts/wheel-smoke.sh installs the wheel in
   # python:3-slim, which is pinned by a multi-architecture digest and so
   # runs on both, and runs it there with no libpulse and no network.
+  #
+  # check-dist then checks what each wheel holds, before it is uploaded,
+  # so that a wheel carrying a test directory, or nothing but its
+  # metadata, stops the release before anything is signed. andris's
+  # wheels hold only the andris binary, under andris-X.Y.Z.data/scripts/,
+  # and their dist-info.
   #
   # The cargo cache is deliberately not restored. A release builds from
   # a cold cache, downloading only what Cargo.lock names, so that nothing
@@ -90,78 +154,21 @@ jobs:
       - name: Build the wheel
         run: scripts/build-andris-wheel.sh ${{ matrix.arch }}
 
+      - name: Check the wheel contents
+        timeout-minutes: 2
+        uses: shakenfist/actions/check-dist@main
+        with:
+          path: target/wheels/
+
       - name: Smoke-test the wheel
         run: scripts/wheel-smoke.sh
 
       - name: Upload the wheel
         uses: actions/upload-artifact@v7
         with:
-          name: andris-wheel-${{ matrix.arch }}
+          name: release-wheel-${{ matrix.arch }}
           if-no-files-found: error
           path: target/wheels/*.whl
-
-  # Keyless Sigstore signing of the tag, gated on approval of the
-  # `release` environment. Every publishing job needs this one, so
-  # nothing is published until the operator approves, and it needs both
-  # builds, so the tag is never re-pushed while a build is running or
-  # after one has failed.
-  sign-tag:
-    name: Sign the release tag with Sigstore
-    needs: build-wheels
-    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
-    # audit-ok: github-hosted-runner -- ephemeral runner for tag signing; it installs gitsign with sudo and writes global git config, so it must be thrown away rather than the shared self-hosted pool
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    environment: release
-    permissions:
-      contents: write
-      id-token: write
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Sign and push the release tag
-        run: scripts/sign-release-tag.sh "${GITHUB_REF_NAME}" "${GITHUB_SHA}"
-
-  # The GitHub release carries the two wheels and their SHA256SUMS, and
-  # scripts/release-checksums.sh refuses anything else. The job checks
-  # out only scripts/, into src/, to run that script. That cleans src/
-  # alone, not the workspace around it, and on the persistent static
-  # pool the workspace holds whatever the last job left, so the wheels
-  # are downloaded into runner.temp, which is per job, where no stale
-  # file can join the release.
-  github-release:
-    name: Create the GitHub release
-    needs: [build-wheels, sign-tag]
-    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
-    runs-on: [self-hosted, static]
-    timeout-minutes: 15
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          path: src
-          sparse-checkout: scripts
-          persist-credentials: false
-
-      - name: Download the wheels
-        uses: actions/download-artifact@v8
-        with:
-          pattern: andris-wheel-*
-          path: ${{ runner.temp }}/dist/
-          merge-multiple: true
-
-      - name: Check the wheels and write SHA256SUMS
-        run: src/scripts/release-checksums.sh "${RUNNER_TEMP}/dist" "${GITHUB_REF_NAME#v}"
-
-      - name: Create the GitHub release
-        uses: softprops/action-gh-release@v3
-        with:
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          files: ${{ runner.temp }}/dist/*
 
   # Publishes both wheels to PyPI through a trusted publisher: GitHub's
   # OIDC token, no stored secret. PyPI matches the owner, repository,
@@ -177,7 +184,7 @@ jobs:
   publish-pypi:
     name: Publish the wheels to PyPI
     needs: [build-wheels, sign-tag, github-release]
-    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     # The vm pool's runners are VMs made for one job and then destroyed,
     # so no earlier job can have tampered with the one holding this
     # job's OIDC token; the static pool, which persists, never does this.
@@ -196,7 +203,7 @@ jobs:
       - name: Download the wheels
         uses: actions/download-artifact@v8
         with:
-          pattern: andris-wheel-*
+          pattern: release-wheel-*
           path: dist/
           merge-multiple: true
 
@@ -212,3 +219,70 @@ jobs:
         with:
           packages-dir: dist/
           skip-existing: true
+
+  # ---------------------------------------------------------------------
+  # END repository build and publish jobs.
+  # ---------------------------------------------------------------------
+
+  # Keyless Sigstore signing of the tag, gated on approval of the
+  # `release` environment. Every publishing job needs this one, so
+  # nothing is published until the operator approves, and it needs the
+  # wheel build, so the tag is never re-pushed while the build is running
+  # or after it has failed.
+  sign-tag:
+    name: Sign the release tag with Sigstore
+    needs: build-wheels
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    # audit-ok: github-hosted-runner -- ephemeral runner for tag signing; it installs gitsign with sudo and writes global git config, so it must be thrown away rather than the shared self-hosted pool
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Sign and push the release tag
+        run: tools/sign-release-tag.sh "${GITHUB_REF_NAME}" "${GITHUB_SHA}"
+
+  # The GitHub release carries the two wheels and their SHA256SUMS, and
+  # scripts/release-checksums.sh refuses anything else. The job checks
+  # out only scripts/, into src/, to run that script. That cleans src/
+  # alone, not the workspace around it, and on the persistent static
+  # pool the workspace holds whatever the last job left, so the wheels
+  # are downloaded into runner.temp, which is per job, where no stale
+  # file can join the release.
+  github-release:
+    name: Create the GitHub release
+    needs: [build-wheels, sign-tag]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: [self-hosted, static]
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: src
+          sparse-checkout: scripts
+          persist-credentials: false
+
+      - name: Download the wheels
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: ${{ runner.temp }}/dist/
+          merge-multiple: true
+
+      - name: Check the wheels and write SHA256SUMS
+        run: src/scripts/release-checksums.sh "${RUNNER_TEMP}/dist" "${GITHUB_REF_NAME#v}"
+
+      - name: Create the GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: ${{ runner.temp }}/dist/*

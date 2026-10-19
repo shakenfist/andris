@@ -100,6 +100,18 @@ expect fail 'no [workspace.package] table' refs/tags/v1.2.3 no-table 'no [worksp
 expect pass 'a branch, with files that agree' refs/heads/develop agree 'Not a release tag'
 expect pass 'a pull request ref, with files that agree' refs/pull/7/merge agree 'Not a release tag'
 
+# release-version.sh reads standard input when tag-release.sh pipes
+# `git show` into it. Fed more than a pipe buffer holds, an awk that
+# exited at the version would SIGPIPE the writer, and pipefail would fail
+# the pipeline with status 141.
+if VERSION_READ="$( { cat "${WORK}/agree/Cargo.toml"; awk 'BEGIN { for (i = 0; i < 200000; i++) print "# padding" }'; } \
+    | "${REPO_ROOT}/scripts/release-version.sh" -)" && [ "${VERSION_READ}" = 1.2.3 ]; then
+    echo 'ok: release-version.sh reads a long piped Cargo.toml without SIGPIPE'
+else
+    echo 'FAIL: release-version.sh on a long piped Cargo.toml' >&2
+    FAILURES=$((FAILURES + 1))
+fi
+
 if [ "${FAILURES}" -ne 0 ]; then
     echo "${FAILURES} check-release-version.sh case(s) failed" >&2
     exit 1

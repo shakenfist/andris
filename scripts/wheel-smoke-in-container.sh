@@ -118,8 +118,8 @@ timeout 30 "${ANDRIS}" --platform x11 --display :99 --ticket-file "${TICKET}" \
 WARNING='cannot load libpulse, so andris serves without sound'
 grep -q "${WARNING}" "${WORK}/x11.log" || fail "andris did not warn '${WARNING}'"
 grep -q 'exporting X display :99' "${WORK}/x11.log" || fail 'andris never tried to open the display'
-WARNED_AT="$(grep -n "${WARNING}" "${WORK}/x11.log" | head -1 | cut -d: -f1)"
-OPENED_AT="$(grep -n 'exporting X display :99' "${WORK}/x11.log" | head -1 | cut -d: -f1)"
+WARNED_AT="$(grep -n -m1 "${WARNING}" "${WORK}/x11.log" | cut -d: -f1)"
+OPENED_AT="$(grep -n -m1 'exporting X display :99' "${WORK}/x11.log" | cut -d: -f1)"
 [ "${WARNED_AT}" -lt "${OPENED_AT}" ] || fail 'andris warned about libpulse only after opening the display'
 if grep -q 'panicked' "${WORK}/x11.log"; then
     fail 'andris panicked'

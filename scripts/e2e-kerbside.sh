@@ -182,7 +182,9 @@ redact() {
             left=1
         fi
     done
-    if grep -rE -- '^password=|GENERATED ROOT PASSWORD: ' "$artifacts" | grep -qv REDACTED; then
+    # Not grep -q: under pipefail, its early exit could SIGPIPE the
+    # first grep and turn a found secret into a miss.
+    if grep -rE -- '^password=|GENERATED ROOT PASSWORD: ' "$artifacts" | grep -v REDACTED >/dev/null; then
         left=1
     fi
     if [ "$left" -ne 0 ]; then

@@ -57,8 +57,12 @@ fi
 # on develop's first-parent line to contain it.
 
 info "Finding the commit that landed release ${VERSION}"
+# awk reads all of git log's output rather than exiting at the match:
+# under pipefail, an early exit kills git log with SIGPIPE, and the whole
+# pipeline then fails with status 141.
 RELEASE_SHA="$(git log origin/develop --format='%H%x09%s' \
-    | awk -F '\t' -v want="Release ${VERSION}." '$2 == want { print $1; exit }')"
+    | awk -F '\t' -v want="Release ${VERSION}." \
+        '$2 == want && found == "" { found = $1 } END { if (found != "") print found }')"
 [[ -n "${RELEASE_SHA}" ]] \
     || err "no commit 'Release ${VERSION}.' on origin/develop. Has the release-${VERSION} pull request landed, as a merge commit? A squash merge renames it."
 TARGET_SHA=''

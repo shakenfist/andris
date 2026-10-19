@@ -129,9 +129,17 @@ jobs:
   # a cold cache, downloading only what Cargo.lock names, so that nothing
   # saved by an earlier run, on a pull request or elsewhere, goes into
   # what is published.
+  #
+  # The if: is needed for the workflow_dispatch dry run. A job with no
+  # if: of its own runs only if every job upstream of it succeeded, not
+  # just the ones it names in needs, so the skipped ci-gate would skip
+  # this job even though check-version ran. Testing check-version's
+  # result alone lets it run then, and on a tag push check-version
+  # succeeds only after the gate did.
   build-wheels:
     name: Build the wheel (${{ matrix.arch }})
     needs: check-version
+    if: ${{ !cancelled() && needs.check-version.result == 'success' }}
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 120
     permissions:

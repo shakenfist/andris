@@ -101,6 +101,12 @@ fixture no-lock-entry 1.2.3 1.2.3
 sed -i 's/^name = "andris"$/name = "not-andris"/' "${WORK}/no-lock-entry/Cargo.lock"
 fixture no-version 1.2.3 1.2.3
 sed -i '/^version = "1.2.3"$/d' "${WORK}/no-version/Cargo.toml"
+# A [package] table at the root, ahead of [workspace.package], with
+# another version: the workspace's version is still the release's.
+fixture root-package 1.2.3 1.2.3
+{ printf '[package]\nname = "andris-root"\nversion = "9.9.9"\n\n'; cat "${WORK}/root-package/Cargo.toml"; } \
+    > "${WORK}/root-package.toml"
+mv "${WORK}/root-package.toml" "${WORK}/root-package/Cargo.toml"
 
 expect pass 'a tag naming the version' refs/tags/v1.2.3 agree 'matches the version'
 expect fail 'a tag naming another version' refs/tags/v1.2.4 agree 'Version mismatch'
@@ -115,6 +121,8 @@ expect fail 'an empty version, in files that agree' refs/heads/develop empty \
 expect fail 'no andris entry in Cargo.lock' refs/heads/develop no-lock-entry 'Cargo.lock has andris <none>'
 expect fail 'no version in [workspace.package]' refs/tags/v1.2.3 no-version \
     'no [workspace.package] or [package] version'
+expect pass 'a root [package] beside [workspace.package]' refs/tags/v1.2.3 root-package 'matches the version'
+expect fail 'a tag naming the root [package] version' refs/tags/v9.9.9 root-package 'Version mismatch'
 expect pass 'a branch, with files that agree' refs/heads/develop agree 'Not a release tag'
 expect pass 'a pull request ref, with files that agree' refs/pull/7/merge agree 'Not a release tag'
 

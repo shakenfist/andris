@@ -101,6 +101,16 @@ This stops anyone but an administrator from creating, moving or
 deleting a release tag. Ryll's release tags are protected the same
 way.
 
+### The default branch
+
+The repository's default branch on GitHub must be `develop`, as it
+is today. The scripts do not name the branch: they ask `gh repo view`
+for the default branch, so `propose-release` branches from it and
+`tag-release` looks for the release commit on its first-parent
+history. The merge queue, its ruleset and the CI gate all work on
+`develop`, so if the default branch were changed to `main`, both
+scripts would follow it and stop matching what the queue merged.
+
 ### Host tools
 
 Both scripts run on the operator's host. Cargo runs only inside the

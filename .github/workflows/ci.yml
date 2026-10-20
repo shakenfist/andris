@@ -252,11 +252,16 @@ jobs:
   # better: on merge_group it is the per-attempt merge commit. So on
   # merge_group the key is the base branch, which every rebuild of every
   # entry shares. That is safe because the queue builds one entry at a
-  # time (max_entries_to_build: 1), so any other in-flight merge_group
-  # run is by definition superseded. The 'merge_group-' prefix keeps the
-  # key distinct from a workflow_dispatch run on develop, whose
-  # github.ref is refs/heads/develop. This is the fleet pattern from
-  # shakenfist/development's docs/audits/merge-group-cancellation.md.
+  # time (max_entries_to_build: 1), so any other first attempt of a
+  # merge_group run has already been abandoned. A re-run is not a queue
+  # build, though. It keeps its original event, so with the base-branch
+  # key a "Re-run jobs" on an old queue run, the release recovery in
+  # docs/releasing.md, would cancel the live queue entry or be cancelled
+  # by it. Re-runs therefore keep their own queue branch's group. The
+  # 'merge_group-' prefix keeps the key distinct from a workflow_dispatch
+  # run on develop, whose github.ref is refs/heads/develop. This is the
+  # fleet pattern from shakenfist/development's
+  # docs/audits/merge-group-cancellation.md.
   merge-build:
     name: Build and test the merge commit
     runs-on: [self-hosted, vm, debian-13-docker, l]
@@ -268,7 +273,7 @@ jobs:
     concurrency:
       group: >-
         ${{ github.workflow }}-merge-build-${{
-        github.event_name == 'merge_group'
+        github.event_name == 'merge_group' && github.run_attempt == '1'
         && format('merge_group-{0}', github.event.merge_group.base_ref)
         || github.ref }}
       cancel-in-progress: true
@@ -294,7 +299,7 @@ jobs:
   # entry this job saves must never be restored by a job that compiles
   # offline and trusts the cache as read-only input (see the action).
   #
-  # The concurrency group follows merge-build's, for the same reason.
+  # The concurrency group follows merge-build's, for the same reasons.
   e2e:
     name: End to end
     runs-on: [self-hosted, vm, debian-13-docker, l]
@@ -307,7 +312,7 @@ jobs:
     concurrency:
       group: >-
         ${{ github.workflow }}-e2e-${{
-        github.event_name == 'merge_group'
+        github.event_name == 'merge_group' && github.run_attempt == '1'
         && format('merge_group-{0}', github.event.merge_group.base_ref)
         || github.ref }}
       cancel-in-progress: true
@@ -338,7 +343,7 @@ jobs:
   # The script redacts the logs it collects, and removes them rather than
   # keep a secret in them, so the upload below never carries one.
   #
-  # The concurrency group follows merge-build's, for the same reason.
+  # The concurrency group follows merge-build's, for the same reasons.
   e2e-kerbside:
     name: Through kerbside
     runs-on: [self-hosted, vm, debian-13-docker, l]
@@ -351,7 +356,7 @@ jobs:
     concurrency:
       group: >-
         ${{ github.workflow }}-e2e-kerbside-${{
-        github.event_name == 'merge_group'
+        github.event_name == 'merge_group' && github.run_attempt == '1'
         && format('merge_group-{0}', github.event.merge_group.base_ref)
         || github.ref }}
       cancel-in-progress: true
@@ -396,7 +401,7 @@ jobs:
   # `cargo fetch` writes the cache with the network up but compiles
   # nothing, and the compile reads it read-only, offline.
   #
-  # The concurrency group follows merge-build's, for the same reason.
+  # The concurrency group follows merge-build's, for the same reasons.
   wheel:
     name: Build the wheel
     runs-on: [self-hosted, vm, debian-13-docker, l]
@@ -409,7 +414,7 @@ jobs:
     concurrency:
       group: >-
         ${{ github.workflow }}-wheel-${{
-        github.event_name == 'merge_group'
+        github.event_name == 'merge_group' && github.run_attempt == '1'
         && format('merge_group-{0}', github.event.merge_group.base_ref)
         || github.ref }}
       cancel-in-progress: true

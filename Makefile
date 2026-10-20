@@ -167,8 +167,8 @@ help:
 	@echo "  make e2e-xrdp               - Run andris against a real xrdp session, in a container"
 	@echo "  make e2e-kerbside           - Run the end-to-end checks through kerbside's demo stack"
 	@echo "  make wheel [ARCH=x86_64]    - Build the manylinux_2_28 wheel for PyPI into target/wheels"
-	@echo "  make propose-release X.Y.Z  - Branch, bump the version, test and push for review"
-	@echo "  make tag-release X.Y.Z      - After the release PR lands: tag develop, start the release"
+	@echo "  make propose-release X.Y.Z  - Branch, bump the version, test and open a release PR"
+	@echo "  make tag-release X.Y.Z      - After the release PR merges: tag it, start the release"
 	@echo "  make lint                   - Run rustfmt and clippy checks"
 	@echo "  make lint-fix               - Run rustfmt and clippy with auto-fix"
 	@echo "  make clean                  - Remove build artifacts"
@@ -341,12 +341,14 @@ wheel:
 	CARGO_CACHE="$(CARGO_CACHE_DIR)" scripts/build-andris-wheel.sh $(ARCH)
 
 # A release is two stages; see docs/releasing.md. First, `make
-# propose-release X.Y.Z` runs scripts/propose-release.sh, which creates a
+# propose-release X.Y.Z` runs tools/propose-release.sh, which creates a
 # release-X.Y.Z branch off develop, bumps the version (refreshing
-# Cargo.lock through `make lock`), tests, and pushes the branch for a pull
-# request. Then, once that pull request has landed, `make tag-release
-# X.Y.Z` runs scripts/tag-release.sh, which tags the merged commit and
-# pushes the tag, starting .github/workflows/release.yml.
+# Cargo.lock through `make lock`), tests, pushes the branch and opens a
+# pull request. Then, once that pull request has merged through the
+# queue, `make tag-release X.Y.Z` runs tools/tag-release.sh, which tags
+# the merged commit and pushes the tag, starting
+# .github/workflows/release.yml. To tag a later commit instead, run
+# tools/tag-release.sh X.Y.Z COMMIT directly.
 #
 # The version is the second word on the command line. The rule below
 # absorbs it as a do-nothing target, so make does not complain that it
@@ -358,13 +360,13 @@ propose-release:
 	@if [ -z "$(RELEASE_VERSION)" ]; then \
 		echo "usage: make propose-release X.Y.Z" >&2; exit 1; \
 	fi
-	scripts/propose-release.sh $(RELEASE_VERSION)
+	tools/propose-release.sh $(RELEASE_VERSION)
 
 tag-release:
 	@if [ -z "$(RELEASE_VERSION)" ]; then \
 		echo "usage: make tag-release X.Y.Z" >&2; exit 1; \
 	fi
-	scripts/tag-release.sh $(RELEASE_VERSION)
+	tools/tag-release.sh $(RELEASE_VERSION)
 
 ifneq ($(and $(RELEASE_VERSION),$(filter propose-release tag-release,$(MAKECMDGOALS))),)
 $(RELEASE_VERSION):

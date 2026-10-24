@@ -22,9 +22,9 @@
 //! back from the client that just took it. Only once both are written do
 //! the session's other channels close, so the client hears why before it
 //! sees any channel go. Until then they carry on, but the inputs channel
-//! no longer passes the client's input to the desktop. A session that ends any other
-//! way, such as andris shutting down, closes without either message, so
-//! a client still reconnects after a restart.
+//! no longer passes the client's input to the desktop. A session that
+//! ends any other way, such as andris shutting down, closes without
+//! either message, so a client still reconnects after a restart.
 //!
 //! # Metrics
 //!

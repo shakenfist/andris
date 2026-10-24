@@ -310,6 +310,24 @@ async fn a_replaced_client_that_lingers_is_dropped_after_the_farewell() {
     );
 }
 
+/// A shutdown ends a replaced session still saying goodbye at once, as
+/// it does the current one: it does not wait out the farewell's time.
+#[tokio::test]
+async fn a_shutdown_ends_a_replaced_session_at_once() {
+    let server = TestServer::start().await;
+    let (mut old_main, _old_inputs) = open_session(&server).await;
+    let old = server.handle.session().unwrap();
+
+    let (_new_main, _) = server.open_main().await;
+    expect_farewell(&mut old_main).await;
+    server.handle.shutdown();
+    assert!(old.is_cancelled(), "the shutdown left the old session");
+    assert!(
+        closed_within(old_main.stream_mut(), FAREWELL_TIMEOUT / 4).await,
+        "the old main channel waited out the farewell"
+    );
+}
+
 /// A session that ends for any reason but a replacement, here andris
 /// shutting down, closes without a farewell, so the client still
 /// reconnects by itself.

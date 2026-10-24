@@ -49,8 +49,10 @@
 //!
 //! When a new client replaces the session, the channel stays open until
 //! the main channel has told the client why (see `server::main_channel`),
-//! but from that moment it drops whatever the client sends: the desktop
-//! is the new client's.
+//! but the desktop is the new client's from that moment. So the channel
+//! releases what the old client holds at once, rather than when it
+//! closes, which could lift a key the new client has since pressed, and
+//! drops whatever the old client sends after.
 
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
@@ -103,14 +105,28 @@ pub async fn run(ctx: ChannelContext, mut conn: ChannelConn<InputsOpcode>) -> Re
         logged: HashSet::new(),
         ctx,
     };
-    while let Some(message) = conn.recv().await? {
-        if inputs.ctx.session.is_replaced() {
-            continue;
-        }
-        if inputs.handle(&mut conn, &message).await? {
-            conn.send(InputsOpcode::MouseMotionAck, &[]).await?;
+    let session = inputs.ctx.session.clone();
+    loop {
+        tokio::select! {
+            biased;
+            () = session.replaced() => break,
+            message = conn.recv() => {
+                let Some(message) = message? else {
+                    return Ok(());
+                };
+                if session.is_replaced() {
+                    break;
+                }
+                if inputs.handle(&mut conn, &message).await? {
+                    conn.send(InputsOpcode::MouseMotionAck, &[]).await?;
+                }
+            }
         }
     }
+    // Replaced: release what the old client holds, then read and drop
+    // what it sends until the channel closes.
+    drop(inputs);
+    while conn.recv().await?.is_some() {}
     Ok(())
 }
 
@@ -490,7 +506,7 @@ mod tests {
 
     /// From the moment a new client replaces the session, what the old
     /// client sends no longer reaches the desktop, though the channel is
-    /// still open. What it already holds is still released.
+    /// still open, and what it already holds is released at once.
     #[tokio::test]
     async fn a_replaced_sessions_input_is_dropped() {
         let platform = SyntheticPlatform::new(Size {
@@ -536,6 +552,16 @@ mod tests {
         .unwrap();
 
         registry.begin("192.0.2.2:5900".parse().unwrap()).unwrap();
+        // Released input is queued, so it lands a moment later.
+        tokio::time::timeout(WAIT, async {
+            while platform.input_events().unwrap().len() < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the old client's key was not released at the replacement");
+        assert!(!task.is_finished(), "the channel closed at the replacement");
+
         client.write_all(&key_down(0x30)).await.unwrap();
         drop(client);
         tokio::time::timeout(WAIT, task)
@@ -543,14 +569,6 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        // Released input is queued, so it may land after the task ends.
-        tokio::time::timeout(WAIT, async {
-            while platform.input_events().unwrap().len() < 2 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
             platform.take_input_events().unwrap(),

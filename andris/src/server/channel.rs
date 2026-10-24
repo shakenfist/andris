@@ -330,13 +330,22 @@ impl<O: ServerOpcode> ChannelConn<O> {
     /// the connection, and a reset can discard what andris last sent
     /// before the client has read it. Not cancel-safe, and it waits as
     /// long as the client keeps the channel open, so the caller bounds it.
+    ///
+    /// What the client sends meanwhile is thrown away unparsed, so even a
+    /// malformed message cannot make the close an error, and an error
+    /// reading means only that the client has gone.
     pub async fn close(&mut self) -> Result<()> {
         self.stream
             .shutdown()
             .await
             .with_context(|| format!("closing the {} channel", O::CHANNEL.name()))?;
-        while self.recv().await?.is_some() {}
-        Ok(())
+        let mut discard = [0u8; 4096];
+        loop {
+            match self.stream.read(&mut discard).await {
+                Ok(0) | Err(_) => return Ok(()),
+                Ok(_) => {}
+            }
+        }
     }
 
     /// Log, once per opcode, that a message was read and ignored.
@@ -560,7 +569,8 @@ mod tests {
 
     /// `close` ends andris's side at once, so the client reads what was
     /// sent and then end of file. It discards what the client sends
-    /// meanwhile, and returns only once the client closes its side.
+    /// meanwhile, even a message too large to accept, and returns only
+    /// once the client closes its side.
     #[tokio::test]
     async fn close_waits_for_the_client_to_close() {
         let (mut conn, mut client) = pair::<MainOpcode>();
@@ -579,6 +589,7 @@ mod tests {
         assert_eq!(read, 0, "andris's side is not closed");
 
         client_send(&mut client, 999, b"discarded").await;
+        client_send(&mut client, 999, &vec![0; MainOpcode::MAX_CLIENT_BODY + 1]).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
             !closing.is_finished(),

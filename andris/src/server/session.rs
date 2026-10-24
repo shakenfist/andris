@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
@@ -324,6 +324,9 @@ impl Drop for ChannelClaim {
 #[derive(Debug, Default)]
 struct RegistryState {
     current: Option<Arc<Session>>,
+    /// Sessions replaced and not yet ended: each lives on while its main
+    /// channel says goodbye, and a shutdown must end those too.
+    replaced: Vec<Weak<Session>>,
     closed: bool,
 }
 
@@ -371,6 +374,8 @@ impl SessionRegistry {
                 "a new client replaces the current session"
             );
             old.replace(peer);
+            state.replaced.retain(|s| s.strong_count() > 0);
+            state.replaced.push(Arc::downgrade(&old));
         } else {
             info!(session = id, %peer, "session begins");
         }
@@ -405,11 +410,15 @@ impl SessionRegistry {
         }
     }
 
-    /// Cancel the current session and refuse new ones.
+    /// Cancel the current session, and any replaced one still saying
+    /// goodbye, and refuse new ones.
     pub fn close(&self) {
         let mut state = self.state();
         state.closed = true;
         if let Some(session) = state.current.take() {
+            session.cancel();
+        }
+        for session in state.replaced.drain(..).filter_map(|s| s.upgrade()) {
             session.cancel();
         }
     }
@@ -509,6 +518,33 @@ mod tests {
         assert!(session.is_cancelled());
         assert!(registry.begin(peer(1)).is_err());
         assert_eq!(registry.current_id(), None);
+    }
+
+    /// A replaced session lives on while it says goodbye, out of the
+    /// registry's sight; a shutdown must still end it at once.
+    #[test]
+    fn close_cancels_replaced_sessions_too() {
+        let registry = SessionRegistry::new();
+        let first = registry.begin(peer(1)).unwrap();
+        let second = registry.begin(peer(2)).unwrap();
+        let third = registry.begin(peer(3)).unwrap();
+        assert!(!first.is_cancelled() && !second.is_cancelled());
+        registry.close();
+        assert!(first.is_cancelled());
+        assert!(second.is_cancelled());
+        assert!(third.is_cancelled());
+    }
+
+    /// The registry does not keep sessions that have ended.
+    #[test]
+    fn ended_replaced_sessions_are_forgotten() {
+        let registry = SessionRegistry::new();
+        let first = registry.begin(peer(1)).unwrap();
+        registry.begin(peer(2)).unwrap();
+        registry.end(&first);
+        drop(first);
+        registry.begin(peer(3)).unwrap();
+        assert_eq!(registry.state().replaced.len(), 1);
     }
 
     #[test]

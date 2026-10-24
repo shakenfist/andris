@@ -228,20 +228,24 @@ link message does. Every later step has a 10 second limit.
 
 Andris serves one client at a time. A client that authenticates
 replaces the one before it. The replaced client is told why on its
-main channel before andris closes it: first a `NOTIFY` (severity
-warn, visibility high) whose text says which address took the
-session over, then `DISCONNECTING` with reason `SPICE_LINK_ERR_OK`.
-spice-server never sends `DISCONNECTING`, so a client can read it as
-"andris ended this session on purpose; do not reconnect by
-yourself". Otherwise an auto-reconnecting client takes the desktop
-straight back from the client that has just taken it, and the two
-fight over it. The old session's channels all close once the
-replaced client closes its main channel, or 2 seconds after the
-replacement if it does not. A session that ends for any other
-reason, such as andris shutting down, closes without either
-message, so a client still reconnects after a restart. The log line
-for a replacement gives both clients' addresses, and the old
-session's `session ends` line says which address replaced it.
+main channel: first a `NOTIFY` (severity warn, visibility high)
+whose text gives the IP address that took the session over, then
+`DISCONNECTING` with reason `SPICE_LINK_ERR_OK`. spice-server never
+sends `DISCONNECTING`, so a client can read it as "andris ended this
+session on purpose; do not reconnect by yourself". Otherwise an
+auto-reconnecting client takes the desktop straight back from the
+client that has just taken it, and the two fight over it.
+
+From the moment of the replacement, the old client's input no longer
+reaches the desktop. Its other channels close as soon as the two
+messages are written, so the client hears why before it sees any
+channel go. Its main channel closes once the client closes it, or 2
+seconds after the replacement if it does not. A session that ends
+for any other reason, such as andris shutting down, closes without
+either message, so a client still reconnects after a restart. The
+log line for a replacement gives both clients' addresses and ports,
+and the old session's `session ends` line says which address
+replaced it.
 
 A session has at most one channel of each type: a new link of a type
 the session already has replaces, and closes, the old channel.

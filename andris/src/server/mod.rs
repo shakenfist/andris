@@ -622,6 +622,11 @@ async fn run_channel(stream: SpiceStream, linked: Linked, shared: &Shared) {
             channel = channel.name(),
             "a later link replaced this channel; closing it"
         ),
+        () = session.secondary_channels_closed(), if channel != ServedChannel::Main => debug!(
+            session = session.id(),
+            channel = channel.name(),
+            "the session was replaced; closing the channel"
+        ),
         () = serve_channel(stream, linked, shared) => {}
     }
 }
@@ -653,7 +658,7 @@ async fn serve_channel(stream: SpiceStream, linked: Linked, shared: &Shared) {
                 () = drive(ctx, conn, main_channel::run) => {}
                 () = overdue => info!(
                     session = session.id(),
-                    "the replaced client did not close its main channel in time; ending the session"
+                    "the replaced client did not close in time; ending its session"
                 ),
             }
         }

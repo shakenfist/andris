@@ -519,7 +519,7 @@ impl<O: AckedOpcode> ChannelConn<O> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::opcodes::{CursorOpcode, DisplayOpcode, InputsOpcode};
+    use crate::server::opcodes::{CursorOpcode, DisplayOpcode, InputsOpcode, MainOpcode};
     use crate::server::session::SessionRegistry;
     use shakenfist_spice_protocol::display_client;
     use shakenfist_spice_protocol::messages::MessageHeader;
@@ -556,6 +556,41 @@ mod tests {
         let mut body = vec![0; header.message_size as usize];
         client.read_exact(&mut body).await.unwrap();
         (header.message_type, body)
+    }
+
+    /// `close` ends andris's side at once, so the client reads what was
+    /// sent and then end of file. It discards what the client sends
+    /// meanwhile, and returns only once the client closes its side.
+    #[tokio::test]
+    async fn close_waits_for_the_client_to_close() {
+        let (mut conn, mut client) = pair::<MainOpcode>();
+        conn.send(MainOpcode::Ping, b"last").await.unwrap();
+        let closing = tokio::spawn(async move { conn.close().await });
+
+        assert_eq!(
+            client_recv(&mut client).await,
+            (MainOpcode::Ping.code(), b"last".to_vec())
+        );
+        let mut rest = [0u8; 1];
+        let read = tokio::time::timeout(WAIT, client.read(&mut rest))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read, 0, "andris's side is not closed");
+
+        client_send(&mut client, 999, b"discarded").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !closing.is_finished(),
+            "close returned before the client closed"
+        );
+
+        drop(client);
+        tokio::time::timeout(WAIT, closing)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[test]

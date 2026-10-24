@@ -19,7 +19,10 @@
 //! `SPICE_LINK_ERR_OK`. spice-server never sends `DISCONNECTING`, so it
 //! means only this: andris ended the session on purpose, and the client
 //! should not reconnect by itself, which would take the desktop straight
-//! back from the client that just took it. A session that ends any other
+//! back from the client that just took it. Only once both are written do
+//! the session's other channels close, so the client hears why before it
+//! sees any channel go. Until then they carry on, but the inputs channel
+//! no longer passes the client's input to the desktop. A session that ends any other
 //! way, such as andris shutting down, closes without either message, so
 //! a client still reconnects after a restart.
 //!
@@ -165,6 +168,10 @@ pub async fn serve_reporting(
 
     loop {
         tokio::select! {
+            // The client's messages and the desktop's clipboard are no
+            // longer this client's business once it is replaced, and an arm
+            // may be picked in the same poll in which that happens, so
+            // those arms check again.
             () = session.replaced() => {
                 return farewell(&mut conn, &session).await;
             }
@@ -172,6 +179,9 @@ pub async fn serve_reporting(
                 let Some(message) = message? else {
                     return Ok(());
                 };
+                if session.is_replaced() {
+                    return farewell(&mut conn, &session).await;
+                }
                 match message.header.message_type {
                     main_client::ATTACH_CHANNELS => {
                         let list = ChannelsList {
@@ -215,6 +225,9 @@ pub async fn serve_reporting(
                 agent.return_tokens(&mut conn).await?;
             }
             () = agent.desktop_clipboard_changed() => {
+                if session.is_replaced() {
+                    return farewell(&mut conn, &session).await;
+                }
                 agent.desktop_clipboard(&mut conn).await?;
             }
             _ = reports.tick() => {
@@ -247,18 +260,20 @@ async fn farewell(conn: &mut ChannelConn<MainOpcode>, session: &Session) -> Resu
     };
     conn.send_msg(MainOpcode::Disconnecting, &disconnecting)
         .await?;
+    session.close_secondary_channels();
     conn.close().await
 }
 
 /// The `NOTIFY` that tells a client another, from `by`, has taken its
-/// session over.
+/// session over. It names only the address, not the port: andris's log
+/// has both.
 fn replaced_notify(timestamp: u64, by: SocketAddr) -> Notify {
     Notify {
         timestamp,
         severity: NotifySeverity::Warn as u32,
         visibility: SpiceVisibility::High as u32,
         what: SPICE_WARN_GENERAL,
-        message: format!("another client ({by}) took over this session").into_bytes(),
+        message: format!("another client ({}) took over this session", by.ip()).into_bytes(),
     }
 }
 
@@ -279,8 +294,9 @@ async fn send_ping(
 
 #[cfg(test)]
 mod tests {
-    use shakenfist_spice_protocol::messages::ReceiveBuffer;
-    use tokio::io::AsyncReadExt;
+    use shakenfist_spice_protocol::messages::{ReceiveBuffer, ReceivedMessage, make_message};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+    use tokio::task::JoinHandle;
 
     use super::*;
     use crate::platform::Size;
@@ -355,5 +371,146 @@ mod tests {
         }
         assert_eq!(ping_ids, vec![1, 2, 3, 4]);
         task.abort();
+    }
+
+    const WAIT: Duration = Duration::from_secs(10);
+
+    /// A main channel served over a pipe that holds `capacity` bytes.
+    struct Served {
+        _platform: Arc<SyntheticPlatform>,
+        registry: SessionRegistry,
+        session: Arc<Session>,
+        client: DuplexStream,
+        buf: ReceiveBuffer,
+        task: JoinHandle<Result<()>>,
+    }
+
+    impl Served {
+        fn start(capacity: usize) -> Self {
+            let platform = SyntheticPlatform::new(Size {
+                width: 16,
+                height: 16,
+            })
+            .unwrap();
+            let registry = SessionRegistry::new();
+            let session = registry.begin("192.0.2.1:5900".parse().unwrap()).unwrap();
+            let ctx = ChannelContext {
+                session: session.clone(),
+                platform: platform.platform(),
+                caps: ClientCaps::default(),
+                channel_id: 0,
+                display: DisplayOptions::default(),
+            };
+            let (server_end, client) = tokio::io::duplex(capacity);
+            let conn = ChannelConn::<MainOpcode>::new(server_end, session.clone());
+            let task = tokio::spawn(serve(ctx, conn, Duration::from_secs(3600)));
+            Self {
+                _platform: platform,
+                registry,
+                session,
+                client,
+                buf: ReceiveBuffer::new(),
+                task,
+            }
+        }
+
+        async fn recv(&mut self) -> ReceivedMessage {
+            loop {
+                if let Some(message) = self.buf.take_message(1 << 20).unwrap() {
+                    return message;
+                }
+                let mut chunk = [0u8; 4096];
+                let read = tokio::time::timeout(WAIT, self.client.read(&mut chunk))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(read > 0, "the channel closed");
+                self.buf.extend_from_slice(&chunk[..read]);
+            }
+        }
+
+        /// Read `INIT` and the first `PING`.
+        async fn skip_opening(&mut self) {
+            assert_eq!(
+                self.recv().await.header.message_type,
+                MainOpcode::Init.code()
+            );
+            assert_eq!(
+                self.recv().await.header.message_type,
+                MainOpcode::Ping.code()
+            );
+        }
+
+        fn replace(&self) {
+            self.registry
+                .begin("192.0.2.2:5900".parse().unwrap())
+                .unwrap();
+        }
+
+        async fn secondary_closed_within(&self, wait: Duration) -> bool {
+            tokio::time::timeout(wait, self.session.secondary_channels_closed())
+                .await
+                .is_ok()
+        }
+    }
+
+    /// The other channels close only once the goodbye is written: a pipe
+    /// too small for a whole message holds each write until the client
+    /// reads it, and until then the other channels stay open.
+    #[tokio::test]
+    async fn other_channels_close_only_after_the_farewell_is_written() {
+        let mut served = Served::start(16);
+        served.skip_opening().await;
+        served.replace();
+        let pause = Duration::from_millis(50);
+        assert!(
+            !served.secondary_closed_within(pause).await,
+            "closed before NOTIFY"
+        );
+        assert_eq!(
+            served.recv().await.header.message_type,
+            MainOpcode::Notify.code()
+        );
+        assert!(
+            !served.secondary_closed_within(pause).await,
+            "closed before DISCONNECTING"
+        );
+        assert_eq!(
+            served.recv().await.header.message_type,
+            MainOpcode::Disconnecting.code()
+        );
+        assert!(served.secondary_closed_within(WAIT).await);
+        drop(served.client);
+        tokio::time::timeout(WAIT, served.task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    /// A message already waiting when the session is replaced is not
+    /// acted on, though the channel's select may pick it in the same poll
+    /// as the replacement. Repeated, since that pick is random.
+    #[tokio::test]
+    async fn a_message_waiting_at_the_replacement_is_not_acted_on() {
+        let mut body = Vec::new();
+        MouseModeRequest {
+            mode: MOUSE_MODE_SERVER as u16,
+        }
+        .write(&mut body);
+        let request = make_message(main_client::MOUSE_MODE_REQUEST, &body);
+        for _ in 0..32 {
+            let mut served = Served::start(64 * 1024);
+            served.skip_opening().await;
+            // Neither the write nor the replacement yields, so the channel
+            // finds both ready when it next runs.
+            served.client.write_all(&request).await.unwrap();
+            served.replace();
+            assert_eq!(
+                served.recv().await.header.message_type,
+                MainOpcode::Notify.code()
+            );
+            assert_eq!(*served.session.mouse_mode().borrow(), MouseMode::Client);
+        }
     }
 }

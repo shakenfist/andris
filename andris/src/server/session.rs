@@ -10,7 +10,9 @@
 //! network fault and takes the session straight back. So
 //! [`SessionRegistry::begin`] only marks the old session replaced, its
 //! main channel tells the client why (see [`Session::replaced`]), and the
-//! session ends when that channel does.
+//! session ends when that channel does. Its other channels close as soon
+//! as the goodbye is written, and its inputs reach the desktop no more
+//! from the moment it is replaced.
 //!
 //! A session holds at most one channel of each type. A new link of a
 //! type the session already has replaces the old channel: claiming the
@@ -130,6 +132,8 @@ pub struct Session {
     cancel: Cancel,
     /// Fired once a new client replaces this session.
     replaced: Cancel,
+    /// Fired to close every channel but main.
+    secondary_closed: Cancel,
     /// The address of the client that replaced this session.
     replaced_by: OnceLock<SocketAddr>,
     /// The channel serving each type, by its claim's cancel signal.
@@ -146,6 +150,7 @@ impl Session {
             mouse_mode: watch::Sender::new(MouseMode::Client),
             cancel: Cancel::new(),
             replaced: Cancel::new(),
+            secondary_closed: Cancel::new(),
             replaced_by: OnceLock::new(),
             channels: Mutex::new(HashMap::new()),
             stats: Stats::default(),
@@ -246,6 +251,13 @@ impl Session {
         self.replaced.cancel();
     }
 
+    /// Whether a new client has replaced this session. Its inputs
+    /// channel checks this, so the replaced client's input does not reach
+    /// the desktop the new client now has.
+    pub fn is_replaced(&self) -> bool {
+        self.replaced.is_cancelled()
+    }
+
     /// The address of the client that replaced this session, if one has.
     pub fn replaced_by(&self) -> Option<SocketAddr> {
         self.replaced_by.get().copied()
@@ -259,6 +271,20 @@ impl Session {
     /// ends it regardless if that takes too long.
     pub async fn replaced(&self) {
         self.replaced.cancelled().await
+    }
+
+    /// Close every channel of the session but main, which carries on
+    /// alone. A replaced session's main channel calls this once its
+    /// goodbye is written: a client that saw another channel close first
+    /// could take that for a fault and reconnect.
+    pub fn close_secondary_channels(&self) {
+        self.secondary_closed.cancel();
+    }
+
+    /// Return once [`Session::close_secondary_channels`] has been called.
+    /// Cancel-safe.
+    pub async fn secondary_channels_closed(&self) {
+        self.secondary_closed.cancelled().await
     }
 }
 
@@ -432,8 +458,10 @@ mod tests {
         let second = registry.begin(peer(2)).unwrap();
         assert_ne!(second.id(), first.id());
         assert_eq!(first.replaced_by(), Some(peer(2)));
+        assert!(first.is_replaced());
         assert!(!first.is_cancelled());
         assert_eq!(second.replaced_by(), None);
+        assert!(!second.is_replaced());
         assert!(!second.is_cancelled());
         assert!(registry.lookup(first.id()).is_none());
         assert!(registry.lookup(second.id()).is_some());

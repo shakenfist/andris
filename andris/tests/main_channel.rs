@@ -1,5 +1,6 @@
-//! The main channel: its opening messages, the channel list, and the
-//! mouse mode, against an in-process andris on the synthetic platform.
+//! The main channel: its opening messages, the channel list, the mouse
+//! mode, and what a replaced client is told, against an in-process andris
+//! on the synthetic platform.
 
 // Test helpers, where a failed unwrap is a failed test. clippy's
 // allow-unwrap-in-tests covers only #[test] functions themselves.
@@ -7,16 +8,20 @@
 
 mod support;
 
+use std::time::Duration;
+
+use andris::server::main_channel::FAREWELL_TIMEOUT;
 use andris::server::session::MouseMode;
 use shakenfist_spice_protocol::messages::{
-    ChannelEntry, ChannelsList, MainInit, MainMouseMode, MouseModeRequest, Ping, Pong,
-    ReceivedMessage, WireType,
+    ChannelEntry, ChannelsList, Disconnecting, MainInit, MainMouseMode, MouseModeRequest, Notify,
+    Ping, Pong, ReceivedMessage, WireType,
 };
 use shakenfist_spice_protocol::{
-    ChannelType, MOUSE_MODE_CLIENT, MOUSE_MODE_SERVER, main_client, main_server,
+    ChannelType, MOUSE_MODE_CLIENT, MOUSE_MODE_SERVER, NotifySeverity, SpiceError, SpiceVisibility,
+    inputs_server, main_client, main_server,
 };
 
-use support::{TestClient, TestServer, wait_until};
+use support::{TestClient, TestServer, closed_within, wait_until};
 
 fn body<T: WireType>(message: &T) -> Vec<u8> {
     let mut out = Vec::new();
@@ -197,4 +202,81 @@ async fn the_ping_round_trip_is_recorded() {
     assert_eq!(stats.ping.mean(), stats.ping.latest());
     // The main channel's own writes (INIT and PING) are counted.
     assert!(stats.main_bytes > 0);
+}
+
+/// A client's main channel past its opening, and its inputs channel past
+/// `INIT`: an inputs channel closes only when its session ends.
+async fn open_session(server: &TestServer) -> (TestClient, TestClient) {
+    let (mut main, session) = server.open_main().await;
+    skip_opening(&mut main).await;
+    let mut inputs = server.open(session, ChannelType::Inputs).await;
+    let init = inputs.recv().await;
+    assert_eq!(init.header.message_type, inputs_server::INIT);
+    (main, inputs)
+}
+
+/// Read the farewell a replaced client is sent: a `NOTIFY` that says who
+/// took over, then `DISCONNECTING` with reason `OK`.
+async fn expect_farewell(main: &mut TestClient) {
+    let message = main.recv().await;
+    assert_eq!(message.header.message_type, main_server::NOTIFY);
+    let notify = Notify::decode(message.payload()).unwrap();
+    assert_eq!(notify.severity_kind(), NotifySeverity::Warn);
+    assert_eq!(notify.visibility_kind(), Some(SpiceVisibility::High));
+    let text = notify.message_text();
+    assert!(
+        text.starts_with("another client (127.0.0.1:")
+            && text.ends_with(") took over this session"),
+        "the notify does not say who took over: {text}"
+    );
+
+    let message = main.recv().await;
+    assert_eq!(message.header.message_type, main_server::DISCONNECTING);
+    let disconnecting = Disconnecting::decode(message.payload()).unwrap();
+    assert_eq!(disconnecting.reason_kind(), SpiceError::Ok);
+}
+
+/// A replaced client is told why, then its main channel is closed, and
+/// its session ends as soon as the client closes it in turn: well within
+/// the farewell's time limit.
+#[tokio::test]
+async fn a_replaced_client_is_told_why_before_its_session_ends() {
+    let server = TestServer::start().await;
+    let (mut old_main, mut old_inputs) = open_session(&server).await;
+    let old = server.session_id();
+
+    let (_new_main, new) = server.open_main().await;
+    assert_ne!(new, old);
+    expect_farewell(&mut old_main).await;
+    old_main.expect_closed().await;
+    assert!(
+        !closed_within(old_inputs.stream_mut(), Duration::from_millis(200)).await,
+        "the old session ended before its client closed the main channel"
+    );
+
+    drop(old_main);
+    assert!(
+        closed_within(old_inputs.stream_mut(), FAREWELL_TIMEOUT / 2).await,
+        "the old session outlived its main channel"
+    );
+    assert_eq!(server.session_id(), new);
+}
+
+/// A replaced client that keeps its main channel open after the farewell
+/// does not keep the old session: it ends once the farewell's time is up.
+#[tokio::test]
+async fn a_replaced_client_that_lingers_is_dropped_after_the_farewell() {
+    let server = TestServer::start().await;
+    let (mut old_main, mut old_inputs) = open_session(&server).await;
+
+    let (_new_main, _) = server.open_main().await;
+    expect_farewell(&mut old_main).await;
+    assert!(
+        !closed_within(old_inputs.stream_mut(), FAREWELL_TIMEOUT / 4).await,
+        "the old session ended before the farewell's time was up"
+    );
+    assert!(
+        closed_within(old_inputs.stream_mut(), FAREWELL_TIMEOUT * 2).await,
+        "the old session outlived the farewell's time limit"
+    );
 }

@@ -11,6 +11,18 @@
 //!
 //! [`agent`]: super::agent
 //!
+//! # A replaced session
+//!
+//! When a new client replaces the session, the main channel says goodbye
+//! before it closes (see [`farewell`]): a `NOTIFY` whose text names the
+//! client that took over, then `DISCONNECTING` with reason
+//! `SPICE_LINK_ERR_OK`. spice-server never sends `DISCONNECTING`, so it
+//! means only this: andris ended the session on purpose, and the client
+//! should not reconnect by itself, which would take the desktop straight
+//! back from the client that just took it. A session that ends any other
+//! way, such as andris shutting down, closes without either message, so
+//! a client still reconnects after a restart.
+//!
 //! # Metrics
 //!
 //! This channel also reports the session's metrics (see [`stats`]). Its
@@ -23,14 +35,19 @@
 //!
 //! [`stats`]: super::stats
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use shakenfist_spice_protocol::messages::{
-    ChannelEntry, ChannelsList, MainInit, MainMouseMode, MouseModeRequest, Ping, WireType,
+    ChannelEntry, ChannelsList, Disconnecting, MainInit, MainMouseMode, MouseModeRequest, Notify,
+    Ping, WireType,
 };
-use shakenfist_spice_protocol::{ChannelType, MOUSE_MODE_CLIENT, MOUSE_MODE_SERVER, main_client};
+use shakenfist_spice_protocol::{
+    ChannelType, MOUSE_MODE_CLIENT, MOUSE_MODE_SERVER, NotifySeverity, SpiceError, SpiceVisibility,
+    main_client,
+};
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, info};
 
@@ -42,6 +59,15 @@ use super::stats::{Reporter, STATS_INTERVAL};
 
 /// How often the main channel pings the client.
 pub const PING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long a replaced session's main channel has to say goodbye and
+/// close, before the server ends the session regardless.
+pub const FAREWELL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// `SPICE_WARN_GENERAL` (spice-protocol's `spice/enums.h`), the only
+/// warning code SPICE defines: a `NOTIFY`'s `what` when its severity is
+/// warn.
+const SPICE_WARN_GENERAL: u32 = 0;
 
 /// The channels `CHANNELS_LIST` offers, in order, when the platform has
 /// audio; without it, [`ChannelType::Playback`] is left out (see
@@ -83,6 +109,7 @@ impl Drop for SessionSummary {
         let elapsed = self.0.elapsed();
         info!(
             session = self.0.id(),
+            replaced_by = self.0.replaced_by().map(tracing::field::display),
             "session ends after {:.1} s: {}; {} kB written in all",
             elapsed.as_secs_f64(),
             self.0.stats().summary(elapsed),
@@ -138,6 +165,9 @@ pub async fn serve_reporting(
 
     loop {
         tokio::select! {
+            () = session.replaced() => {
+                return farewell(&mut conn, &session).await;
+            }
             message = conn.recv() => {
                 let Some(message) = message? else {
                     return Ok(());
@@ -202,6 +232,36 @@ pub async fn serve_reporting(
     }
 }
 
+/// Tell a replaced session's client why its session is ending, and close
+/// the channel. The server bounds this by [`FAREWELL_TIMEOUT`].
+async fn farewell(conn: &mut ChannelConn<MainOpcode>, session: &Session) -> Result<()> {
+    let by = session
+        .replaced_by()
+        .context("a session ends for its replacement without one")?;
+    debug!(session = session.id(), %by, "telling the replaced client why");
+    conn.send_msg(MainOpcode::Notify, &replaced_notify(session.clock_ns(), by))
+        .await?;
+    let disconnecting = Disconnecting {
+        timestamp: session.clock_ns(),
+        reason: SpiceError::Ok as u32,
+    };
+    conn.send_msg(MainOpcode::Disconnecting, &disconnecting)
+        .await?;
+    conn.close().await
+}
+
+/// The `NOTIFY` that tells a client another, from `by`, has taken its
+/// session over.
+fn replaced_notify(timestamp: u64, by: SocketAddr) -> Notify {
+    Notify {
+        timestamp,
+        severity: NotifySeverity::Warn as u32,
+        visibility: SpiceVisibility::High as u32,
+        what: SPICE_WARN_GENERAL,
+        message: format!("another client ({by}) took over this session").into_bytes(),
+    }
+}
+
 /// Send `PING` `id`, stamped with the session clock so the `PONG` says
 /// when it left.
 async fn send_ping(
@@ -255,7 +315,9 @@ mod tests {
             height: 16,
         })
         .unwrap();
-        let session = SessionRegistry::new().begin().unwrap();
+        let session = SessionRegistry::new()
+            .begin("192.0.2.1:5900".parse().unwrap())
+            .unwrap();
         let ctx = ChannelContext {
             session: session.clone(),
             platform: platform.platform(),

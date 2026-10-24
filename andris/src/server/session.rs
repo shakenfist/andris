@@ -2,10 +2,15 @@
 //! the one session andris serves at a time.
 //!
 //! A main-channel link that authenticates begins a new session and
-//! cancels the one before it. Every channel task of a session races its
+//! replaces the one before it. Every channel task of a session races its
 //! handler against [`Session::cancelled`], so cancelling a session drops
-//! each of its channels' sockets without a message, as spice-server
-//! does when a new client replaces an old one.
+//! each of its channels' sockets without a message. A replaced session is
+//! not cancelled straight away, though: spice-server drops the old client
+//! without a word, and an auto-reconnecting client takes that for a
+//! network fault and takes the session straight back. So
+//! [`SessionRegistry::begin`] only marks the old session replaced, its
+//! main channel tells the client why (see [`Session::replaced`]), and the
+//! session ends when that channel does.
 //!
 //! A session holds at most one channel of each type. A new link of a
 //! type the session already has replaces the old channel: claiming the
@@ -13,7 +18,8 @@
 //! task then drops its handler and socket, running its `Drop` guards.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
@@ -117,21 +123,30 @@ const fn narrow(value: u32) -> u16 {
 #[derive(Debug)]
 pub struct Session {
     id: u32,
+    /// The address the session's main channel linked from.
+    peer: SocketAddr,
     started: Instant,
     mouse_mode: watch::Sender<MouseMode>,
     cancel: Cancel,
+    /// Fired once a new client replaces this session.
+    replaced: Cancel,
+    /// The address of the client that replaced this session.
+    replaced_by: OnceLock<SocketAddr>,
     /// The channel serving each type, by its claim's cancel signal.
     channels: Mutex<HashMap<ServedChannel, Arc<Cancel>>>,
     stats: Stats,
 }
 
 impl Session {
-    fn new(id: u32) -> Self {
+    fn new(id: u32, peer: SocketAddr) -> Self {
         Self {
             id,
+            peer,
             started: Instant::now(),
             mouse_mode: watch::Sender::new(MouseMode::Client),
             cancel: Cancel::new(),
+            replaced: Cancel::new(),
+            replaced_by: OnceLock::new(),
             channels: Mutex::new(HashMap::new()),
             stats: Stats::default(),
         }
@@ -170,6 +185,11 @@ impl Session {
     /// secondary channel's link must name it.
     pub fn id(&self) -> u32 {
         self.id
+    }
+
+    /// The address the session's main channel linked from, for the log.
+    pub fn peer(&self) -> SocketAddr {
+        self.peer
     }
 
     /// The session's metrics, for its channels to update.
@@ -217,6 +237,28 @@ impl Session {
     /// Return once the session has been cancelled. Cancel-safe.
     pub async fn cancelled(&self) {
         self.cancel.cancelled().await
+    }
+
+    /// Mark the session replaced by a client from `by`. Only the first
+    /// replacement is recorded; there can be no other.
+    fn replace(&self, by: SocketAddr) {
+        let _ = self.replaced_by.set(by);
+        self.replaced.cancel();
+    }
+
+    /// The address of the client that replaced this session, if one has.
+    pub fn replaced_by(&self) -> Option<SocketAddr> {
+        self.replaced_by.get().copied()
+    }
+
+    /// Return once a new client has replaced this session. Cancel-safe.
+    ///
+    /// The session carries on until its main channel has told the client
+    /// why it is going (the main channel's farewell) and closed, and then
+    /// ends as any session does when its main channel does. The server
+    /// ends it regardless if that takes too long.
+    pub async fn replaced(&self) {
+        self.replaced.cancelled().await
     }
 }
 
@@ -278,9 +320,10 @@ impl SessionRegistry {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Begin a new session with a random non-zero id, cancelling the
-    /// current one. Fails once the registry is closed.
-    pub fn begin(&self) -> Result<Arc<Session>> {
+    /// Begin a new session for a client from `peer`, with a random
+    /// non-zero id, replacing the current one (see
+    /// [`Session::replaced`]). Fails once the registry is closed.
+    pub fn begin(&self, peer: SocketAddr) -> Result<Arc<Session>> {
         let mut state = self.state();
         if state.closed {
             bail!("andris is shutting down, so no new session can begin");
@@ -292,16 +335,18 @@ impl SessionRegistry {
                 break id;
             }
         };
-        let session = Arc::new(Session::new(id));
+        let session = Arc::new(Session::new(id, peer));
         if let Some(old) = state.current.replace(session.clone()) {
             info!(
                 old = old.id(),
+                old_peer = %old.peer(),
                 new = id,
+                new_peer = %peer,
                 "a new client replaces the current session"
             );
-            old.cancel();
+            old.replace(peer);
         } else {
-            info!(session = id, "session begins");
+            info!(session = id, %peer, "session begins");
         }
         Ok(session)
     }
@@ -367,27 +412,60 @@ mod tests {
             .unwrap();
     }
 
+    fn peer(n: u8) -> SocketAddr {
+        SocketAddr::from(([192, 0, 2, n], 5900))
+    }
+
+    /// A new session takes the old one's place at once, but the old one
+    /// is only marked replaced: its main channel ends it once it has told
+    /// the client why.
     #[test]
-    fn begin_replaces_and_cancels_the_current_session() {
+    fn begin_replaces_the_current_session() {
         let registry = SessionRegistry::new();
-        let first = registry.begin().unwrap();
+        let first = registry.begin(peer(1)).unwrap();
         assert_ne!(first.id(), 0);
+        assert_eq!(first.peer(), peer(1));
         assert_eq!(registry.current_id(), Some(first.id()));
         assert!(registry.lookup(first.id()).is_some());
+        assert_eq!(first.replaced_by(), None);
 
-        let second = registry.begin().unwrap();
+        let second = registry.begin(peer(2)).unwrap();
         assert_ne!(second.id(), first.id());
-        assert!(first.is_cancelled());
+        assert_eq!(first.replaced_by(), Some(peer(2)));
+        assert!(!first.is_cancelled());
+        assert_eq!(second.replaced_by(), None);
         assert!(!second.is_cancelled());
         assert!(registry.lookup(first.id()).is_none());
         assert!(registry.lookup(second.id()).is_some());
+
+        registry.end(&first);
+        assert!(first.is_cancelled());
+        assert_eq!(registry.current_id(), Some(second.id()));
+    }
+
+    #[tokio::test]
+    async fn replaced_returns_once_replaced() {
+        let registry = SessionRegistry::new();
+        let first = registry.begin(peer(1)).unwrap();
+        let waiter = {
+            let first = first.clone();
+            tokio::spawn(async move { first.replaced().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        registry.begin(peer(2)).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[test]
     fn ending_an_old_session_leaves_the_current_one() {
         let registry = SessionRegistry::new();
-        let first = registry.begin().unwrap();
-        let second = registry.begin().unwrap();
+        let first = registry.begin(peer(1)).unwrap();
+        let second = registry.begin(peer(2)).unwrap();
         registry.end(&first);
         assert_eq!(registry.current_id(), Some(second.id()));
         registry.end(&second);
@@ -398,16 +476,16 @@ mod tests {
     #[test]
     fn close_cancels_and_refuses() {
         let registry = SessionRegistry::new();
-        let session = registry.begin().unwrap();
+        let session = registry.begin(peer(1)).unwrap();
         registry.close();
         assert!(session.is_cancelled());
-        assert!(registry.begin().is_err());
+        assert!(registry.begin(peer(1)).is_err());
         assert_eq!(registry.current_id(), None);
     }
 
     #[test]
     fn a_second_claim_replaces_the_first() {
-        let session = SessionRegistry::new().begin().unwrap();
+        let session = SessionRegistry::new().begin(peer(1)).unwrap();
         let first = session.claim_channel(ServedChannel::Display);
         let inputs = session.claim_channel(ServedChannel::Inputs);
         assert!(!first.is_replaced());
@@ -437,7 +515,7 @@ mod tests {
             assert_eq!(u32::from(mode.to_wire_u16()), mode.to_wire());
         }
         assert_eq!(MouseMode::from_wire(0), None);
-        let session = Session::new(1);
+        let session = Session::new(1, peer(1));
         assert_eq!(*session.mouse_mode().borrow(), MouseMode::Client);
     }
 }

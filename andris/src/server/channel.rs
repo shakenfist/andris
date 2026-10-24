@@ -324,6 +324,21 @@ impl<O: ServerOpcode> ChannelConn<O> {
         }
     }
 
+    /// Close the channel in an orderly way: end andris's side of the
+    /// stream, then read and discard whatever the client sends until it
+    /// closes its side. Dropping a socket with unread data in it resets
+    /// the connection, and a reset can discard what andris last sent
+    /// before the client has read it. Not cancel-safe, and it waits as
+    /// long as the client keeps the channel open, so the caller bounds it.
+    pub async fn close(&mut self) -> Result<()> {
+        self.stream
+            .shutdown()
+            .await
+            .with_context(|| format!("closing the {} channel", O::CHANNEL.name()))?;
+        while self.recv().await?.is_some() {}
+        Ok(())
+    }
+
     /// Log, once per opcode, that a message was read and ignored.
     pub fn ignore(&mut self, message: &ReceivedMessage) {
         let code = message.header.message_type;
@@ -513,7 +528,9 @@ mod tests {
     const WAIT: Duration = Duration::from_secs(5);
 
     fn session() -> Arc<Session> {
-        SessionRegistry::new().begin().unwrap()
+        SessionRegistry::new()
+            .begin("192.0.2.1:5900".parse().unwrap())
+            .unwrap()
     }
 
     fn pair<O: ServerOpcode>() -> (ChannelConn<O>, DuplexStream) {

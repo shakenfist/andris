@@ -339,7 +339,7 @@ where
     // The session is in place before the client hears it is in, so a
     // client never links a secondary channel to a session not yet begun.
     let session = match existing {
-        None => registry.begin()?,
+        None => registry.begin(ctx.peer)?,
         Some(session) => {
             if session.is_cancelled() {
                 debug!(

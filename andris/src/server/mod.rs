@@ -622,6 +622,11 @@ async fn run_channel(stream: SpiceStream, linked: Linked, shared: &Shared) {
             channel = channel.name(),
             "a later link replaced this channel; closing it"
         ),
+        () = session.secondary_channels_closed(), if channel != ServedChannel::Main => debug!(
+            session = session.id(),
+            channel = channel.name(),
+            "the session was replaced; closing the channel"
+        ),
         () = serve_channel(stream, linked, shared) => {}
     }
 }
@@ -642,8 +647,20 @@ async fn serve_channel(stream: SpiceStream, linked: Linked, shared: &Shared) {
                 registry: &shared.registry,
                 session: session.clone(),
             };
-            let conn = ChannelConn::<MainOpcode>::new(stream, session);
-            drive(ctx, conn, main_channel::run).await;
+            let conn = ChannelConn::<MainOpcode>::new(stream, session.clone());
+            // A replaced session ends when its main channel has said
+            // goodbye, or after FAREWELL_TIMEOUT if it has not.
+            let overdue = async {
+                session.replaced().await;
+                tokio::time::sleep(main_channel::FAREWELL_TIMEOUT).await;
+            };
+            tokio::select! {
+                () = drive(ctx, conn, main_channel::run) => {}
+                () = overdue => info!(
+                    session = session.id(),
+                    "the replaced client did not close in time; ending its session"
+                ),
+            }
         }
         ServedChannel::Display => {
             let conn = ChannelConn::<DisplayOpcode>::new(stream, session);

@@ -44,8 +44,15 @@
 //!
 //! A [`HeldInput`] guard tracks the keys and buttons pressed and not yet
 //! released. Its `Drop` releases them, so they are released however the
-//! channel ends: the client closing it, an error, or the session being
-//! cancelled when a new client replaces it, which drops this handler.
+//! channel ends: the client closing it, an error, or the session ending,
+//! which drops this handler.
+//!
+//! When a new client replaces the session, the channel stays open until
+//! the main channel has told the client why (see `server::main_channel`),
+//! but the desktop is the new client's from that moment. So the channel
+//! releases what the old client holds at once, rather than when it
+//! closes, which could lift a key the new client has since pressed, and
+//! drops whatever the old client sends after.
 
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
@@ -98,11 +105,28 @@ pub async fn run(ctx: ChannelContext, mut conn: ChannelConn<InputsOpcode>) -> Re
         logged: HashSet::new(),
         ctx,
     };
-    while let Some(message) = conn.recv().await? {
-        if inputs.handle(&mut conn, &message).await? {
-            conn.send(InputsOpcode::MouseMotionAck, &[]).await?;
+    let session = inputs.ctx.session.clone();
+    loop {
+        tokio::select! {
+            biased;
+            () = session.replaced() => break,
+            message = conn.recv() => {
+                let Some(message) = message? else {
+                    return Ok(());
+                };
+                if session.is_replaced() {
+                    break;
+                }
+                if inputs.handle(&mut conn, &message).await? {
+                    conn.send(InputsOpcode::MouseMotionAck, &[]).await?;
+                }
+            }
         }
     }
+    // Replaced: release what the old client holds, then read and drop
+    // what it sends until the channel closes.
+    drop(inputs);
+    while conn.recv().await?.is_some() {}
     Ok(())
 }
 
@@ -469,8 +493,97 @@ impl Inputs {
 
 #[cfg(test)]
 mod tests {
+    use shakenfist_spice_protocol::messages::{ReceiveBuffer, make_message};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     use super::*;
     use crate::platform::synthetic::SyntheticPlatform;
+    use crate::server::channel::ClientCaps;
+    use crate::server::display::DisplayOptions;
+    use crate::server::session::SessionRegistry;
+
+    const WAIT: Duration = Duration::from_secs(5);
+
+    /// From the moment a new client replaces the session, what the old
+    /// client sends no longer reaches the desktop, though the channel is
+    /// still open, and what it already holds is released at once.
+    #[tokio::test]
+    async fn a_replaced_sessions_input_is_dropped() {
+        let platform = SyntheticPlatform::new(Size {
+            width: 64,
+            height: 64,
+        })
+        .unwrap();
+        let registry = SessionRegistry::new();
+        let session = registry.begin("192.0.2.1:5900".parse().unwrap()).unwrap();
+        let ctx = ChannelContext {
+            session: session.clone(),
+            platform: platform.platform(),
+            caps: ClientCaps::default(),
+            channel_id: 0,
+            display: DisplayOptions::default(),
+        };
+        let (server_end, mut client) = tokio::io::duplex(64 * 1024);
+        let task = tokio::spawn(run(ctx, ChannelConn::new(server_end, session)));
+
+        let mut buf = ReceiveBuffer::new();
+        while buf.take_message(1 << 20).unwrap().is_none() {
+            let mut chunk = [0u8; 1024];
+            let read = tokio::time::timeout(WAIT, client.read(&mut chunk))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(read > 0, "the channel closed before INIT");
+            buf.extend_from_slice(&chunk[..read]);
+        }
+        let key_down = |scancode| {
+            let mut body = Vec::new();
+            KeyEvent { scancode }.write(&mut body);
+            make_message(inputs_client::KEY_DOWN, &body)
+        };
+        let a = EvdevCode(30);
+        client.write_all(&key_down(0x1E)).await.unwrap();
+        tokio::time::timeout(WAIT, async {
+            while platform.input_events().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        registry.begin("192.0.2.2:5900".parse().unwrap()).unwrap();
+        // Released input is queued, so it lands a moment later.
+        tokio::time::timeout(WAIT, async {
+            while platform.input_events().unwrap().len() < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the old client's key was not released at the replacement");
+        assert!(!task.is_finished(), "the channel closed at the replacement");
+
+        client.write_all(&key_down(0x30)).await.unwrap();
+        drop(client);
+        tokio::time::timeout(WAIT, task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            platform.take_input_events().unwrap(),
+            vec![
+                InputEvent::Key {
+                    code: a,
+                    pressed: true
+                },
+                InputEvent::Key {
+                    code: a,
+                    pressed: false
+                },
+            ]
+        );
+    }
 
     #[test]
     fn modifier_flags_round_trip() {

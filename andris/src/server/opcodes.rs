@@ -98,6 +98,10 @@ server_opcodes! {
         AgentData = main_server::AGENT_DATA,
         /// Agent tokens handed back to the client.
         AgentToken = main_server::AGENT_TOKEN,
+        /// Text for the client to show: why a replaced session is ending.
+        Notify = main_server::NOTIFY,
+        /// Andris is ending the session on purpose.
+        Disconnecting = main_server::DISCONNECTING,
     }
 }
 

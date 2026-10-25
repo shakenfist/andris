@@ -324,6 +324,30 @@ impl<O: ServerOpcode> ChannelConn<O> {
         }
     }
 
+    /// Close the channel in an orderly way: end andris's side of the
+    /// stream, then read and discard whatever the client sends until it
+    /// closes its side. Dropping a socket with unread data in it resets
+    /// the connection, and a reset can discard what andris last sent
+    /// before the client has read it. Not cancel-safe, and it waits as
+    /// long as the client keeps the channel open, so the caller bounds it.
+    ///
+    /// What the client sends meanwhile is thrown away unparsed, so even a
+    /// malformed message cannot make the close an error, and an error
+    /// reading means only that the client has gone.
+    pub async fn close(&mut self) -> Result<()> {
+        self.stream
+            .shutdown()
+            .await
+            .with_context(|| format!("closing the {} channel", O::CHANNEL.name()))?;
+        let mut discard = [0u8; 4096];
+        loop {
+            match self.stream.read(&mut discard).await {
+                Ok(0) | Err(_) => return Ok(()),
+                Ok(_) => {}
+            }
+        }
+    }
+
     /// Log, once per opcode, that a message was read and ignored.
     pub fn ignore(&mut self, message: &ReceivedMessage) {
         let code = message.header.message_type;
@@ -504,7 +528,7 @@ impl<O: AckedOpcode> ChannelConn<O> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::opcodes::{CursorOpcode, DisplayOpcode, InputsOpcode};
+    use crate::server::opcodes::{CursorOpcode, DisplayOpcode, InputsOpcode, MainOpcode};
     use crate::server::session::SessionRegistry;
     use shakenfist_spice_protocol::display_client;
     use shakenfist_spice_protocol::messages::MessageHeader;
@@ -513,7 +537,9 @@ mod tests {
     const WAIT: Duration = Duration::from_secs(5);
 
     fn session() -> Arc<Session> {
-        SessionRegistry::new().begin().unwrap()
+        SessionRegistry::new()
+            .begin("192.0.2.1:5900".parse().unwrap())
+            .unwrap()
     }
 
     fn pair<O: ServerOpcode>() -> (ChannelConn<O>, DuplexStream) {
@@ -539,6 +565,43 @@ mod tests {
         let mut body = vec![0; header.message_size as usize];
         client.read_exact(&mut body).await.unwrap();
         (header.message_type, body)
+    }
+
+    /// `close` ends andris's side at once, so the client reads what was
+    /// sent and then end of file. It discards what the client sends
+    /// meanwhile, even a message too large to accept, and returns only
+    /// once the client closes its side.
+    #[tokio::test]
+    async fn close_waits_for_the_client_to_close() {
+        let (mut conn, mut client) = pair::<MainOpcode>();
+        conn.send(MainOpcode::Ping, b"last").await.unwrap();
+        let closing = tokio::spawn(async move { conn.close().await });
+
+        assert_eq!(
+            client_recv(&mut client).await,
+            (MainOpcode::Ping.code(), b"last".to_vec())
+        );
+        let mut rest = [0u8; 1];
+        let read = tokio::time::timeout(WAIT, client.read(&mut rest))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read, 0, "andris's side is not closed");
+
+        client_send(&mut client, 999, b"discarded").await;
+        client_send(&mut client, 999, &vec![0; MainOpcode::MAX_CLIENT_BODY + 1]).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !closing.is_finished(),
+            "close returned before the client closed"
+        );
+
+        drop(client);
+        tokio::time::timeout(WAIT, closing)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[test]

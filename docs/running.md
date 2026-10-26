@@ -66,16 +66,20 @@ andris --ticket-file PATH [options]
 
 `andris --help` prints the same list. Logs go to stderr at `info`
 level; set `RUST_LOG` (for example `RUST_LOG=andris=debug`) to
-change that. At that level andris still says why a session went: an
-error that closes a channel is logged at `warn`, the first of a
-session's channels that the client closes is logged at `info`, and
-the session's last line (`session ends after ...`) names that first
-channel and the reason in its `closed_first` field. SIGINT (Ctrl-C) and SIGTERM (what systemd and `kill`
-send) each shut andris down cleanly. It closes the client's
-connections, releases any key or mouse button the client still held,
-and waits up to five seconds for the desktop to take those releases
-before it exits with status 0, so nothing is left held down on the
-desktop.
+change that. At that level andris still says why a session went: the
+first of a session's channels to close is logged at `warn` if an
+error closed it, or at `info` if the client did, and the session's
+last line (`session ends after ...`) names that channel and the
+reason in its `closed_first` field. The channels that close after it
+are logged only at `debug`, since the first is usually their cause.
+When another client takes a session over, that line's `replaced_by`
+field says so instead, and no channel is named.
+
+SIGINT (Ctrl-C) and SIGTERM (what systemd and `kill` send) each shut
+andris down cleanly. It closes the client's connections, releases any
+key or mouse button the client still held, and waits up to five
+seconds for the desktop to take those releases before it exits with
+status 0, so nothing is left held down on the desktop.
 
 Andris attaches to a desktop; it does not own one. If the X server it
 exports goes away (the session logs out, or the server exits or is

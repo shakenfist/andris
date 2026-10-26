@@ -208,6 +208,12 @@ impl Logs {
         assert_eq!(lines.len(), 1, "{what:?} in:\n{logs}");
         lines[0].to_string()
     }
+
+    /// Assert that no line contains `what`.
+    fn assert_none(&self, what: &str) {
+        let logs = String::from_utf8(self.0.lock().unwrap().clone()).unwrap();
+        assert!(!logs.contains(what), "{what:?} in:\n{logs}");
+    }
 }
 
 /// A `MOUSE_MODE_REQUEST` too short to decode closes the main channel,
@@ -282,6 +288,60 @@ async fn the_first_channel_the_client_closes_is_logged() {
     let summary = logs.line("session ends after");
     assert!(
         summary.contains("closed_first=the client closed the inputs channel"),
+        "{summary}"
+    );
+}
+
+/// An error that closes a channel after another has closed is usually a
+/// knock-on effect, so it stays below the default log level, and the
+/// session's last line still names the first.
+#[tokio::test]
+async fn a_later_error_is_not_logged_at_warn() {
+    let logs = Logs::default();
+    let _guard = logs.capture();
+    let server = TestServer::start().await;
+    let (mut main, inputs) = open_session(&server).await;
+    let session = server.handle.session().unwrap();
+
+    drop(inputs);
+    wait_until("the inputs channel's close is noted", || {
+        session.closed_first().is_some()
+    })
+    .await;
+    main.send(main_client::MOUSE_MODE_REQUEST, &[1]).await;
+    main.expect_closed().await;
+    server.wait_for_no_session().await;
+
+    assert_eq!(session.closed_first().unwrap().channel, "inputs");
+    logs.assert_none("channel closed with an error");
+    let summary = logs.line("session ends after");
+    assert!(
+        summary.contains("closed_first=the client closed the inputs channel"),
+        "{summary}"
+    );
+}
+
+/// A replaced session's channels close because andris took the session
+/// away, not because the client closed them: none is noted, and the
+/// session's last line names the replacement rather than a channel.
+#[tokio::test]
+async fn a_replaced_session_names_no_channel_closed_first() {
+    let logs = Logs::default();
+    let _guard = logs.capture();
+    let server = TestServer::start().await;
+    let (mut old_main, _old_inputs) = open_session(&server).await;
+    let old = server.handle.session().unwrap();
+
+    let (_new_main, _) = server.open_main().await;
+    expect_farewell(&mut old_main).await;
+    drop(old_main);
+    wait_until("the old session ends", || old.is_cancelled()).await;
+
+    assert_eq!(old.closed_first(), None);
+    logs.assert_none("the first of the session's to close");
+    let summary = logs.line("session ends after");
+    assert!(
+        summary.contains("replaced_by=") && !summary.contains("closed_first"),
         "{summary}"
     );
 }

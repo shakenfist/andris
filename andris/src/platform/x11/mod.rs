@@ -54,6 +54,13 @@
 //! [`Gone`] too, so every [`DamageSubscription`] learns of it. An error
 //! the X server returns for one request fails that request only.
 //!
+//! A call that waits on the capture or input thread warns once it has
+//! waited [`STALL_WARNING`], and logs the answer when it comes (see
+//! [`round_trip_warning`]): an X server that has stopped serving andris
+//! is otherwise silent. The cursor, damage and clipboard threads wait
+//! for events, which may rightly be slow to come, so they are not
+//! watched.
+//!
 //! Dropping the platform closes the capture and input queues, and those
 //! threads exit; the capture thread detaches its MIT-SHM segment as it
 //! goes. The cursor, damage and clipboard threads are blocked waiting for
@@ -86,13 +93,14 @@ mod shm;
 
 use std::os::fd::AsFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Sender, SyncSender};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, OnceLock};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use tokio::sync::watch;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::errors::{ConnectionError, ReplyError, ReplyOrIdError};
 use x11rb::protocol::xproto::{
@@ -118,6 +126,10 @@ use randr::Randr;
 
 /// How many events [`InputSink::inject`] lets wait for the input thread.
 pub const INPUT_QUEUE_LIMIT: usize = 8192;
+
+/// How long a call to the capture or input thread waits for its answer
+/// before andris warns that the X server may be stalled.
+pub const STALL_WARNING: Duration = Duration::from_secs(5);
 
 /// How many more events [`InputSink::inject_release`] may queue beyond
 /// [`INPUT_QUEUE_LIMIT`]. Ample for every key and button held at once.
@@ -380,7 +392,7 @@ impl Drop for X11Platform {
 
 impl DisplayGeometry for X11Platform {
     fn size(&self) -> Result<Size> {
-        round_trip(&self.capture, "capture", CaptureRequest::Size)
+        round_trip(&self.capture, "capture", "size", CaptureRequest::Size)
     }
 }
 
@@ -390,13 +402,13 @@ impl ScreenSource for X11Platform {
     }
 
     fn capture(&self, rects: &[Rectangle]) -> Result<Capture> {
-        round_trip(&self.capture, "capture", |reply| {
+        round_trip(&self.capture, "capture", "capture", |reply| {
             CaptureRequest::Capture(Some(rects.to_vec()), reply)
         })
     }
 
     fn capture_all(&self) -> Result<Capture> {
-        round_trip(&self.capture, "capture", |reply| {
+        round_trip(&self.capture, "capture", "capture", |reply| {
             CaptureRequest::Capture(None, reply)
         })
     }
@@ -412,7 +424,12 @@ impl InputSink for X11Platform {
     }
 
     fn lock_state(&self) -> Result<LockState> {
-        round_trip(&self.input.requests, "input", InputRequest::LockState)
+        round_trip(
+            &self.input.requests,
+            "input",
+            "lock state",
+            InputRequest::LockState,
+        )
     }
 }
 
@@ -428,7 +445,7 @@ impl DisplayControl for X11Platform {
     /// Resizes through RandR, on the capture thread; see [`randr`]. Every
     /// X error is a refusal, naming the error.
     fn set_size(&self, size: Size) -> Result<Resize> {
-        round_trip(&self.capture, "capture", |reply| {
+        round_trip(&self.capture, "capture", "resize", |reply| {
             CaptureRequest::SetSize(size, reply)
         })
     }
@@ -459,15 +476,55 @@ fn stopped(thread: &str) -> anyhow::Error {
 }
 
 /// Send `queue` the request `make` builds around a reply channel, and
-/// wait for the answer.
+/// wait for the answer, warning if it takes [`STALL_WARNING`] or more.
+/// `what` names the request for the log.
 fn round_trip<R, T>(
     queue: &Sender<R>,
     thread: &str,
+    what: &str,
+    make: impl FnOnce(SyncSender<Result<T>>) -> R,
+) -> Result<T> {
+    round_trip_warning(queue, thread, what, STALL_WARNING, make)
+}
+
+/// [`round_trip`], warning after `warn_after`.
+///
+/// Every request the capture and input threads answer is a round trip
+/// to the X server, so an answer this late almost always means the X
+/// server is not serving andris's connections: most often because
+/// another X client holds a server grab. Nothing else would say so,
+/// since the session just goes quiet. The wait goes on, as a grab can
+/// lift by itself, and the answer is logged once it comes.
+fn round_trip_warning<R, T>(
+    queue: &Sender<R>,
+    thread: &str,
+    what: &str,
+    warn_after: Duration,
     make: impl FnOnce(SyncSender<Result<T>>) -> R,
 ) -> Result<T> {
     let (reply, answer) = mpsc::sync_channel(1);
+    let asked = Instant::now();
     queue.send(make(reply)).map_err(|_| stopped(thread))?;
-    answer.recv().map_err(|_| stopped(thread))?
+    match answer.recv_timeout(warn_after) {
+        Ok(result) => return result,
+        Err(RecvTimeoutError::Disconnected) => return Err(stopped(thread)),
+        Err(RecvTimeoutError::Timeout) => {}
+    }
+    warn!(
+        thread,
+        request = what,
+        "the X11 {thread} thread has not answered in {:.1} s; the X server may be \
+         stalled, perhaps by another X client holding a server grab",
+        asked.elapsed().as_secs_f64(),
+    );
+    let result = answer.recv().map_err(|_| stopped(thread))?;
+    info!(
+        thread,
+        request = what,
+        "the X11 {thread} thread answered after {:.1} s",
+        asked.elapsed().as_secs_f64(),
+    );
+    result
 }
 
 /// Start a named backend thread, which runs until `body` returns.
@@ -647,30 +704,90 @@ fn server_facts(
 mod tests {
     use super::*;
     use crate::platform::is_gone;
+    use crate::test_logs::Logs;
 
     #[test]
     fn a_dead_thread_makes_every_call_fail() {
         let (queue, requests) = mpsc::channel::<CaptureRequest>();
         drop(requests);
-        let message = round_trip(&queue, "capture", CaptureRequest::Size)
+        let message = round_trip(&queue, "capture", "size", CaptureRequest::Size)
             .unwrap_err()
             .to_string();
         assert!(message.contains("capture thread has stopped"), "{message}");
         let (queue, requests) = mpsc::channel::<CaptureRequest>();
         drop(requests);
         assert!(is_gone(
-            &round_trip(&queue, "capture", CaptureRequest::Size).unwrap_err()
+            &round_trip(&queue, "capture", "size", CaptureRequest::Size).unwrap_err()
         ));
 
-        // A thread that takes the request but dies before answering.
+        // A thread that takes the request but dies before answering. Its
+        // death is no stall, so nothing is logged for it here.
+        let logs = Logs::default();
+        let _guard = logs.capture(tracing::Level::INFO);
         let (queue, requests) = mpsc::channel::<CaptureRequest>();
         let worker = thread::spawn(move || drop(requests.recv()));
         assert!(
-            round_trip(&queue, "capture", |reply| CaptureRequest::Capture(
-                None, reply
-            ))
+            round_trip(&queue, "capture", "capture", |reply| {
+                CaptureRequest::Capture(None, reply)
+            })
             .is_err()
         );
+        worker.join().unwrap();
+        assert_eq!(logs.text(), "");
+    }
+
+    /// A late answer is warned about once, while andris still waits, and
+    /// logged again when it comes; a prompt one is not logged at all.
+    #[test]
+    fn a_late_answer_is_warned_about_and_its_arrival_logged() {
+        let logs = Logs::default();
+        let _guard = logs.capture(tracing::Level::INFO);
+        let (queue, requests) = mpsc::channel::<CaptureRequest>();
+        let worker = thread::spawn(move || {
+            for (n, request) in requests.iter().enumerate() {
+                let CaptureRequest::Size(reply) = request else {
+                    panic!("not a size request");
+                };
+                if n == 1 {
+                    thread::sleep(Duration::from_millis(300));
+                }
+                reply
+                    .send(Ok(Size {
+                        width: 8,
+                        height: 8,
+                    }))
+                    .unwrap();
+            }
+        });
+        let warn_after = Duration::from_millis(100);
+        round_trip_warning(&queue, "capture", "size", warn_after, CaptureRequest::Size).unwrap();
+        assert_eq!(logs.text(), "", "a prompt answer was logged");
+
+        let size = round_trip_warning(&queue, "capture", "size", warn_after, CaptureRequest::Size)
+            .unwrap();
+        assert_eq!(size.width, 8);
+        let text = logs.text();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        for expected in [
+            "WARN",
+            "the X11 capture thread has not answered in 0.1 s",
+            "another X client holding a server grab",
+            "request=\"size\"",
+        ] {
+            assert!(
+                lines[0].contains(expected),
+                "{expected:?} missing from {}",
+                lines[0]
+            );
+        }
+        assert!(lines[1].contains("INFO"), "{}", lines[1]);
+        assert!(
+            lines[1].contains("the X11 capture thread answered after 0.3 s"),
+            "{}",
+            lines[1]
+        );
+        drop(queue);
         worker.join().unwrap();
     }
 

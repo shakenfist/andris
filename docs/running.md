@@ -66,7 +66,11 @@ andris --ticket-file PATH [options]
 
 `andris --help` prints the same list. Logs go to stderr at `info`
 level; set `RUST_LOG` (for example `RUST_LOG=andris=debug`) to
-change that. SIGINT (Ctrl-C) and SIGTERM (what systemd and `kill`
+change that. At that level andris still says why a session went: an
+error that closes a channel is logged at `warn`, the first of a
+session's channels that the client closes is logged at `info`, and
+the session's last line (`session ends after ...`) names that first
+channel and the reason in its `closed_first` field. SIGINT (Ctrl-C) and SIGTERM (what systemd and `kill`
 send) each shut andris down cleanly. It closes the client's
 connections, releases any key or mouse button the client still held,
 and waits up to five seconds for the desktop to take those releases

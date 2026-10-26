@@ -8,10 +8,11 @@
 
 mod support;
 
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use andris::server::main_channel::FAREWELL_TIMEOUT;
-use andris::server::session::MouseMode;
+use andris::server::session::{ClosedFirst, MouseMode};
 use shakenfist_spice_protocol::messages::{
     ChannelEntry, ChannelsList, Disconnecting, MainInit, MainMouseMode, MouseModeRequest, Notify,
     Ping, Pong, ReceiveBuffer, ReceivedMessage, WireType,
@@ -165,17 +166,124 @@ async fn unknown_opcode_does_not_close_the_channel() {
     assert_eq!(message.header.message_type, main_server::CHANNELS_LIST);
 }
 
+/// Log lines at info and above, collected for a test to read. The test
+/// runtime has one thread, so this sees the server's tasks too.
+#[derive(Clone, Default)]
+struct Logs(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Logs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+    type Writer = Logs;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl Logs {
+    fn capture(&self) -> tracing::subscriber::DefaultGuard {
+        tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(self.clone())
+                .with_max_level(tracing::Level::INFO)
+                .with_ansi(false)
+                .finish(),
+        )
+    }
+
+    /// The one line containing `what`.
+    fn line(&self, what: &str) -> String {
+        let logs = String::from_utf8(self.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = logs.lines().filter(|l| l.contains(what)).collect();
+        assert_eq!(lines.len(), 1, "{what:?} in:\n{logs}");
+        lines[0].to_string()
+    }
+}
+
 /// A `MOUSE_MODE_REQUEST` too short to decode closes the main channel,
-/// and so ends the session.
+/// and so ends the session. The error is logged at warn, and the
+/// session's last line says it is why the session ended.
 #[tokio::test]
 async fn malformed_mouse_mode_request_closes_the_main_channel() {
+    let logs = Logs::default();
+    let _guard = logs.capture();
     let server = TestServer::start().await;
     let (mut client, _) = server.open_main().await;
     skip_opening(&mut client).await;
+    let session = server.handle.session().unwrap();
 
     client.send(main_client::MOUSE_MODE_REQUEST, &[1]).await;
     client.expect_closed().await;
     server.wait_for_no_session().await;
+
+    let first = session.closed_first().unwrap();
+    assert_eq!(first.channel, "main");
+    assert!(
+        first
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("a malformed MOUSE_MODE_REQUEST"),
+        "{first:?}"
+    );
+    let warning = logs.line("channel closed with an error");
+    assert!(warning.contains("WARN"), "{warning}");
+    assert!(
+        warning.contains("a malformed MOUSE_MODE_REQUEST"),
+        "{warning}"
+    );
+    let summary = logs.line("session ends after");
+    assert!(
+        summary.contains("closed_first=the main channel failed: a malformed MOUSE_MODE_REQUEST"),
+        "{summary}"
+    );
+}
+
+/// When the client closes a channel, the first to close is logged at
+/// info, and named on the session's last line; the rest are not.
+#[tokio::test]
+async fn the_first_channel_the_client_closes_is_logged() {
+    let logs = Logs::default();
+    let _guard = logs.capture();
+    let server = TestServer::start().await;
+    let (main, inputs) = open_session(&server).await;
+    let session = server.handle.session().unwrap();
+
+    drop(inputs);
+    wait_until("the inputs channel's close is noted", || {
+        session.closed_first().is_some()
+    })
+    .await;
+    drop(main);
+    server.wait_for_no_session().await;
+
+    assert_eq!(
+        session.closed_first(),
+        Some(&ClosedFirst {
+            channel: "inputs",
+            error: None
+        })
+    );
+    let first = logs.line("the first of the session's to close");
+    assert!(
+        first.contains("INFO") && first.contains("channel=\"inputs\""),
+        "{first}"
+    );
+    let summary = logs.line("session ends after");
+    assert!(
+        summary.contains("closed_first=the client closed the inputs channel"),
+        "{summary}"
+    );
 }
 
 #[tokio::test]

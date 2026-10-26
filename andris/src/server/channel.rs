@@ -27,11 +27,11 @@ use shakenfist_spice_protocol::messages::{
     AckSync, Disconnecting, Pong, ReceiveBuffer, ReceivedMessage, SetAck, WireType, make_message,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 use super::display::DisplayOptions;
 use super::opcodes::{AckedOpcode, ServerOpcode};
-use super::session::Session;
+use super::session::{ClosedFirst, Session};
 use crate::platform::Platform;
 
 /// The ack window display and cursor ask for, as spice-server does.
@@ -128,6 +128,11 @@ impl ChannelContext {
 
 /// Run `handler` on `conn` until it returns or the session is
 /// cancelled, then drop the connection, closing the socket.
+///
+/// A handler that returns ends its channel by itself, and the session
+/// notes it (see [`Session::note_closed`]): an error is logged at warn,
+/// and the first channel of the session to close cleanly at info, since
+/// at the default log level that is all that says why a session went.
 pub async fn drive<O, F, Fut>(ctx: ChannelContext, conn: ChannelConn<O>, handler: F)
 where
     O: ServerOpcode,
@@ -142,15 +147,28 @@ where
         () = session.cancelled() => {
             debug!(session = session.id(), channel, "session ended; closing the channel");
         }
-        result = handler(ctx, conn) => match result {
-            Ok(()) => debug!(session = session.id(), channel, "channel closed"),
-            Err(e) => debug!(
-                session = session.id(),
+        result = handler(ctx, conn) => {
+            let error = result.err().map(|e| format!("{e:#}"));
+            let first = session.note_closed(ClosedFirst {
                 channel,
-                error = format!("{e:#}"),
-                "channel closed with an error"
-            ),
-        },
+                error: error.clone(),
+            });
+            match error {
+                Some(error) => warn!(
+                    session = session.id(),
+                    channel,
+                    error,
+                    first,
+                    "channel closed with an error"
+                ),
+                None if first => info!(
+                    session = session.id(),
+                    channel,
+                    "the client closed the channel, the first of the session's to close"
+                ),
+                None => debug!(session = session.id(), channel, "the client closed the channel"),
+            }
+        }
     }
 }
 

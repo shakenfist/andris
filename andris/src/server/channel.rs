@@ -27,11 +27,11 @@ use shakenfist_spice_protocol::messages::{
     AckSync, Disconnecting, Pong, ReceiveBuffer, ReceivedMessage, SetAck, WireType, make_message,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 use super::display::DisplayOptions;
 use super::opcodes::{AckedOpcode, ServerOpcode};
-use super::session::Session;
+use super::session::{ClosedFirst, Session};
 use crate::platform::Platform;
 
 /// The ack window display and cursor ask for, as spice-server does.
@@ -128,6 +128,13 @@ impl ChannelContext {
 
 /// Run `handler` on `conn` until it returns or the session is
 /// cancelled, then drop the connection, closing the socket.
+///
+/// A handler that returns ends its channel by itself, and the session
+/// notes it (see [`Session::note_closed`]). The first channel of the
+/// session to close is logged at warn if an error closed it and at info
+/// if the client did, since at the default log level that is all that
+/// says why a session went; later closes are logged at debug. A replaced
+/// session's channels are not noted: the replacement is why they close.
 pub async fn drive<O, F, Fut>(ctx: ChannelContext, conn: ChannelConn<O>, handler: F)
 where
     O: ServerOpcode,
@@ -142,15 +149,46 @@ where
         () = session.cancelled() => {
             debug!(session = session.id(), channel, "session ended; closing the channel");
         }
-        result = handler(ctx, conn) => match result {
-            Ok(()) => debug!(session = session.id(), channel, "channel closed"),
-            Err(e) => debug!(
-                session = session.id(),
+        result = handler(ctx, conn) => {
+            let error = result.err().map(|e| format!("{e:#}"));
+            // A replaced session's handlers end because andris took the
+            // session away, which its replaced_by already says, not
+            // because the client chose to or failed.
+            if session.is_replaced() {
+                debug!(
+                    session = session.id(),
+                    channel,
+                    error,
+                    "the replaced session's channel closed"
+                );
+                return;
+            }
+            let first = session.note_closed(ClosedFirst {
                 channel,
-                error = format!("{e:#}"),
-                "channel closed with an error"
-            ),
-        },
+                error: error.clone(),
+            });
+            match error {
+                Some(error) if first => warn!(
+                    session = session.id(),
+                    channel,
+                    error,
+                    "channel closed with an error, the first of the session's to close"
+                ),
+                // Usually a knock-on effect of the first close.
+                Some(error) => debug!(
+                    session = session.id(),
+                    channel,
+                    error,
+                    "channel closed with an error"
+                ),
+                None if first => info!(
+                    session = session.id(),
+                    channel,
+                    "the client closed the channel, the first of the session's to close"
+                ),
+                None => debug!(session = session.id(), channel, "the client closed the channel"),
+            }
+        }
     }
 }
 
@@ -400,7 +438,11 @@ impl<O: ServerOpcode> ChannelConn<O> {
                 });
             }
             let mut chunk = [0u8; READ_CHUNK];
-            let read = self.stream.read(&mut chunk).await?;
+            let read = self
+                .stream
+                .read(&mut chunk)
+                .await
+                .with_context(|| format!("reading the {} channel", O::CHANNEL.name()))?;
             self.buf.extend_from_slice(&chunk[..read]);
             if read == 0 {
                 if !self.buf.is_empty() {

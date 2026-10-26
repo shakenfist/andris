@@ -121,6 +121,25 @@ const fn narrow(value: u32) -> u16 {
     value as u16
 }
 
+/// The first of a session's channels to close by itself, rather than
+/// because the session ended, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosedFirst {
+    /// The channel's name.
+    pub channel: &'static str,
+    /// The error that closed it, or `None` if the client closed it.
+    pub error: Option<String>,
+}
+
+impl std::fmt::Display for ClosedFirst {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.error {
+            Some(error) => write!(f, "the {} channel failed: {error}", self.channel),
+            None => write!(f, "the client closed the {} channel", self.channel),
+        }
+    }
+}
+
 /// One client's session: the channels linked with its id.
 #[derive(Debug)]
 pub struct Session {
@@ -136,6 +155,8 @@ pub struct Session {
     secondary_closed: Cancel,
     /// The address of the client that replaced this session.
     replaced_by: OnceLock<SocketAddr>,
+    /// The first channel to close by itself, and why.
+    closed_first: OnceLock<ClosedFirst>,
     /// The channel serving each type, by its claim's cancel signal.
     channels: Mutex<HashMap<ServedChannel, Arc<Cancel>>>,
     stats: Stats,
@@ -152,6 +173,7 @@ impl Session {
             replaced: Cancel::new(),
             secondary_closed: Cancel::new(),
             replaced_by: OnceLock::new(),
+            closed_first: OnceLock::new(),
             channels: Mutex::new(HashMap::new()),
             stats: Stats::default(),
         }
@@ -271,6 +293,20 @@ impl Session {
     /// ends it regardless if that takes too long.
     pub async fn replaced(&self) {
         self.replaced.cancelled().await
+    }
+
+    /// Record that a channel closed by itself, not because the session
+    /// ended. True if it is the first of the session's channels to; only
+    /// the first is kept, since the first is usually the cause of the
+    /// rest.
+    pub fn note_closed(&self, closed: ClosedFirst) -> bool {
+        self.closed_first.set(closed).is_ok()
+    }
+
+    /// The first of the session's channels to close by itself, if one
+    /// has, and why.
+    pub fn closed_first(&self) -> Option<&ClosedFirst> {
+        self.closed_first.get()
     }
 
     /// Close every channel of the session but main, which carries on
@@ -570,6 +606,35 @@ mod tests {
         assert!(session.channels().get(&ServedChannel::Display).is_none());
         let fourth = session.claim_channel(ServedChannel::Display);
         assert!(!fourth.is_replaced());
+    }
+
+    /// Only the first channel to close is kept.
+    #[test]
+    fn only_the_first_close_is_noted() {
+        let session = Session::new(1, peer(1));
+        assert_eq!(session.closed_first(), None);
+        let inputs = ClosedFirst {
+            channel: "inputs",
+            error: Some("injecting a key: gone".into()),
+        };
+        assert!(session.note_closed(inputs.clone()));
+        assert!(!session.note_closed(ClosedFirst {
+            channel: "main",
+            error: None,
+        }));
+        assert_eq!(session.closed_first(), Some(&inputs));
+        assert_eq!(
+            inputs.to_string(),
+            "the inputs channel failed: injecting a key: gone"
+        );
+        assert_eq!(
+            ClosedFirst {
+                channel: "main",
+                error: None
+            }
+            .to_string(),
+            "the client closed the main channel"
+        );
     }
 
     #[test]

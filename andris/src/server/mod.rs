@@ -647,6 +647,9 @@ async fn serve_channel(stream: SpiceStream, linked: Linked, shared: &Shared) {
                 registry: &shared.registry,
                 session: session.clone(),
             };
+            // Dropped before `_end`, so the summary precedes "session
+            // ends", and after `drive`, so it sees how main closed.
+            let _summary = main_channel::SessionSummary::new(session.clone());
             let conn = ChannelConn::<MainOpcode>::new(stream, session.clone());
             // A replaced session ends when its main channel has said
             // goodbye, or after FAREWELL_TIMEOUT if it has not.

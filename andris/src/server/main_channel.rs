@@ -33,8 +33,9 @@
 //! its main channel does, and ending a session cancels the task. So it
 //! needs no task of its own and nothing to stop. Every
 //! [`STATS_INTERVAL`] it logs a summary of the interval if any frame was
-//! sent in it, and a [`SessionSummary`] guard logs the whole session's
-//! once when the task ends, however it ends.
+//! sent in it. A [`SessionSummary`] guard, which the server holds around
+//! the channel, logs the whole session's once when the channel ends,
+//! however it ends, with which channel closed first and why.
 //!
 //! [`stats`]: super::stats
 
@@ -104,8 +105,16 @@ pub async fn run(ctx: ChannelContext, conn: ChannelConn<MainOpcode>) -> Result<(
 }
 
 /// Logs the whole session's metrics when dropped: that is, when the main
-/// channel's task ends or is cancelled, which is the session's end.
-struct SessionSummary(Arc<Session>);
+/// channel's task ends or is cancelled, which is the session's end. It
+/// is held outside [`drive`](super::channel::drive), so the line also
+/// says which channel closed first, and why, even when that was main.
+pub struct SessionSummary(Arc<Session>);
+
+impl SessionSummary {
+    pub fn new(session: Arc<Session>) -> Self {
+        Self(session)
+    }
+}
 
 impl Drop for SessionSummary {
     fn drop(&mut self) {
@@ -113,6 +122,7 @@ impl Drop for SessionSummary {
         info!(
             session = self.0.id(),
             replaced_by = self.0.replaced_by().map(tracing::field::display),
+            closed_first = self.0.closed_first().map(tracing::field::display),
             "session ends after {:.1} s: {}; {} kB written in all",
             elapsed.as_secs_f64(),
             self.0.stats().summary(elapsed),
@@ -139,7 +149,6 @@ pub async fn serve_reporting(
     stats_interval: Duration,
 ) -> Result<()> {
     let session = ctx.session.clone();
-    let _summary = SessionSummary(session.clone());
     let mut agent = Agent::new(session.id(), &ctx.platform);
 
     let init = MainInit {

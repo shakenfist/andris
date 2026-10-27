@@ -150,7 +150,8 @@ keys has waited five seconds for the X server, andris logs a warning:
 be stalled, perhaps by another X client holding a server grab` (or
 the input thread, for the lock keys). It keeps waiting, since a grab
 can lift by itself, and logs `the X11 capture thread answered after
-37.5 s` at info when the answer comes. Key presses and pointer motion
+37.5 s` at info when the answer comes, or another warning if the
+thread stops without answering. Key presses and pointer motion
 are only queued, so a stall shows there only once the queue fills or
 the lock keys are next read.
 

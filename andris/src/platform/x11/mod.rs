@@ -494,7 +494,8 @@ fn round_trip<R, T>(
 /// server is not serving andris's connections: most often because
 /// another X client holds a server grab. Nothing else would say so,
 /// since the session just goes quiet. The wait goes on, as a grab can
-/// lift by itself, and the answer is logged once it comes.
+/// lift by itself, and the answer is logged once it comes, as is the
+/// thread stopping without one.
 fn round_trip_warning<R, T>(
     queue: &Sender<R>,
     thread: &str,
@@ -515,9 +516,17 @@ fn round_trip_warning<R, T>(
         request = what,
         "the X11 {thread} thread has not answered in {:.1} s; the X server may be \
          stalled, perhaps by another X client holding a server grab",
-        asked.elapsed().as_secs_f64(),
+        warn_after.as_secs_f64(),
     );
-    let result = answer.recv().map_err(|_| stopped(thread))?;
+    let Ok(result) = answer.recv() else {
+        warn!(
+            thread,
+            request = what,
+            "the X11 {thread} thread stopped after {:.1} s without answering",
+            asked.elapsed().as_secs_f64(),
+        );
+        return Err(stopped(thread));
+    };
     info!(
         thread,
         request = what,
@@ -736,8 +745,16 @@ mod tests {
         assert_eq!(logs.text(), "");
     }
 
+    /// The seconds in a log line's "... after N s".
+    fn seconds_after(line: &str) -> f64 {
+        let (_, rest) = line.split_once(" after ").unwrap();
+        rest.split_once(" s").unwrap().0.parse().unwrap()
+    }
+
     /// A late answer is warned about once, while andris still waits, and
     /// logged again when it comes; a prompt one is not logged at all.
+    /// The warning names the threshold, so only the answer's time varies,
+    /// and it is checked as a lower bound: a busy machine only adds to it.
     #[test]
     fn a_late_answer_is_warned_about_and_its_arrival_logged() {
         let logs = Logs::default();
@@ -760,7 +777,8 @@ mod tests {
             }
         });
         let warn_after = Duration::from_millis(100);
-        round_trip_warning(&queue, "capture", "size", warn_after, CaptureRequest::Size).unwrap();
+        let patient = Duration::from_secs(60);
+        round_trip_warning(&queue, "capture", "size", patient, CaptureRequest::Size).unwrap();
         assert_eq!(logs.text(), "", "a prompt answer was logged");
 
         let size = round_trip_warning(&queue, "capture", "size", warn_after, CaptureRequest::Size)
@@ -783,12 +801,49 @@ mod tests {
         }
         assert!(lines[1].contains("INFO"), "{}", lines[1]);
         assert!(
-            lines[1].contains("the X11 capture thread answered after 0.3 s"),
+            lines[1].contains("the X11 capture thread answered after"),
             "{}",
             lines[1]
         );
+        assert!(seconds_after(lines[1]) >= 0.3, "{}", lines[1]);
         drop(queue);
         worker.join().unwrap();
+    }
+
+    /// A thread that stops after the warning, without answering, fails
+    /// the call as any stopped thread does, and says so in the log.
+    #[test]
+    fn a_thread_that_stops_after_the_warning_is_logged() {
+        let logs = Logs::default();
+        let _guard = logs.capture(tracing::Level::INFO);
+        let (queue, requests) = mpsc::channel::<CaptureRequest>();
+        let worker = thread::spawn(move || {
+            let request = requests.recv().unwrap();
+            thread::sleep(Duration::from_millis(300));
+            drop(request);
+        });
+        let warn_after = Duration::from_millis(100);
+        let error = round_trip_warning(&queue, "capture", "size", warn_after, CaptureRequest::Size)
+            .unwrap_err();
+        assert!(is_gone(&error), "{error:#}");
+        worker.join().unwrap();
+
+        let text = logs.text();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(
+            lines[0].contains("has not answered in 0.1 s"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[1].contains("WARN"), "{}", lines[1]);
+        assert!(
+            lines[1].contains("the X11 capture thread stopped after"),
+            "{}",
+            lines[1]
+        );
+        assert!(lines[1].contains("without answering"), "{}", lines[1]);
+        assert!(seconds_after(lines[1]) >= 0.3, "{}", lines[1]);
     }
 
     #[test]

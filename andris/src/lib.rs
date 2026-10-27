@@ -22,6 +22,8 @@ pub mod config;
 pub mod install;
 pub mod platform;
 pub mod server;
+#[cfg(test)]
+mod test_logs;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -204,6 +206,7 @@ pub async fn serve_until(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_logs::Logs;
 
     #[test]
     fn the_audio_configuration_picks_the_source() {
@@ -220,47 +223,19 @@ mod tests {
         );
     }
 
-    /// Log lines, collected for a test to read.
-    #[derive(Clone, Default)]
-    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for Captured {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
-        type Writer = Captured;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
     #[test]
     fn without_libpulse_there_is_no_sound_and_a_warning_says_why() {
-        let logs = Captured::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(logs.clone())
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
-        let source = tracing::subscriber::with_default(subscriber, || {
-            audio_source_from(
-                &AudioConfig::Pulse {
-                    source: "@DEFAULT_MONITOR@".into(),
-                },
-                "libandris-no-such-libpulse.so.0",
-            )
-        });
+        let captured = Logs::default();
+        let guard = captured.capture(tracing::Level::WARN);
+        let source = audio_source_from(
+            &AudioConfig::Pulse {
+                source: "@DEFAULT_MONITOR@".into(),
+            },
+            "libandris-no-such-libpulse.so.0",
+        );
+        drop(guard);
         assert!(source.is_none(), "a PulseAudio source without libpulse");
-        let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        let logs = captured.text();
         let lines: Vec<&str> = logs.lines().collect();
         assert_eq!(lines.len(), 1, "{logs}");
         let line = lines[0];

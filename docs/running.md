@@ -150,6 +150,19 @@ The server's keyboard layout is read once at startup, so a layout
 changed afterwards with `setxkbmap` is not noticed until andris
 restarts.
 
+An X server that stops answering andris leaves the client with a
+frozen picture and dead input, most often because another X client
+holds a server grab. If a capture, a resize or a read of the lock
+keys has waited five seconds for the X server, andris logs a warning:
+`the X11 capture thread has not answered in 5.0 s; the X server may
+be stalled, perhaps by another X client holding a server grab` (or
+the input thread, for the lock keys). It keeps waiting, since a grab
+can lift by itself, and logs `the X11 capture thread answered after
+37.5 s` at info when the answer comes, or another warning if the
+thread stops without answering. Key presses and pointer motion
+are only queued, so a stall shows there only once the queue fills or
+the lock keys are next read.
+
 ## The synthetic platform
 
 ```bash

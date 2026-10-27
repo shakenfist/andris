@@ -429,11 +429,11 @@ management session reviews each diff and makes each commit.
 | 5 | high | opus | none | Complete | The kerbside lane: `make e2e-kerbside` and its merge-tier job. See brief 5. |
 | 6 | medium | sonnet | none | Complete | Documentation, including the soak recipe. See brief 6. |
 | 7 | medium | management | none | Complete | Operator check of the wheel on `:10`. See brief 7. |
-| 8 | medium | management | none | In progress | Push audit and pull request. See brief 8. |
-| 9 | low | operator | none | Not started | PyPI trusted publisher, the `release` environment, tag protection. See brief 9. |
-| 10 | low | management | none | Not started | Release 0.1.0. See brief 10. |
-| 11 | medium | operator | none | Not started | The week's soak through kerbside. See brief 11. |
-| 12 | medium | management | none | Not started | The acceptance pull request. See brief 12. |
+| 8 | medium | management | none | Complete | Push audit and pull request. See brief 8. |
+| 9 | low | operator | none | Complete | PyPI trusted publisher, the `release` environment, tag protection. See brief 9. |
+| 10 | low | management | none | Complete | Release 0.1.0. See brief 10. |
+| 11 | medium | operator | none | Complete | The week's soak through kerbside. See brief 11. |
+| 12 | medium | management | none | In progress | The acceptance pull request. See brief 12. |
 
 Steps 1 and 2 are independent, and either may go first. Step 3 needs
 step 1, since its earned-tag check fails until libpulse is no longer
@@ -1125,3 +1125,122 @@ Declined:
 
 The unit changed after step 7, so the operator re-runs `andris
 install-unit` and restarts `andris@10` before the soak.
+
+### Steps 9 and 10: the release
+
+The operator set up PyPI's trusted publisher, the `release`
+environment and the `v*` tag ruleset. Release pull request #29 merged
+as `c0617e9`, and the release workflow for `v0.1.0` succeeded on
+2026-10-19. On 2026-10-28 the management session checked that:
+
+- PyPI has `andris-0.1.0-py3-none-manylinux_2_28_x86_64.whl` and
+  `..._aarch64.whl`, both uploaded 2026-10-19 05:59 UTC;
+- the GitHub release has both wheels and `SHA256SUMS`, and
+  `sha256sum -c SHA256SUMS` passes for both;
+- `gh attestation verify` passes for the x86_64 wheel;
+- the tag object is `c020049`, re-signed by `github-actions[bot]`, and
+  `gitsign verify-tag v0.1.0` with `docs/releasing.md`'s identity and
+  issuer reports a good signature and a validated Rekor entry. A
+  clone fetched before `sign-tag` force-pushed still holds the
+  unsigned tag, and needs `git fetch --force` on the tag to verify it.
+
+### Step 11: the soak
+
+The soak ran from 2026-10-19 to 2026-10-27 on andris 0.1.0 from PyPI,
+installed with pipx and served by `andris@10`. **It did not go through
+kerbside.** ryll reached andris through an SSH tunnel to
+`127.0.0.1:5900`, and kerbside's demo stack was never brought up on
+the development host. Kerbside's path is covered only by the
+`Through kerbside` merge-tier lane, and the master plan's success
+criteria and Future work say so.
+
+RDP stayed available and was never needed. The operator reported no
+misbehaviour beyond the issues below.
+
+Hours are connected time, from the session-end metrics lines, which
+the operator accepted as the measure. ryll stays connected around the
+clock, and its sessions break at about 08:00 and 18:20 on working
+days, so the daytime session is the working day. Rates are each
+session's averages. Times and dates here and in the issues below are
+local (AEDT, UTC+11).
+
+| Day | Daytime session | fps | Display kbit/s | Notes |
+|-----|-----------------|-----|----------------|-------|
+| Mon 10-19 | 10:42–18:01, 7.3 h | 2.9 | 168 | Still the step 7 wheel (0.0.1). At 10:29 one start exited `status=2/INVALIDARGUMENT`: a trial `--listen 192.168.1.7:5900` was refused for lacking TLS, as designed. `andris@10` was restarted onto 0.1.0 at 18:06. |
+| Tue 10-20 | 11:14–18:01, 6.8 h | 3.9 | 559 | The overnight session (17.1 h) carried 77 s of Opus. From 11:09 to 11:14, eight sessions lasted under a minute: two ryll instances replacing each other (#36). The operator restarted `andris@10` at 11:13. |
+| Wed 10-21 | 08:10–18:23, 10.2 h | 3.7 | 490 | |
+| Thu 10-22 | 08:08–18:20, 10.2 h | 2.5 | 211 | |
+| Fri 10-23 to Sun 10-25 | one session, 10-22 18:20 to 10-26 08:47, 86.4 h | 3.6 | 273 | 33 H.264 streams and 42,401 Opus frames (about seven minutes of sound), no stream, server or audio drops. With no session boundary, the journal cannot separate Friday's use from the weekend. |
+| Mon 10-26 | 08:54–16:32, 7.6 h | 2.4 | 106 | |
+| Tue 10-27 | 08:21–17:55, 9.6 h | 2.4 | 116 | The operator restarted `andris@10` at 08:18, still on 0.1.0. |
+
+Across the week:
+
+- `NRestarts` stayed at 0. Every stop was a `SIGTERM: shutting down`
+  from a deliberate restart, and the only failed start was the
+  configuration error on 10-19.
+- **No `status=31/SYS`**, nor any other signal, with MIT-SHM capture
+  throughout and sound in two sessions.
+- No server, stream or audio drops in any session-end line. Capture
+  stayed at 0.4 to 1.0 ms and encode at 0.2 to 1.2 ms in sessions over
+  ten minutes.
+- One warning in the week: the client's resize request, refused by
+  xorgxrdp's RandR, as phase 7 expects.
+- `andris@10` used 4 h 4 min of CPU between 10-20 11:13 and 10-27
+  08:18, about 2.5% of one core averaged over 165 hours of use and
+  idle. This is not the success criterion's static-screen figure,
+  which the soak did not measure.
+
+Issues:
+
+- **#36**, found on 10-20: a replaced client was dropped silently, so
+  auto-reconnecting clients fought over the session. Fixed by #41,
+  merged 10-25.
+- #22 (inputs channel closed after Enter, the cause logged only at
+  debug) and #26 (a stalled X request served a silent session) were
+  filed before the soak, both on 10-17. #46 and #47 fixed them
+  during it, both merged 10-27.
+
+None of the three fixes is in 0.1.0. They reach the development host
+with the next release. Nothing the soak found is left unfixed.
+
+### Step 12: the acceptance pull request
+
+- **`SystemCallFilter=@system-service` stays.** Decision 6's test
+  passed: zero `status=31/SYS` over the week, with MIT-SHM and sound
+  in use. The unit is unchanged.
+- No fixes land here. Every regression's fix landed in its own pull
+  request.
+- The master plan's success criteria record what the soak settled,
+  and its Future work gains a soak through kerbside.
+- `/usr/local/bin/andris` was removed on 2026-10-18 (step 7), and the
+  development host runs 0.1.0 from PyPI (`pipx list` shows no
+  `direct_url.json` for it), so the operator's reminder is already
+  acted on. Plan-blockers note n1 on the master plan can be cleared.
+
+The Definition of done's evidence, for the items earlier sections do
+not already carry. The CI evidence is #28's passing merge-queue run,
+39117589930, on 2026-10-18:
+
+- **The tag is earned.** `readelf -d` of the released 0.1.0 wheels'
+  binaries lists only `libstdc++`, `libdl`, `libgcc_s`, `libpthread`,
+  `libm`, `libc` and the dynamic loader, for both architectures, with
+  no RPATH or RUNPATH. The merge-queue `Build the wheel` job prints the
+  same `DT_NEEDED` list. Step 3's commit, `4248df1`, records the
+  libpulse and nasm mutations.
+- **SIMD is in.** The same job logs `openh264's SIMD code is in: ...
+  defines WelsSampleSad16x16_sse2`.
+- **No libpulse, no crash.** The same job's smoke test logs `andris
+  --platform synthetic listened, and exited 0 on SIGTERM`.
+- **Kerbside carries every channel.** `Through kerbside` logs that
+  kerbside relayed the main, display, inputs, cursor and playback
+  channels. Through the proxy, one H.264 stream decoded 73 frames
+  without failures, and 599 Opus packets decoded at 48 kHz. Kerbside's
+  log phrasing differs from the Definition of done's "hypervisor
+  connection successful". The lane's own assertion is the check.
+- **The audit is clean.** No consistency-audit issue is open against
+  andris.
+- **Documentation agrees.** `grep -n undecided docs/running.md` finds
+  nothing. `grep -n 0.1.7 docs/running.md` finds one line, the warning
+  that ryll 0.1.7 and earlier cannot decode andris's LZ4. That line
+  recommends 0.3.0, which is what the check was guarding.

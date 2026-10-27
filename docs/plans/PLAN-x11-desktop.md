@@ -575,7 +575,10 @@ because the following statements will be true:
 
 * The operator has used ryll → kerbside → andris as the daily
   connection to the development host for a week, with RDP still
-  available against the same session.
+  available against the same session. *Partly met in phase 10:* the
+  week's soak (2026-10-19 to 10-27) used ryll → andris through an
+  SSH tunnel, with RDP available and never needed. Kerbside is
+  exercised only by the `Through kerbside` merge-tier lane.
 * With a static screen, andris uses under 2% of one core on
   the development host.
 * Scrolling a full-screen terminal at the session's native size
@@ -588,7 +591,8 @@ because the following statements will be true:
 * Every file in andris's review scope carries a current human
   review mark.
 * A video played on the desktop arrives as an H.264 stream with
-  audio.
+  audio. *Met in phase 10:* step 7's check, and 33 streams with sound
+  during the soak.
 * CI exercises andris end to end against Xvfb with ryll headless,
   and through kerbside.
 * `docs/` describes running andris alongside xrdp, without
@@ -641,6 +645,9 @@ file) and keep its status in step with the Execution table.
   beside the encoder's tables, so that encode and decode can be tested
   against each other.
 - A side-by-side comparison against Xspice as a baseline.
+- Daily use through kerbside. Phase 10's soak ran ryll → andris
+  through an SSH tunnel, so kerbside has carried andris only in the
+  merge-tier lane's short sessions, never a working day.
 - A `.deb` or `.rpm` of andris. Phase 10 ships PyPI wheels and
   `andris install-unit`, which cover the install story.
 - Depending on ryll's crates by crates.io version rather than git

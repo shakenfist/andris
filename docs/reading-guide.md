@@ -838,13 +838,20 @@ are watched, and a note for Renovate's own major bumps.
 ### `.gitignore`
 
 Build output, the in-checkout cargo cache, editor, OS and Python cache
-files.
+files. `.vscode/` is ignored as `.vscode/*` with exceptions, so that
+the weAudit review marks, their SHA sidecars and `review-scope.toml`
+can be committed while the weAudit day log and editor settings stay
+ignored. What this file hides is a security property: an ignored file
+is never reviewed and never scanned.
 
 ### `.pre-commit-config.yaml`
 
 The hooks: rustfmt and clippy through `make lint`, the release version
 script's fixtures, actionlint, the usual whitespace and YAML checks,
 shellcheck, gitleaks and skillsaw. Note that the Rust hook runs Docker.
+The two rewriting hooks, trailing-whitespace and end-of-file-fixer,
+skip the weAudit marks, which a rewrite would corrupt. That exclusion
+is per hook, not top-level, so that gitleaks still reads review notes.
 
 ### `.devcontainer/Dockerfile`
 
@@ -910,10 +917,11 @@ documentation included; `codeql-analysis.yml`, `supply-chain.yml` and
 and `pr-re-review.yml` answer bot commands in comments;
 `export-repo-config.yml` snapshots the repository's GitHub settings into
 `.github/exported-config/`, which is generated; `prune-reviews.yml`
-keeps the review marks honest, dropping any whose file has changed. `actions/cargo-cache/`
-is the cache step every devcontainer job shares, and `actionlint.yaml`
-declares the runner labels. Several of these are copies of
-shakenfist/development's templates, and say so in their headers.
+keeps the review marks honest, dropping any whose file has changed.
+`actions/cargo-cache/` is the cache step every devcontainer job shares,
+and `actionlint.yaml` declares the runner labels. Several of these are
+copies of shakenfist/development's templates, and say so in their
+headers.
 
 ## The rest
 

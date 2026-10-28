@@ -70,7 +70,9 @@ jobs:
       # reads the tree (its README, "Supported workflows"). Skipping
       # the checkout on pull_request keeps a fork's content off the
       # static runner, which is why this job carries no fork guard.
-      # The token is not left in the shared runner's .git config.
+      # On merge_group the queue's content is checked out but never
+      # executed here, and the token is not left in the shared
+      # runner's .git config.
       - uses: actions/checkout@v7
         if: github.event_name == 'merge_group'
         with:

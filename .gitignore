@@ -12,7 +12,10 @@
 # IDE
 .idea/
 *.iml
-.vscode/
+.vscode/*
+!.vscode/*.weaudit
+!.vscode/*.weaudit-shas.json
+!.vscode/review-scope.toml
 
 # OS
 .DS_Store

@@ -548,3 +548,18 @@ runs, or a comment saying it could not dispatch.
 When a job fails for a reason unrelated to the change, such as a
 runner outage, re-running the failed job from the Actions tab is
 cheaper than a full retest.
+
+## Reviewing andris
+
+Andris is in the Shaken Fist ecosystem's review tracking, which
+records which files a person has read and when. The mechanism is
+described in
+[development's code-review-tracking.md](https://github.com/shakenfist/development/blob/main/docs/code-review-tracking.md).
+The files in scope are listed in `.vscode/review-scope.toml`, and
+`REVIEWS.md` is generated from the review state, never edited by hand.
+
+`./tools/review-tracking.sh next` offers the next file to read in the
+order of [the reading guide](reading-guide.md), which says what each
+file is for and what to look at. Review sessions land as pull requests
+from a `reviews` branch. The `review-coverage` audit keeps an issue
+open while five or more in-scope files need review.

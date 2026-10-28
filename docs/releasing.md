@@ -261,9 +261,14 @@ sha256sum -c SHA256SUMS
 gh attestation verify andris-0.1.0-py3-none-manylinux_2_28_x86_64.whl \
     --repo shakenfist/andris
 gitsign verify-tag v0.1.0 \
-    --certificate-identity-regexp '^https://github.com/shakenfist/andris/' \
+    --certificate-identity-regexp '^https://github\.com/shakenfist/andris/\.github/workflows/release\.yml@refs/tags/v' \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
+
+The pattern names `release.yml` running for a `v*` tag: a pattern that
+stops at the repository would accept a signature from any of its
+workflows. [gitsign](https://github.com/sigstore/gitsign) has
+install instructions.
 
 ## The platform tag
 

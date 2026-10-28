@@ -468,13 +468,18 @@ Three jobs are the required status checks on `develop`:
 | `Can enqueue` | not `merge_group` | every smoke job succeeded or was skipped |
 | `Can merge` | `merge_group` | all four merge-tier jobs succeeded or were skipped |
 
-A `Check paths` job skips the lint, build and supply-chain jobs
-when a pull request changes only `docs/**` and `LICENSE`. Other
+A `Check paths` job skips the jobs of both tiers when a pull
+request, or a merge-queue entry, changes only `docs/**`, `LICENSE`
+or the review state: `REVIEWS.md` and the weAudit marks under
+`.vscode/` (see [Reviewing andris](#reviewing-andris)). Other
 Markdown, such as `AGENTS.md`, is not skipped, since the `skillsaw`
-hook lints it. The filter is applied per job and not with a
-`paths-ignore:` on the trigger: a required check in a workflow that
-never started never reports, and would block the merge forever.
-The gates treat a skipped job as success for the same reason.
+hook lints it, and nor is `.vscode/review-scope.toml`, which decides
+what is reviewed at all. The filter is applied per job and not with
+a `paths-ignore:` on the trigger: a required check in a workflow
+that never started never reports, and would block the merge forever.
+The gates treat a skipped job as success for the same reason, and
+since `Check paths` is itself a dependency of both gates, a failure
+of the filter fails them.
 
 ### Other workflows
 
@@ -482,7 +487,8 @@ The gates treat a skipped job as success for the same reason.
 |----------|------|--------------|
 | `secret-scan.yml` | every pull request, pushes to `develop` | gitleaks over full history; not path-filtered, because a credential lands in documentation as easily as in code |
 | `supply-chain.yml` | Mondays 09:00 UTC, and on demand | `cargo audit` and `cargo deny` against `develop`, so a newly published advisory is noticed without waiting for a pull request |
-| `codeql-analysis.yml` | pull requests, pushes to `main` and `develop`, Tuesdays 17:00 UTC | CodeQL; skipped for documentation-only changes |
+| `codeql-analysis.yml` | pull requests, pushes to `main` and `develop`, Tuesdays 17:00 UTC | CodeQL; skipped for changes to documentation and review state alone |
+| `prune-reviews.yml` | pushes to `develop`, daily, and on demand | drops review marks whose file has changed since it was reviewed, imports marks for files identical to ones reviewed in shakenfist/development, and commits the result to `develop` as the bot; see [Reviewing andris](#reviewing-andris) |
 | `renovate.yml` | hourly | self-hosted Renovate dependency updates |
 | `release.yml` | a pushed `vX.Y.Z` tag; a manual dispatch builds and tests both wheels without publishing | checks that `ci.yml` passed on the tagged commit, builds the x86_64 and aarch64 wheels, signs the tag, creates the GitHub release and publishes to PyPI; see [releasing.md](releasing.md) |
 | `export-repo-config.yml` | nightly | exports repository settings into the repository |

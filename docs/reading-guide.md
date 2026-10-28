@@ -29,7 +29,9 @@ usually the clearest statement of what the code promises.
 start:
 
 - `#![deny(unsafe_code)]` holds crate-wide. Only `platform/x11/shm.rs`
-  and `platform/pulse/ffi.rs` opt out.
+  and `platform/pulse/ffi.rs` opt out: `ffi.rs` with an inner
+  attribute, and `shm` with one on its `mod` line in
+  `platform/x11/mod.rs`.
 - The server (`andris/src/server/`) knows SPICE and nothing of X11. The
   platform (`andris/src/platform/`) knows the desktop and nothing of
   SPICE. Keys cross between them as Linux evdev codes.
@@ -891,6 +893,9 @@ Rust release template, apart from their marked settings:
 `propose-release.sh` and `tag-release.sh` for the two stages,
 `release-version.sh` and its test, and `sign-release-tag.sh`, run by the
 release workflow. `docs/releasing.md` describes how they fit.
+`review-tracking.sh` and `ci-prune-reviews.sh` are the review-tracking
+template's copies: the first is the wrapper behind `next` and `status`,
+and the second is what the prune bot runs.
 
 ## CI
 
@@ -904,7 +909,8 @@ documentation included; `codeql-analysis.yml`, `supply-chain.yml` and
 `renovate.yml` are the scanners and the dependency bot; `pr-retest.yml`
 and `pr-re-review.yml` answer bot commands in comments;
 `export-repo-config.yml` snapshots the repository's GitHub settings into
-`.github/exported-config/`, which is generated. `actions/cargo-cache/`
+`.github/exported-config/`, which is generated; `prune-reviews.yml`
+keeps the review marks honest, dropping any whose file has changed. `actions/cargo-cache/`
 is the cache step every devcontainer job shares, and `actionlint.yaml`
 declares the runner labels. Several of these are copies of
 shakenfist/development's templates, and say so in their headers.

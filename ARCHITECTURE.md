@@ -6,6 +6,8 @@ the design commitments behind it. The documentation index is
 [`docs/index.md`](docs/index.md); how to run andris is in
 [`docs/running.md`](docs/running.md), and how to build, test and land
 a change is in [`docs/development.md`](docs/development.md).
+[`docs/reading-guide.md`](docs/reading-guide.md) gives an order to read
+the code in, and what to look at in each file.
 
 ## Components
 

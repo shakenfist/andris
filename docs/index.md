@@ -29,6 +29,9 @@ is meant to become.
   and the merge queue
 - [Releasing andris](releasing.md) - Publishing the wheels to PyPI:
   the one-time setup, the two-stage release, and what it produces
+- [Reading andris](reading-guide.md) - An order to read the code in,
+  from the binary through the server, its channels and the platform
+  backends, with what to look at in each file
 - [Plans index](plans/index.md) - Every planning document, with its
   intent and status
 - [X11 desktop over SPICE](plans/PLAN-x11-desktop.md) - The master

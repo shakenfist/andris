@@ -28,7 +28,9 @@ repos:
     rev: v6.0.0
     hooks:
       - id: trailing-whitespace
+        exclude: ^\.vscode/.*\.weaudit
       - id: end-of-file-fixer
+        exclude: ^\.vscode/.*\.weaudit
       - id: check-yaml
         exclude: ^scripts/kerbside-lane/compose\.override\.yml$
       # A compose override's `!reset` tag is not one PyYAML can

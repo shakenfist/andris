@@ -9,21 +9,31 @@ name: CI
 # pr-retest.yml's `gh workflow run ci.yml` is a full retest of a pull
 # request.
 #
-# Changes that cannot affect the build or the lint -- documentation
-# under docs/, and the licence -- are skipped on a pull request by the
-# check_paths job below; the merge tier always runs. Markdown elsewhere
-# is not skipped: AGENTS.md and the other root documents are agent
-# context, which the lint job's skillsaw hook checks. The gates still
-# pass: their jq treats a skipped dependency as success. This is
-# deliberately job-level filtering, not trigger-level `paths-ignore:`:
-# the gates are required status checks, and a required check in a
-# workflow that never started never reports, which blocks the merge
-# forever.
+# Changes that cannot affect the build, the lint or the tests are
+# skipped in both tiers by the check_paths job below: documentation
+# under docs/, the licence, and the code-review state -- the weAudit
+# marks under .vscode/ and the REVIEWS.md rendered from them. A review
+# session's pull request carries nothing else, and rebuilding the
+# wheel and rerunning the end-to-end lanes for it would test only what
+# develop already tested. Markdown elsewhere is not skipped: AGENTS.md
+# and the other root documents are agent context, which the lint job's
+# skillsaw hook checks. Nor is .vscode/review-scope.toml: it decides
+# what is reviewed at all, so a change to it is linted and reaches the
+# automated reviewer like code. Keep the skip list in step with the
+# .vscode entries in .gitignore and with codeql-analysis.yml, which
+# alone also skips review-scope.toml because CodeQL does not read it.
 #
-# The secret scanner is not here. It lives in secret-scan.yml, which
-# also runs on pushes to develop, and it deliberately does not consume
-# check_paths: a credential lands in documentation as easily as in
-# code.
+# The gates still pass: their jq treats a skipped dependency as
+# success. This is deliberately job-level filtering, not trigger-level
+# `paths-ignore:`: the gates are required status checks, and a required
+# check in a workflow that never started never reports, which blocks
+# the merge forever.
+#
+# The content scanners are not here. They live in secret-scan.yml,
+# which also runs on pushes to develop, and they deliberately do not
+# consume check_paths: their whole point is to read human-written text,
+# and a credential lands in documentation or a review note as easily
+# as in code.
 on:
   pull_request:
     branches: [develop]
@@ -34,43 +44,67 @@ permissions:
   contents: read
 
 jobs:
-  # Detect documentation-only changes so the tier jobs can skip them.
-  # The filter step runs only on pull_request. For every other event it
-  # is skipped and the output defaults to code_changed=true, so
-  # everything runs: workflow_dispatch has no pull request to diff, and
-  # the merge tier rebuilds whatever the queue hands it.
+  # Detect documentation-only and review-only changes so the tier jobs
+  # can skip them. The filter runs on pull_request and merge_group. On
+  # workflow_dispatch it is skipped and the output defaults to
+  # code_changed=true, so everything runs: a dispatch has no pull
+  # request or queue entry to diff, and it is asked for as a full
+  # retest. The default also makes the filter fail open -- a step that
+  # produces no output runs everything -- and a file outside the
+  # exclusion list below always counts as code.
   check_paths:
     name: "Check paths"
     runs-on: [self-hosted, static]
     timeout-minutes: 10
-    # paths-filter reads the changed-file list from pulls.listFiles
-    # rather than from the working tree, and the top-level permissions
-    # block sets every scope it does not name to none.
+    # Job-level permissions replace the top-level block rather than
+    # extend it, so the checkout's contents: read is named again
+    # beside the pull-requests: read that pulls.listFiles needs.
     permissions:
+      contents: read
       pull-requests: read
     outputs:
       code_changed: ${{ steps.filter.outputs.code || 'true' }}
     steps:
-      # There is deliberately no checkout step. On a pull_request event
-      # paths-filter asks the API for the changed files and never looks
-      # at the working tree, so a fork's content never reaches the
-      # static runner -- which is why this job, unlike the smoke jobs
-      # below, carries no fork guard.
+      # paths-filter diffs with git on merge_group, so it needs a
+      # checkout there; on pull_request it asks the API and never
+      # reads the tree (its README, "Supported workflows"). Skipping
+      # the checkout on pull_request keeps a fork's content off the
+      # static runner, which is why this job carries no fork guard.
+      # On merge_group the queue's content is checked out but never
+      # executed here, and the token is not left in the shared
+      # runner's .git config.
+      - uses: actions/checkout@v7
+        if: github.event_name == 'merge_group'
+        with:
+          persist-credentials: false
       - uses: dorny/paths-filter@v4
         id: filter
-        if: github.event_name == 'pull_request'
+        if: >-
+          github.event_name == 'pull_request'
+          || github.event_name == 'merge_group'
         with:
+          # On merge_group, compare against the payload's base_sha and
+          # never the develop branch, which moves: once the queue has
+          # merged this entry, a "Re-run all jobs" (the release recovery
+          # in docs/releasing.md) would diff against a develop already
+          # holding HEAD, find nothing, and let "Can merge" go green
+          # having tested nothing. A re-run keeps its payload. On
+          # pull_request the action ignores base.
+          base: ${{ github.event.merge_group.base_sha || 'develop' }}
           # By default a file matches the filter if it matches ANY listed
           # pattern, which makes '**' match everything and silently
           # defeats the '!docs/**' style exclusions. 'every' requires a
           # file to match ALL patterns, which is the correct semantics for
-          # an "everything except documentation" filter.
+          # an "everything except documentation and review state" filter.
           predicate-quantifier: 'every'
           filters: |
             code:
               - '**'
               - '!docs/**'
               - '!LICENSE'
+              - '!REVIEWS.md'
+              - '!.vscode/*.weaudit'
+              - '!.vscode/*.weaudit-shas.json'
 
   # Smoke tier: everything below here, up to the merge tier, runs on
   # pull_request (and on workflow_dispatch) and gates "Can enqueue".
@@ -233,7 +267,11 @@ jobs:
   # Merge tier: the jobs below run on merge_group and gate "Can merge".
   # They rebuild and retest the merge-group commit, which is what would
   # actually land, rather than the pull request head the smoke tier
-  # tested.
+  # tested. Like the smoke tier, each is skipped when check_paths finds
+  # only documentation or review state in the queue entry. If
+  # check_paths itself fails, the tier is skipped too (a status-free
+  # `if:` carries an implicit success()), and "Can merge" fails on
+  # check_paths' own result.
   #
   # They cannot carry the smoke tier's fork guard: a merge_group event has
   # no pull_request head to compare, so enqueueing a fork pull request
@@ -472,8 +510,11 @@ jobs:
   # this workflow's checks at all. Each gate uses always() so it still
   # runs when a dependency failed or was skipped, and its jq maps every
   # dependency to "success or skipped" and requires all of them. That is
-  # what lets a documentation-only change (where check_paths skips the
-  # whole tier) pass; a cancelled or failed dependency fails the gate.
+  # what lets a documentation-only or review-only change (where
+  # check_paths skips the whole tier) pass; a cancelled or failed
+  # dependency fails the gate. check_paths is itself a dependency of
+  # both, so its own failure or cancellation fails the gate even when
+  # the tier jobs it feeds did not run.
   # The ruleset requires these checks by name, so do not rename them.
   # They are ryll's gates, with the shell variables quoted so that
   # actionlint's shellcheck pass is clean.

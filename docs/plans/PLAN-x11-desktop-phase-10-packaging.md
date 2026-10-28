@@ -433,7 +433,7 @@ management session reviews each diff and makes each commit.
 | 9 | low | operator | none | Complete | PyPI trusted publisher, the `release` environment, tag protection. See brief 9. |
 | 10 | low | management | none | Complete | Release 0.1.0. See brief 10. |
 | 11 | medium | operator | none | Complete | The week's soak through kerbside. See brief 11. |
-| 12 | medium | management | none | In progress | The acceptance pull request. See brief 12. |
+| 12 | medium | management | none | Complete | The acceptance pull request. See brief 12. |
 
 Steps 1 and 2 are independent, and either may go first. Step 3 needs
 step 1, since its earned-tag check fails until libpulse is no longer

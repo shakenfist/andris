@@ -188,7 +188,7 @@ written with `/next-phase` as each phase comes up.
 | 8. Video streams | PLAN-x11-desktop-phase-08-video.md | Complete | ryll `a157ced` (#552), `601b9dc` (#554), `49072fc` (#557); andris `c2fe8a7` (#21), `1ecafa5` (#23) |
 | 9. Audio | PLAN-x11-desktop-phase-09-audio.md | Complete | ryll `38c51ef` (#578); andris `d8f316a` (#27) |
 | 10. Packaging and dogfood soak | PLAN-x11-desktop-phase-10-packaging.md | Complete | andris `553ecfb` (#28), `c0617e9` (#29), `c36e87a` (#49) |
-| 11. Human review | Not yet written | Not started | |
+| 11. Human review | PLAN-x11-desktop-phase-11-review.md | In progress | |
 | 12. Push audit | This file, below | Not started | |
 
 Rough sizing, as judgement rather than measurement: phases 0–5
@@ -514,24 +514,37 @@ acceptance pull request or recorded under Future work.
 
 ### Phase 11: Human review
 
+Detail is in
+[PLAN-x11-desktop-phase-11-review.md](PLAN-x11-desktop-phase-11-review.md).
 Asked for by the operator on 2026-10-14, who wants to read andris and
 learn how it works. Bring andris into shakenfist/development's
-review-tracking tooling, as ryll is:
+review-tracking tooling, as ryll is, by the steps of development's
+"Adopting a repository":
 
-- `.vscode/review-scope.toml`, modelled on ryll's: the Rust, scripts,
-  documentation, CI workflows, manifests, `deny.toml`, the `Makefile`
-  and the systemd unit are in scope;
-- a generated `REVIEWS.md`, and the `prune-reviews` workflow that keeps
-  it current on `develop`;
-- the audit matrix's review-coverage and review-scope-completeness
-  checks then apply, rather than reporting not applicable.
+- `.vscode/review-scope.toml`, modelled on ryll's: the Rust, tests,
+  scripts, documentation, CI workflows, manifests, `deny.toml`, the
+  `Makefile` and the systemd unit are in scope. Its `order = 'listed'`
+  makes the tooling's `next` offer files in the reading guide's order;
+- the template's `tools/review-tracking.sh`, `tools/ci-prune-reviews.sh`
+  and `prune-reviews` workflow, byte for byte, and a generated
+  `REVIEWS.md`;
+- a `.gitignore` that admits the review state, pre-commit excludes for
+  the review marks, CI that skips review-only changes in both tiers,
+  and a `DEPENDENCIES_TOKEN` secret, since andris's ruleset requires
+  pull requests;
+- five audits then apply: review-coverage, review-scope-completeness,
+  review-tracking-templates, review-marks-pre-commit and
+  review-scope-ci. Review-coverage keeps an issue open while five or
+  more in-scope files need review, which it will for most of the
+  phase.
 
 The phase also writes a reading guide in `docs/`: an order to read the
 code in, from the binary's entry point through the server, the
 channels and the platform backends, saying for each part what it does
 and what to look at. The operator then reviews the files in review
-sessions. Findings land as their own pull requests. The phase is done
-when every in-scope file carries a current review mark.
+sessions, each landing as a pull request. Findings land as their own
+pull requests. The phase is done when every in-scope file is reviewed
+on one commit of `develop`.
 
 ### Phase 12: Push audit
 
@@ -598,7 +611,9 @@ because the following statements will be true:
 * `docs/` describes running andris alongside xrdp, without
   reference to plan phases.
 * The daily consistency audit runs against andris and files no
-  issues, apart from the documented human-review exemption.
+  issues. Until phase 11's review is done, review-coverage keeps one
+  open; the audit has no exemption mechanism, and that issue is the
+  review's work queue.
 
 ### Documentation index maintenance
 

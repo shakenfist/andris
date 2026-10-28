@@ -293,13 +293,15 @@ it in a container, but never against a real desktop.
 version, or `Cargo.lock` disagrees with `Cargo.toml`. That should not
 happen through `tag-release`, which checks both first. If it does,
 after a tag pushed by hand, say, nothing has been signed or published.
-The version is fixed on `develop` through a new release pull request,
-and then an administrator moves the tag:
+The version is fixed on `develop` through a new pull request, and then an
+administrator moves the tag to the fixed commit. Name that commit:
+a fix pull request is not a "Release X.Y.Z." commit, so without it
+`tag-release` would pick the original release merge and refuse:
 
 ```bash
 git push origin :refs/tags/v0.1.0   # needs the tag ruleset's bypass
 git tag -d v0.1.0
-tools/tag-release.sh 0.1.0
+tools/tag-release.sh 0.1.0 <the fixed commit>
 ```
 
 ### The CI gate fails

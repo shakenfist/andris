@@ -112,9 +112,12 @@ locally:
   for the workspace; tests may unwrap.
 - **Commits go through `pre-commit run --all-files`.** Run it, and
   fix what it reports, before proposing a commit.
-- **The release scripts in `tools/` are copies of the Rust release
-  template** in shakenfist/development. Change the template first;
-  only their marked per-repository settings are andris's own.
+- **Four of the release scripts in `tools/` are copies of the Rust
+  release template** in shakenfist/development: `propose-release.sh`,
+  `release-version.sh`, `tag-release.sh` and `sign-release-tag.sh`.
+  Change the template first; only their marked per-repository
+  settings are andris's own. `test-release-version.sh` is andris's
+  own, and not a template copy.
 - **Python, if any appears** (tooling under `tools/`, say), uses
   single quotes for strings, double quotes for docstrings, and lines
   wrapped at 120 characters.

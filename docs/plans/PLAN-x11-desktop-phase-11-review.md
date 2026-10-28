@@ -330,7 +330,7 @@ management session reviews each diff and makes each commit.
 | 0 | low | management | none | Not started | Commit phase 10's close-out and this plan. |
 | 1 | high | opus | none | Not started | Write `docs/reading-guide.md`. See brief 1. |
 | 2 | medium | sonnet | none | Not started | The adoption files, the scope config and `REVIEWS.md`. See brief 2. |
-| 3 | medium | opus | none | Not started | CI skips review-only changes in both tiers. See brief 3. |
+| 3 | medium | opus | none | Complete | CI skips review-only changes in both tiers. See brief 3. |
 | 4 | low | sonnet | none | Not started | Add andris to development's adopters table, in a development worktree. See brief 4. |
 | 5 | low | operator | none | Not started | Add `DEPENDENCIES_TOKEN` to andris, and ready the review account's clone. See brief 5. |
 | 6 | medium | management | none | Not started | Push audit, then both pull requests. See brief 6. |
@@ -463,9 +463,9 @@ reasons, before writing andris's.
 - Add the three review-state exclusions to the filter, and keep
   `!docs/**` and `!LICENSE`. Do not add `.vscode/review-scope.toml`.
 - Gate every merge-tier job on `needs.check_paths.outputs.code_changed
-  != 'false'`, with `!cancelled()` as the smoke tier already has. The
-  gates' `jq` must still treat a skipped job as success. Check that
-  `Can merge` cannot go green when `check_paths` itself failed.
+  != 'false'`, as the smoke tier already is. The gates' `jq` must
+  still treat a skipped job as success. Check that `Can merge` cannot
+  go green when `check_paths` itself failed.
 - Rewrite the header comment (lines 12 to 21) to say that both tiers
   skip documentation and review state, and why.
 - Leave `secret-scan.yml`, `codeql-analysis.yml` and the

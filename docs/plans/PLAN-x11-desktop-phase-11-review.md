@@ -327,12 +327,12 @@ management session reviews each diff and makes each commit.
 
 | Step | Effort | Model | Isolation | Status | Brief for sub-agent |
 |------|--------|-------|-----------|--------|---------------------|
-| 0 | low | management | none | Not started | Commit phase 10's close-out and this plan. |
-| 1 | high | opus | none | Not started | Write `docs/reading-guide.md`. See brief 1. |
-| 2 | medium | sonnet | none | Not started | The adoption files, the scope config and `REVIEWS.md`. See brief 2. |
+| 0 | low | management | none | Complete | Commit phase 10's close-out and this plan. |
+| 1 | high | opus | none | Complete | Write `docs/reading-guide.md`. See brief 1. |
+| 2 | medium | sonnet | none | Complete | The adoption files, the scope config and `REVIEWS.md`. See brief 2. |
 | 3 | medium | opus | none | Complete | CI skips review-only changes in both tiers. See brief 3. |
-| 4 | low | sonnet | none | Not started | Add andris to development's adopters table, in a development worktree. See brief 4. |
-| 5 | low | operator | none | Not started | Add `DEPENDENCIES_TOKEN` to andris, and ready the review account's clone. See brief 5. |
+| 4 | low | sonnet | none | Complete | Add andris to development's adopters table, in a development worktree. See brief 4. |
+| 5 | low | operator | none | In progress | Add `DEPENDENCIES_TOKEN` to andris, and ready the review account's clone. See brief 5. |
 | 6 | medium | management | none | Not started | Push audit, then both pull requests. See brief 6. |
 | 7 | low | management | none | Not started | After the merge, check that the prune bot and the audits work. See brief 7. |
 | 8 | high | operator | none | Not started | The review sessions. See brief 8. |
@@ -341,6 +341,32 @@ management session reviews each diff and makes each commit.
 Step 1 comes first, because step 2's `include` order mirrors the
 guide's. Step 3 may run beside steps 1 and 2. Step 4 and step 5 may
 happen at any time before step 6 and step 7 respectively.
+
+### Execution notes
+
+- 2026-10-28 AEDT. The back brief was approved as written, and the
+  operator gave permission to push and open both pull requests, the
+  andris one and development's adopters-table one.
+- Steps 1 and 4 ran in parallel: step 4 writes only to its own
+  development worktree, so it cannot collide with the guide. Step 2
+  followed step 1 as planned, and step 3 ran after step 2 rather
+  than beside them, so that each step's `pre-commit` run had the
+  tree to itself.
+- The gate after step 1 was held. The operator approved the guide's
+  order unchanged, including its departures from decision 3's table:
+  the opcodes before the channel, the encoder, lossy and heat modules
+  before the stream, capture before shm, the PulseAudio module before
+  its FFI, and `audit.toml` beside `deny.toml`. Rows 10 and 11 became
+  one heading per file.
+- Brief 3 said the smoke tier gates its jobs with `!cancelled()`. It
+  does not, and nor does ryll. The step dropped it from the merge
+  tier, because "Can merge" fails on a failed `check_paths` either
+  way, and the brief is corrected.
+- Step 5: the operator reported `DEPENDENCIES_TOKEN` added, but on
+  2026-10-28 at 16:07 AEDT the andris repository, Dependabot and
+  `release` environment secret listings were all empty, while ryll's
+  shows it. Nothing needs it before the merge; step 7 checks again
+  before dispatching the prune bot.
 
 ### Brief 1: the reading guide
 

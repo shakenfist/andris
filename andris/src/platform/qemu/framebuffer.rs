@@ -212,20 +212,23 @@ impl Framebuffer {
         Ok(Some(clipped))
     }
 
-    /// Copy `rect` of the screen from `source`, an image of that
-    /// rectangle alone, as qemu sends an update over the socket. Returns
-    /// the part of `rect` that lies on the screen, which may be empty.
+    /// Copy `rect` of the screen from `source`, an image qemu sent over
+    /// the socket whose pixel `origin` is `rect`'s top left: (0, 0) unless
+    /// qemu's rectangle started off the top or left of the screen, and
+    /// was cut. Returns the part of `rect` that lies on the screen, which
+    /// may be empty.
     pub fn update_from_patch(
         &mut self,
         rect: Rectangle,
         source: Source<'_>,
+        origin: (u32, u32),
     ) -> Result<Option<Rectangle>> {
         let Some(clipped) = rect.clip(self.size) else {
             return Ok(None);
         };
-        // Clipping keeps the top left corner, so the patch's origin is
-        // still its first pixel.
-        self.copy(clipped, source, (0, 0))?;
+        // Clipping to the screen keeps the top left corner, so `origin`
+        // still names its pixel.
+        self.copy(clipped, source, origin)?;
         Ok(Some(clipped))
     }
 
@@ -342,22 +345,25 @@ mod tests {
 
     #[test]
     fn the_other_formats_convert_to_bgrx() {
-        // Pure red, in each format, as the bytes qemu sends.
-        let cases: &[(u32, &[u8])] = &[
-            (A8R8G8B8, &[0x00, 0x00, 0xff, 0x80]),
-            (0x2003_0888, &[0xff, 0x00, 0x00, 0x00]), // x8b8g8r8
-            (0x2008_0888, &[0x00, 0xff, 0x00, 0x00]), // b8g8r8x8
-            (0x2009_0888, &[0x00, 0x00, 0x00, 0xff]), // r8g8b8x8
-            (0x1802_0888, &[0x00, 0x00, 0xff]),       // r8g8b8
-            (0x1803_0888, &[0xff, 0x00, 0x00]),       // b8g8r8
-            (0x1002_0565, &[0x00, 0xf8]),             // r5g6b5
-            (0x1002_0555, &[0x00, 0x7c]),             // x1r5g5b5
+        // Red 0xc0, green 0x80 and blue 0x40 in each 8-bit format, and
+        // pure red in the narrow ones, as the bytes qemu sends.
+        const MIXED: [u8; 4] = [0x40, 0x80, 0xc0, 0];
+        const RED: [u8; 4] = [0, 0, 0xff, 0];
+        let cases: &[(u32, &[u8], [u8; 4])] = &[
+            (A8R8G8B8, &[0x40, 0x80, 0xc0, 0x80], MIXED),
+            (0x2003_0888, &[0xc0, 0x80, 0x40, 0x00], MIXED), // x8b8g8r8
+            (0x2008_0888, &[0x00, 0xc0, 0x80, 0x40], MIXED), // b8g8r8x8
+            (0x2009_0888, &[0x00, 0x40, 0x80, 0xc0], MIXED), // r8g8b8x8
+            (0x1802_0888, &[0x40, 0x80, 0xc0], MIXED),       // r8g8b8
+            (0x1803_0888, &[0xc0, 0x80, 0x40], MIXED),       // b8g8r8
+            (0x1002_0565, &[0x00, 0xf8], RED),               // r5g6b5
+            (0x1002_0555, &[0x00, 0x7c], RED),               // x1r5g5b5
         ];
         let size = Size {
             width: 1,
             height: 1,
         };
-        for &(format, bytes) in cases {
+        for &(format, bytes, expected) in cases {
             let mut fb = Framebuffer::new(size).unwrap();
             fb.replace(
                 size,
@@ -369,11 +375,7 @@ mod tests {
             )
             .unwrap();
             let whole = fb.capture_all().unwrap().into_whole().unwrap();
-            assert_eq!(
-                pixel(&whole, 0, 0),
-                [0, 0, 0xff, 0],
-                "format {format:#010x}"
-            );
+            assert_eq!(pixel(&whole, 0, 0), expected, "format {format:#010x}");
         }
     }
 
@@ -430,6 +432,7 @@ mod tests {
                 stride: 10,
                 format: X8R8G8B8,
             },
+            (0, 0),
         )
         .unwrap();
         let whole = fb.capture_all().unwrap().into_whole().unwrap();
@@ -456,19 +459,41 @@ mod tests {
                 .unwrap(),
             None
         );
-        let short = Source {
-            data: &screen[..40],
-            stride: 16,
+        // With padded rows, the last row needs only its pixels: 56 bytes
+        // hold the screen, and 55 do not.
+        let padded = image(SIZE, 20);
+        let cut = |len: usize| Source {
+            data: &padded[..len],
+            stride: 20,
             format: X8R8G8B8,
         };
-        assert!(fb.update_from_screen(Rectangle::full(SIZE), short).is_err());
+        assert!(
+            fb.update_from_screen(Rectangle::full(SIZE), cut(56))
+                .is_ok()
+        );
+        assert!(
+            fb.update_from_screen(Rectangle::full(SIZE), cut(55))
+                .is_err()
+        );
+        let unaddressable = Source {
+            data: &screen,
+            stride: usize::MAX,
+            format: X8R8G8B8,
+        };
+        let error = fb
+            .update_from_screen(Rectangle::full(SIZE), unaddressable)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("too large to address"),
+            "{error}"
+        );
         let refused = Source {
             data: &screen,
             stride: 16,
             format: 0x0804_0000,
         };
         assert!(
-            fb.update_from_patch(Rectangle::full(SIZE), refused)
+            fb.update_from_patch(Rectangle::full(SIZE), refused, (0, 0))
                 .is_err()
         );
     }

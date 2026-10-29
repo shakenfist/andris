@@ -1,6 +1,5 @@
 //! Just enough of QMP, qemu's JSON monitor protocol, to hand qemu one end
-//! of a socket as a D-Bus display client, and then to learn when qemu
-//! goes away.
+//! of a socket as a D-Bus display client.
 //!
 //! QMP sends one JSON object a line: a greeting, then a `return` or an
 //! `error` for each command, with asynchronous `event`s interleaved. A
@@ -75,26 +74,6 @@ impl Qmp {
             "adding a D-Bus display client; qemu must run with -display dbus,p2p=on for andris \
              to attach to it",
         )
-    }
-
-    /// Stop timing reads out, and wait for qemu to close the connection,
-    /// reading and dropping the events it sends meanwhile. Returns why the
-    /// connection ended: qemu's `SHUTDOWN` event, end of file, or an
-    /// error.
-    pub fn wait_for_close(mut self) -> String {
-        if let Err(error) = self.reader.get_ref().set_read_timeout(None) {
-            return format!("could not wait on qemu's QMP socket: {error}");
-        }
-        loop {
-            match self.read_message() {
-                Ok(message) => {
-                    if message.get("event").and_then(Value::as_str) == Some("SHUTDOWN") {
-                        return "qemu is shutting down".to_string();
-                    }
-                }
-                Err(error) => return format!("{error:#}"),
-            }
-        }
     }
 
     /// Send `command`, with `fd` attached if given, and wait for its
@@ -229,17 +208,5 @@ mod tests {
         assert!(seen[0].contains("qmp_capabilities"));
         assert!(seen[1].contains("\"getfd\"") && seen[1].contains("display"));
         assert!(seen[2].contains("@dbus-display"));
-    }
-
-    #[test]
-    fn a_closed_socket_ends_the_wait() {
-        let dir = tempfile::tempdir().unwrap();
-        let (path, server) = fake_qmp(dir.path(), vec![]);
-        let qmp = Qmp::connect(&path, Duration::from_secs(5)).unwrap();
-        // The fake hangs up once andris does; shut down its read side so
-        // that it does now.
-        qmp.writer.shutdown(std::net::Shutdown::Write).unwrap();
-        server.join().unwrap();
-        assert!(qmp.wait_for_close().contains("closed"));
     }
 }

@@ -21,24 +21,32 @@
 //! to anything but `ScanoutMap`, which it waits for with its main loop
 //! held, so a slow `ScanoutMap` stalls the guest.
 //!
+//! The cursor comes on the same interface: `CursorDefine` gives a shape
+//! in ARGB words, and `MouseSet` shows or hides it. A guest that draws
+//! its own pointer into the screen, as one on std-vga does, sends
+//! neither. `MouseSet` also carries the pointer's position, which
+//! andris has no use for: its clients draw the pointer where their own
+//! mouse is.
+//!
 //! Each update is logged at debug level with the wall-clock time it
 //! arrived, in microseconds since the epoch, and how long the copy took,
 //! so that a trace can be lined up with qemu's own trace log, which
 //! stamps events with the same clock.
 
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use qemu_display::{ScanoutMap, ScanoutMmap};
 use serde_bytes::ByteBuf;
+use tokio::sync::watch;
 use tracing::{debug, warn};
 use zbus::fdo;
 use zbus::zvariant::Fd;
 
 use super::framebuffer::{Framebuffer, Source};
-use crate::platform::{DamageHub, Rectangle, Size};
+use crate::platform::{CursorReceiver, CursorShape, DamageHub, Rectangle, Size};
 
 /// Where qemu expects the listener's objects.
 pub const LISTENER_PATH: &str = "/org/qemu/Display1/Listener";
@@ -59,6 +67,18 @@ pub struct Shared {
     /// logged once.
     last_failure: Mutex<Option<String>>,
     pub damage: DamageHub,
+    /// The guest's cursor as qemu last described it.
+    cursor: Mutex<Cursor>,
+    /// The cursor as the platform reports it: the shape while qemu shows
+    /// it, otherwise `None`.
+    cursor_shapes: watch::Sender<Option<Arc<CursorShape>>>,
+}
+
+/// The guest's cursor: the shape qemu last defined, and whether qemu
+/// shows it. Shown until qemu says otherwise.
+struct Cursor {
+    shape: Option<Arc<CursorShape>>,
+    visible: bool,
 }
 
 impl Shared {
@@ -74,7 +94,49 @@ impl Shared {
                 width: 1,
                 height: 1,
             }),
+            cursor: Mutex::new(Cursor {
+                shape: None,
+                visible: true,
+            }),
+            cursor_shapes: watch::channel(None).0,
         }
+    }
+
+    /// The screen's size. Fails if qemu has sent no screen yet.
+    pub fn size(&self) -> Result<Size> {
+        self.screen()?
+            .as_ref()
+            .map(Framebuffer::size)
+            .ok_or_else(|| anyhow!("qemu has sent no screen"))
+    }
+
+    /// A receiver of the cursor as the platform reports it.
+    pub fn subscribe_cursor(&self) -> CursorReceiver {
+        self.cursor_shapes.subscribe()
+    }
+
+    /// Change the cursor with `change`, and report the result if what
+    /// clients should see changed.
+    fn set_cursor(&self, change: impl FnOnce(&mut Cursor)) -> Result<()> {
+        let mut cursor = self
+            .cursor
+            .lock()
+            .map_err(|_| anyhow!("the qemu cursor's lock is poisoned"))?;
+        change(&mut cursor);
+        let shown = cursor.shape.clone().filter(|_| cursor.visible);
+        // MouseSet comes with every move of the guest's pointer, so the
+        // shape is compared by identity, not pixel by pixel; a define
+        // makes a new one.
+        self.cursor_shapes
+            .send_if_modified(|reported| match (reported.as_ref(), shown.as_ref()) {
+                (None, None) => false,
+                (Some(old), Some(new)) if Arc::ptr_eq(old, new) => false,
+                _ => {
+                    *reported = shown;
+                    true
+                }
+            });
+        Ok(())
     }
 
     /// The screen, locked.
@@ -182,6 +244,55 @@ fn rectangle(x: i32, y: i32, w: i32, h: i32) -> Option<Rectangle> {
     Some(Rectangle::new(x as u32, y as u32, width, height))
 }
 
+/// The cursor qemu's `CursorDefine` describes: `width` x `height` with
+/// its hot spot at (`hot_x`, `hot_y`), and `data` holding each pixel as a
+/// 32-bit ARGB word in qemu's byte order, which is this host's.
+fn cursor_shape(
+    width: i32,
+    height: i32,
+    hot_x: i32,
+    hot_y: i32,
+    data: &[u8],
+) -> Result<CursorShape> {
+    let side = |value: i32, what: &str| {
+        u16::try_from(value).with_context(|| format!("qemu sent a cursor {what} of {value}"))
+    };
+    let (width, height) = (side(width, "width")?, side(height, "height")?);
+    let (hot_x, hot_y) = (side(hot_x, "hot spot x")?, side(hot_y, "hot spot y")?);
+    let pixels = usize::from(width) * usize::from(height);
+    ensure!(
+        data.len() == pixels * 4,
+        "qemu sent {} bytes for a {width}x{height} cursor, not {}",
+        data.len(),
+        pixels * 4
+    );
+    let argb = data
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| u32::from_ne_bytes(*word))
+        .collect();
+    CursorShape::new(width, height, hot_x, hot_y, argb)
+}
+
+/// `fd`, if the file behind it holds at least `needed` bytes. Reading a
+/// mapping past the end of its file faults, which would kill andris, so
+/// a screen is mapped only once the file is known to hold it. qemu does
+/// not seal its screens' memfds against shrinking, so a qemu that
+/// truncated one later could still fault andris; the guest cannot.
+fn holding(fd: OwnedFd, needed: u64) -> Result<OwnedFd> {
+    let file = std::fs::File::from(fd);
+    let length = file
+        .metadata()
+        .context("cannot read the size of the screen's file")?
+        .len();
+    ensure!(
+        length >= needed,
+        "qemu shared a screen of {needed} bytes in a file of {length}"
+    );
+    Ok(OwnedFd::from(file))
+}
+
 /// Now, on the wall clock, in microseconds since the epoch: the clock
 /// qemu's trace log stamps events with.
 fn wall_clock_us() -> u128 {
@@ -248,6 +359,12 @@ impl Listener {
         let Some(rect) = rectangle(x, y, w, h) else {
             return;
         };
+        // The pixels start at qemu's corner, which a negative coordinate
+        // put off the screen: the first on it is this far in.
+        let origin = (
+            (i64::from(rect.x) - i64::from(x)) as u32,
+            (i64::from(rect.y) - i64::from(y)) as u32,
+        );
         let result = self.shared.update(rect, |screen| {
             screen.update_from_patch(
                 rect,
@@ -256,6 +373,7 @@ impl Listener {
                     stride: stride as usize,
                     format,
                 },
+                origin,
             )
         });
         debug!(
@@ -275,6 +393,36 @@ impl Listener {
     /// The guest turned its screen off. The last picture stays.
     async fn disable(&mut self) {
         debug!("qemu disabled the guest's screen; the last picture stays");
+    }
+
+    /// The guest's cursor took a new shape.
+    async fn cursor_define(
+        &mut self,
+        width: i32,
+        height: i32,
+        hot_x: i32,
+        hot_y: i32,
+        data: ByteBuf,
+    ) {
+        debug!(width, height, hot_x, hot_y, "qemu cursor shape");
+        let result = cursor_shape(width, height, hot_x, hot_y, &data).and_then(|shape| {
+            let shape = Arc::new(shape);
+            self.shared.set_cursor(|cursor| cursor.shape = Some(shape))
+        });
+        // Only a failure is reported: a success would clear a failing
+        // screen update's warning, and log it again at its next failure.
+        if result.is_err() {
+            self.shared.report("CursorDefine", result);
+        }
+    }
+
+    /// The guest's pointer moved to (`x`, `y`), and is shown unless `on`
+    /// is 0. Only whether it is shown matters to andris.
+    async fn mouse_set(&mut self, _x: i32, _y: i32, on: i32) {
+        let result = self.shared.set_cursor(|cursor| cursor.visible = on != 0);
+        if result.is_err() {
+            self.shared.report("MouseSet", result);
+        }
     }
 
     /// The optional interfaces this listener implements, which qemu reads
@@ -316,6 +464,8 @@ impl MapListener {
             .as_fd()
             .try_clone_to_owned()
             .map_err(|error| fdo::Error::Failed(format!("cannot keep the screen's fd: {error}")))?;
+        let needed = u64::from(offset) + u64::from(stride) * u64::from(height);
+        let fd = holding(fd, needed).map_err(|error| fdo::Error::Failed(format!("{error:#}")))?;
         let mapped = ScanoutMap {
             fd,
             offset,
@@ -326,17 +476,20 @@ impl MapListener {
         }
         .mmap()
         .map_err(|error| fdo::Error::Failed(format!("cannot map the screen: {error}")))?;
+        // A screen andris refuses is not kept, so that no update is read
+        // from it against another screen's geometry.
         let result = self.shared.mapping().and_then(|mut mapping| {
-            let result = self.shared.replace(
+            *mapping = None;
+            self.shared.replace(
                 Size { width, height },
                 Source {
                     data: mapped.as_ref(),
                     stride: stride as usize,
                     format,
                 },
-            );
+            )?;
             *mapping = Some(mapped);
-            result
+            Ok(())
         });
         debug!(
             kind = "ScanoutMap",
@@ -392,6 +545,42 @@ impl MapListener {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_screen_must_fit_its_file() {
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(100).unwrap();
+        let fd = OwnedFd::from(file);
+        let fd = holding(fd, 100).unwrap();
+        let error = holding(fd, 101).unwrap_err();
+        assert!(format!("{error:#}").contains("101 bytes in a file of 100"));
+    }
+
+    #[test]
+    fn cursors_take_qemus_argb_words() {
+        let words = [0xff00_00ffu32, 0x8012_3456, 0, 0x0102_0304];
+        let data: Vec<u8> = words.iter().flat_map(|word| word.to_ne_bytes()).collect();
+        let shape = cursor_shape(2, 2, 1, 1, &data).unwrap();
+        assert_eq!(
+            (shape.width(), shape.height(), shape.hot_x(), shape.hot_y()),
+            (2, 2, 1, 1)
+        );
+        assert_eq!(shape.argb(), words);
+
+        let refused = |width, height, hot_x, hot_y, data: &[u8]| {
+            format!(
+                "{:#}",
+                cursor_shape(width, height, hot_x, hot_y, data).unwrap_err()
+            )
+        };
+        assert!(refused(2, 2, 0, 0, &data[..12]).contains("12 bytes for a 2x2 cursor, not 16"));
+        assert!(refused(2, 2, 0, 0, &[data.clone(), vec![0; 4]].concat()).contains("20 bytes"));
+        assert!(refused(-2, 2, 0, 0, &data).contains("width of -2"));
+        assert!(refused(2, 70_000, 0, 0, &data).contains("height of 70000"));
+        assert!(refused(2, 2, -1, 0, &data).contains("hot spot x of -1"));
+        assert!(refused(2, 2, 0, 2, &data).contains("hot spot"));
+        assert!(refused(0, 0, 0, 0, &[]).contains("no pixels"));
+    }
 
     #[test]
     fn rectangles_lose_their_negative_parts() {

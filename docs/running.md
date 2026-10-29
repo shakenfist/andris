@@ -193,8 +193,10 @@ target/release/andris --platform qemu --qmp /run/vm1/qmp.sock --ticket-file tick
 Andris passes qemu a socket over QMP (`getfd`, then `add_client` with
 protocol `@dbus-display`), registers a display listener on the first
 console, and waits up to 10 seconds for qemu's first picture before it
-listens for clients. When qemu exits, andris stops, as it does when an
-X server goes. qemu's D-Bus display needs its `ui-dbus` module
+listens for clients. It then closes QMP, which gives full control of
+qemu, so the QMP socket is free for other tools once andris has
+attached; a restarted andris attaches through it again. When qemu
+exits, andris stops, as it does when an X server goes. qemu's D-Bus display needs its `ui-dbus` module
 (Debian's `qemu-system-modules-opengl`).
 
 The guest's screen arrives in one of two ways, chosen by qemu:
@@ -211,11 +213,50 @@ and captures from that. Each change is logged at debug level
 arrived and how long the copy took, on the clock qemu's trace log
 uses.
 
-The platform exports the picture only: it takes no keyboard or
-mouse input (events are dropped), has no cursor shape, refuses
-resizes, and has no clipboard or sound. It shows one head, and not a
-GPU (`gl=on`) scanout. `-display dbus` without `p2p=on`, the mode
-libvirt's `<graphics type='dbus'/>` defaults to, is not supported.
+Input goes back to the console's keyboard and mouse on the same
+D-Bus connection:
+
+- **Keys** go as qnums, qemu's numbering of PC scan codes, through a
+  table generated from keycodemapdb by `scripts/gen-qemu-qnums.py`. A
+  key with no qnum is dropped.
+- **The mouse** follows the guest's: absolute if the guest has a
+  tablet (`-device usb-tablet`), otherwise relative. Andris reads which
+  from qemu at most once a second, and again after qemu refuses a
+  motion. For a relative mouse, client mouse mode's positions are sent
+  as the distance from the last position, so the guest's own pointer
+  acceleration can make its pointer drift from the client's; give the
+  guest a tablet.
+- **The lock state** is the keyboard's, as qemu reports it.
+
+The cursor is the shape a virtio-gpu guest sets for its hardware
+cursor, hidden while qemu says the guest hides it. A guest that draws
+its own pointer into the screen, as one on std-vga does, has no
+cursor shape, so the client draws its own.
+
+### Limits
+
+- **Only virtio-gpu in 2D mode has been measured.** On it, each
+  rectangle the guest flushed reached andris unchanged, a fraction of a
+  millisecond later. std-vga and bochs-display work, over the polled
+  path above, but each update is copied through the socket at full
+  width.
+- **A stalled andris grows qemu's memory on some guests.** qemu sends
+  updates without waiting for andris, and queues what andris has not
+  read. On the shared-memory path with a guest that draws into one
+  buffer, the queue holds only rectangles, and stays small. On std-vga,
+  where every update carries its pixels, and with a virtio-gpu guest
+  that flips between buffers, which makes qemu share the screen again
+  and wait for andris to answer, a listener that stops reading grows
+  qemu by hundreds of megabytes a second; qemu frees the queue when
+  andris disconnects. A flipping guest also freezes for up to a second
+  while qemu waits, after which qemu sends andris whole frames in each
+  message for as long as andris stays attached. Andris has no watchdog
+  for this, so treat the qemu platform as an experiment, not something
+  to put in front of production guests.
+- One head (qemu's first console), and no GPU (`gl=on`) scanout.
+- No resizing the guest from the client, no clipboard, and no sound.
+- `-display dbus` without `p2p=on`, the mode libvirt's
+  `<graphics type='dbus'/>` defaults to, is not supported.
 
 ## The ticket file
 

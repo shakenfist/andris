@@ -52,9 +52,10 @@ andris --ticket-file PATH [options]
 | Option | Default | Meaning |
 |--------|---------|---------|
 | `--ticket-file PATH` | none; required | File holding the SPICE ticket (password) clients must present |
-| `--platform x11\|synthetic` | `x11` | The display system to export |
+| `--platform x11\|synthetic\|qemu` | `x11` | The display system to export; `qemu` only in a build with the `qemu` feature |
 | `--display DISPLAY` | the `DISPLAY` environment variable | The X display to export, such as `:10`; used by `--platform x11` |
 | `--synthetic-size WxH` | `1024x768` | The test pattern's size; used by `--platform synthetic` |
+| `--qmp PATH` | none | The QMP socket of the qemu whose guest to export; used by `--platform qemu`, and present only in a build with the `qemu` feature |
 | `--listen ADDR:PORT` | `127.0.0.1:5900` | The plain TCP listener |
 | `--tls-listen ADDR:PORT` | none | A TLS listener; needs `--tls-cert` and `--tls-key` |
 | `--tls-cert PATH` | none | The TLS certificate chain, as PEM, leaf first |
@@ -174,6 +175,47 @@ bars with an orange square that moves along them. It needs no X
 server and records the input it is given rather than injecting it.
 It is for trying a client, load testing, and the tests.
 `--synthetic-size` sets its size.
+
+## The qemu platform
+
+A build with the `qemu` cargo feature (`cargo build --features qemu`,
+or `make release FEATURES=qemu`) can export a qemu guest's screen
+instead of an X display, taken from qemu's D-Bus display. The default
+build, and the wheel, leave it out. Start qemu with a peer-to-peer
+D-Bus display and a QMP socket that andris may use:
+
+```bash
+qemu-system-x86_64 ... -vga none -device virtio-vga \
+    -display dbus,p2p=on,gl=off -qmp unix:/run/vm1/qmp.sock,server=on,wait=off
+target/release/andris --platform qemu --qmp /run/vm1/qmp.sock --ticket-file ticket
+```
+
+Andris passes qemu a socket over QMP (`getfd`, then `add_client` with
+protocol `@dbus-display`), registers a display listener on the first
+console, and waits up to 10 seconds for qemu's first picture before it
+listens for clients. When qemu exits, andris stops, as it does when an
+X server goes. qemu's D-Bus display needs its `ui-dbus` module
+(Debian's `qemu-system-modules-opengl`).
+
+The guest's screen arrives in one of two ways, chosen by qemu:
+
+- **Shared memory**, for virtio-gpu's 2D resources: qemu shares the
+  screen once, then sends only the rectangles the guest flushed.
+- **Pixels in each message**, for std-vga and bochs-display, whose
+  screen is video memory: qemu polls it every 30 ms and sends each
+  band of changed scanlines, at full width.
+
+Either way andris copies each change into a framebuffer of its own
+and captures from that. Each change is logged at debug level
+(`RUST_LOG=andris::platform::qemu=debug`) with the wall-clock time it
+arrived and how long the copy took, on the clock qemu's trace log
+uses.
+
+The platform exports the picture only: it takes no keyboard or
+mouse input (events are dropped), has no cursor shape, refuses
+resizes, and has no clipboard or sound. It shows one head, and not a
+GPU (`gl=on`) scanout. `-display dbus` without `p2p=on`, the mode
+libvirt's `<graphics type='dbus'/>` defaults to, is not supported.
 
 ## The ticket file
 

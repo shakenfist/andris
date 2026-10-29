@@ -67,6 +67,11 @@ pub fn run(config: Config) -> Result<()> {
             info!("exporting X display {name}");
             X11Platform::connect(name)?.platform()
         }
+        #[cfg(feature = "qemu")]
+        PlatformConfig::Qemu { qmp } => {
+            info!("exporting the guest of the qemu at {}", qmp.display());
+            platform::qemu::QemuPlatform::connect(qmp)?.platform()
+        }
     };
     platform.audio = audio;
     let runtime = tokio::runtime::Builder::new_multi_thread()

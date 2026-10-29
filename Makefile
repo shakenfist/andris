@@ -46,6 +46,12 @@ KERBSIDE_REV := 2d9ee91e29095e4566b8452d50fbc1ca521ba4f8
 KERBSIDE_VERSION := 0.7.0
 KERBSIDE_ROOT := $(CARGO_CACHE_DIR)/kerbside
 
+# Cargo features for `build`, `release` and `test`, none by default:
+# `make test FEATURES=qemu` builds and tests the qemu platform too.
+# `lint` ignores it, and always checks both builds.
+FEATURES ?=
+CARGO_FEATURES := $(if $(strip $(FEATURES)),--features $(FEATURES))
+
 # The architecture `make wheel` builds for: the host's by default, since
 # the wheel is built natively, not under emulation. Set on the command
 # line (`make wheel ARCH=x86_64`), which overrides this; an ARCH in the
@@ -227,25 +233,26 @@ target-dir:
 build: fetch target-dir
 	$(DOCKER_RUN_OFFLINE) \
 		$(ANDRIS_IMAGE) \
-		cargo build --frozen --workspace
+		cargo build --frozen --workspace $(CARGO_FEATURES)
 
 # Build release version
 release: fetch target-dir
 	$(DOCKER_RUN_OFFLINE) \
 		$(ANDRIS_IMAGE) \
-		cargo build --release --frozen --workspace
+		cargo build --release --frozen --workspace $(CARGO_FEATURES)
 
 # Run tests
 test: fetch target-dir
 	$(DOCKER_RUN_OFFLINE) \
 		$(ANDRIS_IMAGE) \
-		cargo test --frozen --workspace
+		cargo test --frozen --workspace $(CARGO_FEATURES)
 
-# Run linting checks (rustfmt + clippy)
+# Run linting checks (rustfmt + clippy), on the default build and on the
+# qemu feature's, which compiles code the default build leaves out.
 lint: fetch target-dir
 	$(DOCKER_RUN_OFFLINE) \
 		$(ANDRIS_IMAGE) \
-		sh -c "cargo fmt --all -- --check && cargo clippy --frozen --workspace --all-targets -- -D warnings"
+		sh -c "cargo fmt --all -- --check && cargo clippy --frozen --workspace --all-targets -- -D warnings && cargo clippy --frozen --workspace --all-targets --features qemu -- -D warnings"
 
 # Run linting with auto-fix. Unlike the targets above this mounts the
 # checkout writable, since rustfmt and clippy --fix write sources: run

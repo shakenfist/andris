@@ -42,6 +42,10 @@ pub enum PlatformKind {
     X11,
     /// A generated test pattern of `--synthetic-size`.
     Synthetic,
+    /// A qemu guest's screen, from the D-Bus display of the qemu whose
+    /// QMP socket is `--qmp`.
+    #[cfg(feature = "qemu")]
+    Qemu,
 }
 
 /// Andris's whole command line: either a subcommand, or the options of
@@ -136,6 +140,12 @@ pub struct Args {
     #[arg(long, value_name = "WxH", default_value = "1024x768", value_parser = parse_size)]
     pub synthetic_size: Size,
 
+    /// The QMP socket of the qemu whose guest to export, for `--platform
+    /// qemu`. qemu must run with `-display dbus,p2p=on`.
+    #[cfg(feature = "qemu")]
+    #[arg(long, value_name = "PATH")]
+    pub qmp: Option<PathBuf>,
+
     /// The shortest time between two frames, in milliseconds: a cap on
     /// the frame rate. A frame is sent only when the desktop changes.
     #[arg(
@@ -177,6 +187,9 @@ pub enum PlatformConfig {
     X11 { display: String },
     /// The synthetic test pattern, at this size.
     Synthetic { size: Size },
+    /// A qemu guest, through the QMP socket at this path.
+    #[cfg(feature = "qemu")]
+    Qemu { qmp: PathBuf },
 }
 
 /// Where the desktop's sound comes from.
@@ -289,7 +302,25 @@ impl Args {
                 "--audio-source {source} names a PulseAudio source, but --platform synthetic \
                  plays a tone of its own: leave --audio-source out, or use --platform x11"
             ),
+            #[cfg(feature = "qemu")]
+            (false, PlatformKind::Qemu, None) => AudioConfig::Off,
+            #[cfg(feature = "qemu")]
+            (false, PlatformKind::Qemu, Some(source)) => bail!(
+                "--audio-source {source} names a PulseAudio source, but --platform qemu \
+                 exports no sound: leave --audio-source out"
+            ),
         };
+
+        #[cfg(feature = "qemu")]
+        if let Some(qmp) = &self.qmp
+            && self.platform != PlatformKind::Qemu
+        {
+            bail!(
+                "--qmp {} names qemu's QMP socket, which only --platform qemu uses: leave --qmp \
+                 out, or use --platform qemu",
+                qmp.display()
+            );
+        }
 
         let platform = match self.platform {
             PlatformKind::X11 => match self.display {
@@ -301,6 +332,14 @@ impl Args {
             },
             PlatformKind::Synthetic => PlatformConfig::Synthetic {
                 size: self.synthetic_size,
+            },
+            #[cfg(feature = "qemu")]
+            PlatformKind::Qemu => match self.qmp {
+                Some(qmp) if !qmp.as_os_str().is_empty() => PlatformConfig::Qemu { qmp },
+                _ => bail!(
+                    "--platform qemu needs qemu's QMP socket: give --qmp, and run qemu with \
+                     -display dbus,p2p=on and a -qmp unix socket"
+                ),
             },
         };
 
@@ -762,6 +801,70 @@ mod tests {
             read_ticket_file(ticket.path()).unwrap().as_bytes(),
             b"kerbside-11"
         );
+    }
+
+    #[cfg(feature = "qemu")]
+    #[test]
+    fn qemu_needs_a_qmp_socket_and_has_no_sound() {
+        let ticket = ticket_file(b"secret\n", 0o600);
+        let path = ticket.path().to_str().unwrap();
+        let config = Args::try_parse_from([
+            "andris",
+            "--ticket-file",
+            path,
+            "--platform",
+            "qemu",
+            "--qmp",
+            "/run/qemu/qmp.sock",
+        ])
+        .unwrap()
+        .validate()
+        .unwrap();
+        assert_eq!(
+            config.platform,
+            PlatformConfig::Qemu {
+                qmp: PathBuf::from("/run/qemu/qmp.sock")
+            }
+        );
+        assert_eq!(config.audio, AudioConfig::Off);
+
+        let args =
+            Args::try_parse_from(["andris", "--ticket-file", path, "--platform", "qemu"]).unwrap();
+        let message = error(args);
+        assert!(message.contains("--qmp"), "{message}");
+        assert!(message.contains("p2p=on"), "{message}");
+
+        let args = Args::try_parse_from([
+            "andris",
+            "--ticket-file",
+            path,
+            "--platform",
+            "qemu",
+            "--qmp",
+            "/run/qemu/qmp.sock",
+            "--audio-source",
+            "sink.monitor",
+        ])
+        .unwrap();
+        assert!(error(args).contains("--platform qemu"));
+
+        for platform in ["x11", "synthetic"] {
+            let args = Args::try_parse_from([
+                "andris",
+                "--ticket-file",
+                path,
+                "--platform",
+                platform,
+                "--display",
+                ":10",
+                "--qmp",
+                "/run/qemu/qmp.sock",
+            ])
+            .unwrap();
+            let message = error(args);
+            assert!(message.contains("--qmp /run/qemu/qmp.sock"), "{message}");
+            assert!(message.contains("only --platform qemu"), "{message}");
+        }
     }
 
     #[test]

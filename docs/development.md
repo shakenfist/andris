@@ -28,8 +28,8 @@ container runs as your uid and gid.
 ```bash
 make build      # debug build of the whole workspace
 make release    # release build
-make test       # cargo test across the workspace
-make lint       # cargo fmt --check, then clippy with -D warnings
+make test       # cargo test (FEATURES=qemu adds the qemu platform)
+make lint       # cargo fmt --check, then clippy -D warnings, both builds
 make ryll-headless  # build ryll's headless client at the pinned revision
 make e2e        # run andris against Xvfb, driven by ryll
 make e2e-xrdp   # run andris against a real xrdp session, in a container
@@ -367,8 +367,10 @@ Dependencies are checked by `cargo deny` against
 [`deny.toml`](https://github.com/shakenfist/andris/blob/develop/deny.toml):
 a licence allowlist, yanked crates denied, and crates.io as the only
 registry. Git dependencies are denied except for the ryll
-repository. Add a licence to the allowlist only when a dependency
-needs it, and give every advisory ignore a URL and a rationale.
+repository and qemu-display, which only the optional `qemu` feature
+uses; `andris/Cargo.toml` says why that is pinned to a commit. Add a
+licence to the allowlist only when a dependency needs it, and give
+every advisory ignore a URL and a rationale.
 `cargo audit` runs too and does not read `deny.toml`, so
 [`.cargo/audit.toml`](https://github.com/shakenfist/andris/blob/develop/.cargo/audit.toml)
 repeats the same advisory ignores; change both together.
@@ -419,7 +421,7 @@ Runs on `pull_request` and on `workflow_dispatch`, and gates the
 | Job | What it does |
 |-----|--------------|
 | `Lint` | `pre-commit run --all-files`, so every hook above |
-| `Build and test` | `make build test` |
+| `Build and test` | `make build test`, then `make test FEATURES=qemu` |
 | `cargo audit` | RustSec advisory check |
 | `cargo deny` | Licence, ban, source and advisory policy |
 
@@ -437,9 +439,10 @@ reviewing its code.
 ### The merge tier
 
 Runs only on `merge_group` and gates `Can merge`. Four jobs run.
-`Build and test the merge commit` runs `make release test` against
-the commit the queue has built from the pull request and the current
-tip of `develop`. The smoke tier's jobs do not run on `merge_group`.
+`Build and test the merge commit` runs `make release test`, then
+`make test FEATURES=qemu`, against the commit the queue has built
+from the pull request and the current tip of `develop`. The smoke
+tier's jobs do not run on `merge_group`.
 
 The other three also run on `workflow_dispatch`, and `Can merge`
 requires each of them. A retest of a branch dispatches them, so they

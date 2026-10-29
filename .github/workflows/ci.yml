@@ -195,6 +195,11 @@ jobs:
       - name: Build and run the tests
         run: make build test
 
+      # The qemu platform is behind a cargo feature the default build
+      # leaves out, so its tests run in a build of their own.
+      - name: Run the tests with the qemu feature
+        run: make test FEATURES=qemu
+
   # The two scanner jobs below are the pull-request half of the
   # supply-chain checks (see deny.toml for the cargo-deny policy).
   # supply-chain.yml runs the same two on a weekly cron to catch
@@ -323,6 +328,9 @@ jobs:
 
       - name: Build a release and run the tests
         run: make release test
+
+      - name: Run the tests with the qemu feature
+        run: make test FEATURES=qemu
 
   # Andris exporting an Xvfb display, driven by ryll's headless client
   # built at the revision Cargo.lock pins: `make e2e`, which runs

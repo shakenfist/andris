@@ -16,11 +16,11 @@
 //! whose bindings link the real library, so that these cannot drift
 //! from it unseen.
 //!
-//! This module and `platform/x11/shm.rs` are andris's only `unsafe`
-//! code; the crate denies it everywhere else. The unsafety here is the
-//! foreign function interface: Rust cannot check that a symbol has the
-//! type it is declared with, so these declarations must match the
-//! headers exactly. Above it, [`Simple`] owns one connection and frees
+//! This module, `platform/x11/shm.rs` and `platform/qemu/shm.rs` are
+//! andris's only `unsafe` code; the crate denies it everywhere else.
+//! The unsafety here is the foreign function interface: Rust cannot
+//! check that a symbol has the type it is declared with, so these
+//! declarations must match the headers exactly. Above it, [`Simple`] owns one connection and frees
 //! it exactly once, so its users need no `unsafe` of their own.
 
 #![allow(unsafe_code)]

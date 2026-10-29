@@ -21,8 +21,9 @@ clap = { version = "4", features = ["derive", "env"] }
 # For O_NONBLOCK, and memfd_create and file seals for the MIT-SHM capture
 # segment; already in the tree through tokio.
 libc = "0.2"
-# Maps the MIT-SHM capture segment, a memfd shared with the X server, so
-# andris does not hand-roll mmap and munmap.
+# Maps the MIT-SHM capture segment, a memfd shared with the X server, and
+# the screen the qemu platform's qemu shares, so andris does not hand-roll
+# mmap and munmap.
 memmap2 = "0.9"
 # Loads libpulse at run time, for PulseAudio's simple API, which
 # captures the desktop's sound from a sink's monitor (the protocol is
@@ -68,6 +69,56 @@ shakenfist-spice-protocol = { version = "0.3.0", git = "https://github.com/shake
 shakenfist-spice-compression = { version = "0.3.0", git = "https://github.com/shakenfist/ryll", rev = "38c51eff3351795342b4ba283cf283b0eb2bab94", default-features = false, features = [
     "encode",
 ] }
+
+# The qemu platform (`--platform qemu`), which exports a guest through
+# qemu's D-Bus display (`-display dbus,p2p=on`). Off by default, so the
+# default build, the wheel and the default dependency tree carry none of
+# it: `cargo build --features qemu`.
+[features]
+qemu = ["dep:qemu-display", "dep:rustix", "dep:serde_bytes", "dep:serde_json", "dep:zbus"]
+
+# The qemu platform's dependencies, all optional: only `--features qemu`
+# builds them.
+#
+# qemu-display: zbus bindings to qemu's D-Bus display interfaces (MIT),
+# for the proxies of the console that registers a listener, and of its
+# keyboard and mouse. Pinned to a commit, not the crates.io
+# release: 0.2.1 has the Unix.Map listener, but depends unconditionally on
+# usbredirhost, which links the system's libusbredirhost and libusb
+# through pkg-config. af33f32 moved that host backend out of the crate,
+# and the pin, 6ffedb9, is the commit of 2026-09-02.
+[dependencies.qemu-display]
+version = "0.2.1"
+git = "https://gitlab.com/marcandre.lureau/qemu-display"
+rev = "6ffedb95967dcd864991e1ac581d9e9d62d3e84a"
+optional = true
+
+[dependencies.rustix]
+# 1.1, the version x11rb already pulls in, for sendmsg with SCM_RIGHTS:
+# passing qemu its end of the display socket over QMP, which std cannot do
+# on stable Rust, without andris writing unsafe code.
+version = "1.1"
+features = ["net"]
+optional = true
+
+[dependencies.serde_bytes]
+# Deserialises the listener's `ay` pixel arguments as one byte buffer,
+# rather than element by element.
+version = "0.11"
+optional = true
+
+[dependencies.serde_json]
+# QMP is JSON, one object to a line.
+version = "1"
+optional = true
+
+[dependencies.zbus]
+# 5, the version qemu-display uses. Andris serves the listener interfaces
+# itself, so it names zbus directly; `p2p` for the peer-to-peer
+# connections the display and its listener use.
+version = "5"
+features = ["p2p"]
+optional = true
 
 [dev-dependencies]
 # libpulse's own bindings, which link it, so that a test can check the

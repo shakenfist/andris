@@ -34,6 +34,20 @@ ignore = [
     # same migration. ryll's deny.toml carries the same entry.
     # https://rustsec.org/advisories/RUSTSEC-2025-0134
     "RUSTSEC-2025-0134",
+
+    # RUSTSEC-2026-0370, -0371 and -0372: zvariant, zbus_names and
+    # zvariant_derive unmaintained, because zbus 6 absorbed them. They
+    # are not vulnerabilities. They reach andris only through the
+    # optional qemu feature, by way of zbus 5, which the qemu-display
+    # bindings are built on, so no upgrade is open until those bindings
+    # move to zbus 6 or andris carries its own. The default build does
+    # not include them.
+    # https://rustsec.org/advisories/RUSTSEC-2026-0370
+    "RUSTSEC-2026-0370",
+    # https://rustsec.org/advisories/RUSTSEC-2026-0371
+    "RUSTSEC-2026-0371",
+    # https://rustsec.org/advisories/RUSTSEC-2026-0372
+    "RUSTSEC-2026-0372",
 ]
 
 [licenses]
@@ -93,4 +107,9 @@ unknown-git = "deny"
 required-git-spec = "rev"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # ryll's shared crates may be pinned by git revision.
-allow-git = ["https://github.com/shakenfist/ryll"]
+allow-git = [
+    "https://github.com/shakenfist/ryll",
+    # qemu-display, for the optional qemu platform; Cargo.toml says why it is
+    # pinned to a commit rather than a release.
+    "https://gitlab.com/marcandre.lureau/qemu-display",
+]

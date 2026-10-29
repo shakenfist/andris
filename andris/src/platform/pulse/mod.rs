@@ -55,8 +55,9 @@
 //! counted, and once [`MAX_LIVE_CAPTURES`] are, `open` refuses until one
 //! exits.
 
-// The only unsafe code outside the X11 backend's MIT-SHM capture: the
-// foreign function interface to libpulse. The module allows it itself.
+// Unsafe code, as only this and the two shared-memory mappings (the X11
+// platform's and the qemu platform's) are: the foreign function
+// interface to libpulse. The module allows it itself.
 mod ffi;
 
 use std::ffi::CString;

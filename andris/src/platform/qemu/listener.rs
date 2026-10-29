@@ -33,19 +33,19 @@
 //! so that a trace can be lined up with qemu's own trace log, which
 //! stamps events with the same clock.
 
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::AsFd;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use qemu_display::{ScanoutMap, ScanoutMmap};
 use serde_bytes::ByteBuf;
 use tokio::sync::watch;
 use tracing::{debug, warn};
 use zbus::fdo;
 use zbus::zvariant::Fd;
 
-use super::framebuffer::{Framebuffer, Source};
+use super::framebuffer::{Framebuffer, PixelFormat, Source};
+use super::shm::Mapping;
 use crate::platform::{CursorReceiver, CursorShape, DamageHub, Rectangle, Size};
 
 /// Where qemu expects the listener's objects.
@@ -62,7 +62,7 @@ pub struct Shared {
     first_screen: Condvar,
     /// The screen qemu shared, while it shares one. Taken before
     /// `screen` when both are held.
-    mapping: Mutex<Option<ScanoutMmap>>,
+    mapping: Mutex<Option<SharedScreen>>,
     /// The last copy that failed, so that a run of the same failure is
     /// logged once.
     last_failure: Mutex<Option<String>>,
@@ -72,6 +72,13 @@ pub struct Shared {
     /// The cursor as the platform reports it: the shape while qemu shows
     /// it, otherwise `None`.
     cursor_shapes: watch::Sender<Option<Arc<CursorShape>>>,
+}
+
+/// A screen qemu shared with `ScanoutMap`, and how it described it.
+struct SharedScreen {
+    mapping: Mapping,
+    size: Size,
+    format: u32,
 }
 
 /// The guest's cursor: the shape qemu last defined, and whether qemu
@@ -162,7 +169,7 @@ impl Shared {
         }
     }
 
-    fn mapping(&self) -> Result<MutexGuard<'_, Option<ScanoutMmap>>> {
+    fn mapping(&self) -> Result<MutexGuard<'_, Option<SharedScreen>>> {
         self.mapping
             .lock()
             .map_err(|_| anyhow!("the qemu mapping's lock is poisoned"))
@@ -273,24 +280,6 @@ fn cursor_shape(
         .map(|word| u32::from_ne_bytes(*word))
         .collect();
     CursorShape::new(width, height, hot_x, hot_y, argb)
-}
-
-/// `fd`, if the file behind it holds at least `needed` bytes. Reading a
-/// mapping past the end of its file faults, which would kill andris, so
-/// a screen is mapped only once the file is known to hold it. qemu does
-/// not seal its screens' memfds against shrinking, so a qemu that
-/// truncated one later could still fault andris; the guest cannot.
-fn holding(fd: OwnedFd, needed: u64) -> Result<OwnedFd> {
-    let file = std::fs::File::from(fd);
-    let length = file
-        .metadata()
-        .context("cannot read the size of the screen's file")?
-        .len();
-    ensure!(
-        length >= needed,
-        "qemu shared a screen of {needed} bytes in a file of {length}"
-    );
-    Ok(OwnedFd::from(file))
 }
 
 /// Now, on the wall clock, in microseconds since the epoch: the clock
@@ -447,8 +436,10 @@ impl MapListener {
 #[zbus::interface(name = "org.qemu.Display1.Listener.Unix.Map", spawn = false)]
 impl MapListener {
     /// qemu shares the screen: `fd` holds it from `offset` on. qemu waits
-    /// for this to return, with its main loop held. Failing makes qemu
-    /// send pixels in the message from then on.
+    /// for this to return, with its main loop held. Failing, as andris
+    /// does for a screen it cannot map or refuses, makes qemu stop
+    /// offering this listener the shared screen: it sends the update it
+    /// was making, and every later one, as pixels in the message.
     async fn scanout_map(
         &mut self,
         fd: Fd<'_>,
@@ -460,35 +451,32 @@ impl MapListener {
     ) -> fdo::Result<()> {
         let received = wall_clock_us();
         let started = Instant::now();
-        let fd = fd
-            .as_fd()
-            .try_clone_to_owned()
-            .map_err(|error| fdo::Error::Failed(format!("cannot keep the screen's fd: {error}")))?;
-        let needed = u64::from(offset) + u64::from(stride) * u64::from(height);
-        let fd = holding(fd, needed).map_err(|error| fdo::Error::Failed(format!("{error:#}")))?;
-        let mapped = ScanoutMap {
-            fd,
-            offset,
-            width,
-            height,
-            stride,
-            format,
-        }
-        .mmap()
-        .map_err(|error| fdo::Error::Failed(format!("cannot map the screen: {error}")))?;
+        let size = Size { width, height };
         // A screen andris refuses is not kept, so that no update is read
         // from it against another screen's geometry.
-        let result = self.shared.mapping().and_then(|mut mapping| {
-            *mapping = None;
+        let result = self.shared.mapping().and_then(|mut shared| {
+            *shared = None;
+            let fd = fd
+                .as_fd()
+                .try_clone_to_owned()
+                .context("cannot keep the screen's fd")?;
+            let mapping = Mapping::new(fd, offset, height, stride)?;
+            let rows = mapping
+                .rows(0, height as usize, 0, stride as usize)
+                .context("the screen lies outside its mapping")?;
             self.shared.replace(
-                Size { width, height },
+                size,
                 Source {
-                    data: mapped.as_ref(),
+                    data: &rows,
                     stride: stride as usize,
                     format,
                 },
             )?;
-            *mapping = Some(mapped);
+            *shared = Some(SharedScreen {
+                mapping,
+                size,
+                format,
+            });
             Ok(())
         });
         debug!(
@@ -496,13 +484,21 @@ impl MapListener {
             width,
             height,
             stride,
+            offset,
             format = format_args!("{format:#010x}"),
             received_us = received,
             copy_us = started.elapsed().as_micros(),
             "qemu screen"
         );
+        let refusal = result
+            .as_ref()
+            .err()
+            .map(|error| fdo::Error::Failed(format!("{error:#}")));
         self.shared.report("ScanoutMap", result);
-        Ok(())
+        match refusal {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// A rectangle of the shared screen changed.
@@ -512,18 +508,35 @@ impl MapListener {
         let Some(rect) = rectangle(x, y, w, h) else {
             return Ok(());
         };
-        let result = self.shared.mapping().and_then(|mapping| {
-            let Some(mapped) = mapping.as_ref() else {
+        let result = self.shared.mapping().and_then(|shared| {
+            let Some(shared) = shared.as_ref() else {
                 bail!("qemu sent UpdateMap with no screen shared");
             };
+            let Some(rect) = rect.clip(shared.size) else {
+                return Ok(());
+            };
+            // Only the rectangle's span of each of its rows is copied out
+            // of the shared screen, and converted from that copy.
+            let bytes = PixelFormat::from_pixman(shared.format)?.bytes_per_pixel();
+            let span = rect.width as usize * bytes;
+            let rows = shared
+                .mapping
+                .rows(
+                    rect.y as usize,
+                    rect.height as usize,
+                    rect.x as usize * bytes,
+                    span,
+                )
+                .with_context(|| format!("{rect} lies outside the shared screen"))?;
             self.shared.update(rect, |screen| {
-                screen.update_from_screen(
+                screen.update_from_patch(
                     rect,
                     Source {
-                        data: mapped.as_ref(),
-                        stride: mapped.stride() as usize,
-                        format: mapped.format(),
+                        data: &rows,
+                        stride: span,
+                        format: shared.format,
                     },
+                    (0, 0),
                 )
             })
         });
@@ -545,16 +558,6 @@ impl MapListener {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_screen_must_fit_its_file() {
-        let file = tempfile::tempfile().unwrap();
-        file.set_len(100).unwrap();
-        let fd = OwnedFd::from(file);
-        let fd = holding(fd, 100).unwrap();
-        let error = holding(fd, 101).unwrap_err();
-        assert!(format!("{error:#}").contains("101 bytes in a file of 100"));
-    }
 
     #[test]
     fn cursors_take_qemus_argb_words() {

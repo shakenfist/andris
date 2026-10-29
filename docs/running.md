@@ -55,7 +55,7 @@ andris --ticket-file PATH [options]
 | `--platform x11\|synthetic\|qemu` | `x11` | The display system to export; `qemu` only in a build with the `qemu` feature |
 | `--display DISPLAY` | the `DISPLAY` environment variable | The X display to export, such as `:10`; used by `--platform x11` |
 | `--synthetic-size WxH` | `1024x768` | The test pattern's size; used by `--platform synthetic` |
-| `--qmp PATH` | none | The QMP socket of the qemu whose guest to export; used by `--platform qemu`, and present only in a build with the `qemu` feature |
+| `--qmp PATH` | none | The QMP socket of the qemu whose guest to export; required by `--platform qemu` and refused with any other, and present only in a build with the `qemu` feature |
 | `--listen ADDR:PORT` | `127.0.0.1:5900` | The plain TCP listener |
 | `--tls-listen ADDR:PORT` | none | A TLS listener; needs `--tls-cert` and `--tls-key` |
 | `--tls-cert PATH` | none | The TLS certificate chain, as PEM, leaf first |
@@ -193,11 +193,13 @@ target/release/andris --platform qemu --qmp /run/vm1/qmp.sock --ticket-file tick
 Andris passes qemu a socket over QMP (`getfd`, then `add_client` with
 protocol `@dbus-display`), registers a display listener on the first
 console, and waits up to 10 seconds for qemu's first picture before it
-listens for clients. It then closes QMP, which gives full control of
+listens for clients. Each QMP command must be read and answered within
+10 seconds too. Andris then closes QMP, which gives full control of
 qemu, so the QMP socket is free for other tools once andris has
-attached; a restarted andris attaches through it again. When qemu
-exits, andris stops, as it does when an X server goes. qemu's D-Bus display needs its `ui-dbus` module
-(Debian's `qemu-system-modules-opengl`).
+attached; a restarted andris attaches through it again. Andris learns
+that qemu has exited when qemu closes the display connection, and then
+stops, as it does when an X server goes. qemu's D-Bus display needs its
+`ui-dbus` module (Debian's `qemu-system-modules-opengl`).
 
 The guest's screen arrives in one of two ways, chosen by qemu:
 
@@ -206,6 +208,10 @@ The guest's screen arrives in one of two ways, chosen by qemu:
 - **Pixels in each message**, for std-vga and bochs-display, whose
   screen is video memory: qemu polls it every 30 ms and sends each
   band of changed scanlines, at full width.
+
+A shared screen andris refuses, one in a pixel format it cannot read
+say, is refused to qemu, which sends pixels in each message from then
+on.
 
 Either way andris copies each change into a framebuffer of its own
 and captures from that. Each change is logged at debug level

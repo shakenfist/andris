@@ -28,10 +28,10 @@ usually the clearest statement of what the code promises.
 **Conventions.** Some hold everywhere, and are worth knowing before you
 start:
 
-- `#![deny(unsafe_code)]` holds crate-wide. Only `platform/x11/shm.rs`
-  and `platform/pulse/ffi.rs` opt out: `ffi.rs` with an inner
-  attribute, and `shm` with one on its `mod` line in
-  `platform/x11/mod.rs`.
+- `#![deny(unsafe_code)]` holds crate-wide. Only `platform/x11/shm.rs`,
+  `platform/pulse/ffi.rs` and, with the `qemu` feature,
+  `platform/qemu/shm.rs` opt out: `ffi.rs` with an inner attribute, and
+  each `shm` with one on its `mod` line in its platform's `mod.rs`.
 - The server (`andris/src/server/`) knows SPICE and nothing of X11. The
   platform (`andris/src/platform/`) knows the desktop and nothing of
   SPICE. Keys cross between them as Linux evdev codes.
@@ -573,7 +573,7 @@ thread, so a resize holds up captures while it lasts. Read before
 ### `andris/src/platform/x11/shm.rs`
 
 MIT-SHM capture through a sealed memfd passed with `ShmAttachFd`, and
-one of the crate's two `unsafe` modules. Look at the trust boundary in
+one of the crate's three `unsafe` modules. Look at the trust boundary in
 the module comment: any client of the display, or any process that can
 open the memfd, may write the segment at any time. So andris never makes
 a Rust reference into the mapping; `Mapping::copy()` copies out through
@@ -648,7 +648,7 @@ run at once.
 
 ## PulseAudio
 
-Sound capture, and the crate's other `unsafe` module.
+Sound capture, and another of the crate's `unsafe` modules.
 
 ### `andris/src/platform/pulse/mod.rs`
 
@@ -682,26 +682,45 @@ Built only with the `qemu` cargo feature. Read `mod.rs` first.
 listener's), and the seams over what the listener keeps. Look at
 `attach()`: qemu answers `RegisterListener` before it opens the
 listener's connection, and both listener interfaces must be served from
-the start, since qemu asks for the shared screen at once.
+the start, since qemu asks for the shared screen at once. Look at
+`start()`: QMP is closed once qemu has the display socket, and qemu's
+exit is seen when it closes the display connection, which the platform's
+thread waits for; that thread lets the connections go if attaching
+fails or times out, so qemu drops the client.
 
 ### `andris/src/platform/qemu/qmp.rs`
 
 Just enough QMP to pass qemu a socket (`getfd` with `SCM_RIGHTS`, then
-`add_client`) and to learn when qemu goes. Lines are bounded, and every
-read during attach times out.
+`add_client`); andris closes it straight after. Lines are bounded, and
+every read and write times out.
 
 ### `andris/src/platform/qemu/listener.rs`
 
 The objects qemu calls with each change: pixels in the message, or a
 shared memfd and then bare rectangles, plus the cursor. Look at
-`holding()`, which refuses a memfd shorter than the screen it claims to
-hold, and at `set_cursor()`, which reports only a change of what is
-shown, since `MouseSet` comes with every pointer move.
+`scanout_map()`, which fails back to qemu for a screen andris cannot
+map or refuses, so that qemu sends pixels in the message instead, and
+keeps no mapping; `update_map()`, which copies only the rectangle's
+span of each row out of the mapping and converts from that copy; and
+`set_cursor()`, which reports only a change of what is shown, since
+`MouseSet` comes with every pointer move.
+
+### `andris/src/platform/qemu/shm.rs`
+
+The mapping of the screen qemu shares, and the third of the crate's
+`unsafe` modules. Look at the trust boundary in the module comment: qemu
+and the guest write the screen while andris reads it. So, as in the X11
+platform's `shm.rs`, andris never makes a Rust reference into the
+mapping; `Mapping::rows()` copies out through raw pointers, so a
+concurrent writer can only tear pixels. `Mapping::new()` refuses a memfd
+shorter than the screen it claims to hold, since reading past the end
+of a mapping faults.
 
 ### `andris/src/platform/qemu/framebuffer.rs`
 
 The platform's own copy of the screen, and pixman format conversion.
-Every copy is bounds-checked against what qemu sent or mapped, and a
+Every copy is bounds-checked against what qemu sent or andris copied
+out of the mapping, and a
 refused replacement leaves the screen as it was.
 
 ### `andris/src/platform/qemu/input.rs`
@@ -974,7 +993,7 @@ headers.
 end-to-end lanes, why compiling is offline, pre-commit and CI.
 `docs/releasing.md` is the release process and its setup. `AGENTS.md`
 holds the conventions for AI coding assistants, many of which this guide
-has met in the code: the opcode enums, evdev codes at the seam, the two
+has met in the code: the opcode enums, evdev codes at the seam, the
 `unsafe` modules. `PUSH-AUDIT.md` is the pre-push audit runbook, and the
 planning template beside it at the repository's root is where new plans
 start. These are process documents, so read them for how work is done

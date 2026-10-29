@@ -5,10 +5,11 @@
 //! it is ready for them, so the platform keeps a [`Framebuffer`] of its
 //! own: each update qemu sends is copied into it as it arrives, and
 //! captures read from it. A capture therefore sees each update whole or
-//! not at all. On the shared-memory path the copy is taken from memory
-//! the guest may still be drawing into, so a rectangle can hold a mix of
-//! two guest frames; the copy keeps that to the moment it was taken, and
-//! the next update of the area replaces it.
+//! not at all. On the shared-memory path the rows are first copied out
+//! of memory the guest may still be drawing into (by the `shm` module),
+//! so a rectangle can hold a mix of two guest frames; the copy keeps that
+//! to the moment it was taken, and the next update of the area replaces
+//! it.
 //!
 //! qemu names formats with pixman's format codes. The framebuffer holds
 //! BGRX, which is pixman's `x8r8g8b8` on a little-endian host and what
@@ -197,26 +198,11 @@ impl Framebuffer {
         Ok(())
     }
 
-    /// Copy `rect` of the screen from `source`, a whole screen's image of
-    /// the same size, as the shared-memory path maps it. Returns the part
-    /// of `rect` that lies on the screen, which may be empty.
-    pub fn update_from_screen(
-        &mut self,
-        rect: Rectangle,
-        source: Source<'_>,
-    ) -> Result<Option<Rectangle>> {
-        let Some(clipped) = rect.clip(self.size) else {
-            return Ok(None);
-        };
-        self.copy(clipped, source, (clipped.x, clipped.y))?;
-        Ok(Some(clipped))
-    }
-
-    /// Copy `rect` of the screen from `source`, an image qemu sent over
-    /// the socket whose pixel `origin` is `rect`'s top left: (0, 0) unless
-    /// qemu's rectangle started off the top or left of the screen, and
-    /// was cut. Returns the part of `rect` that lies on the screen, which
-    /// may be empty.
+    /// Copy `rect` of the screen from `source`, an image whose pixel
+    /// `origin` is `rect`'s top left: (0, 0) unless the image holds more
+    /// than the rectangle, as when qemu's rectangle started off the top
+    /// or left of the screen and was cut. Returns the part of `rect` that
+    /// lies on the screen, which may be empty.
     pub fn update_from_patch(
         &mut self,
         rect: Rectangle,
@@ -279,8 +265,8 @@ impl Framebuffer {
             .with_context(|| format!("cropping {rect} from a {} screen", self.size))
     }
 
-    /// `rects`, each clipped to the screen, as [`crate::platform::ScreenSource::capture`]
-    /// returns them.
+    /// `rects`, each clipped to the screen, as
+    /// [`crate::platform::ScreenSource::capture`] returns them.
     pub fn capture(&self, rects: &[Rectangle]) -> Result<Capture> {
         let patches = rects
             .iter()
@@ -403,18 +389,19 @@ mod tests {
     }
 
     #[test]
-    fn updates_from_the_screen_and_from_a_patch_land_in_place() {
+    fn updates_from_a_screen_and_from_a_patch_land_in_place() {
         let mut fb = Framebuffer::new(SIZE).unwrap();
         let screen = image(SIZE, 16);
         let rect = Rectangle::new(1, 1, 2, 2);
         assert_eq!(
-            fb.update_from_screen(
+            fb.update_from_patch(
                 rect,
                 Source {
                     data: &screen,
                     stride: 16,
                     format: X8R8G8B8,
                 },
+                (1, 1),
             )
             .unwrap(),
             Some(rect)
@@ -450,12 +437,12 @@ mod tests {
             format: X8R8G8B8,
         };
         assert_eq!(
-            fb.update_from_screen(Rectangle::new(3, 2, 5, 5), source)
+            fb.update_from_patch(Rectangle::new(3, 2, 5, 5), source, (3, 2))
                 .unwrap(),
             Some(Rectangle::new(3, 2, 1, 1))
         );
         assert_eq!(
-            fb.update_from_screen(Rectangle::new(9, 9, 1, 1), source)
+            fb.update_from_patch(Rectangle::new(9, 9, 1, 1), source, (0, 0))
                 .unwrap(),
             None
         );
@@ -468,11 +455,11 @@ mod tests {
             format: X8R8G8B8,
         };
         assert!(
-            fb.update_from_screen(Rectangle::full(SIZE), cut(56))
+            fb.update_from_patch(Rectangle::full(SIZE), cut(56), (0, 0))
                 .is_ok()
         );
         assert!(
-            fb.update_from_screen(Rectangle::full(SIZE), cut(55))
+            fb.update_from_patch(Rectangle::full(SIZE), cut(55), (0, 0))
                 .is_err()
         );
         let unaddressable = Source {
@@ -481,7 +468,7 @@ mod tests {
             format: X8R8G8B8,
         };
         let error = fb
-            .update_from_screen(Rectangle::full(SIZE), unaddressable)
+            .update_from_patch(Rectangle::full(SIZE), unaddressable, (0, 0))
             .unwrap_err();
         assert!(
             error.to_string().contains("too large to address"),

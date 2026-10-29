@@ -16,10 +16,12 @@
 //!
 //! The listener copies each change into a framebuffer of the platform's
 //! own ([`framebuffer`]) and reports it to a [`DamageHub`]; captures read
-//! from that copy. qemu reports exactly the rectangles the guest's device
-//! reports: what a virtio-gpu guest flushes, and for std-vga whole
-//! scanlines of what changed, polled every 30 ms. The listener also takes
-//! the guest's cursor shape, when the guest has one.
+//! from that copy. A screen qemu shares is mapped, and rows copied out of
+//! it, by [`shm`], one of the crate's three `unsafe` modules. qemu
+//! reports exactly the rectangles the guest's device reports: what a
+//! virtio-gpu guest flushes, and for std-vga whole scanlines of what
+//! changed, polled every 30 ms. The listener also takes the guest's
+//! cursor shape, when the guest has one.
 //!
 //! Keyboard and mouse input goes back on the display connection, to the
 //! console's `Keyboard` and `Mouse` ([`input`]).
@@ -31,15 +33,26 @@
 //! qemu's D-Bus calls run on zbus's own executor thread. A thread of the
 //! platform's waits for qemu to close the display connection, which it
 //! does when it exits, and then sets the [`GoneSignal`]; another sends
-//! input.
+//! input. If attaching fails or times out, or the platform is dropped,
+//! that thread lets the connections go, so qemu drops the client.
 
 mod framebuffer;
 mod input;
 mod listener;
 mod qmp;
 mod qnums;
+// Unsafe code, as only this, the X11 platform's MIT-SHM mapping and the
+// libpulse bindings are: the mapping of the screen qemu shares. See the
+// module's documentation for why it is sound.
+#[allow(unsafe_code)]
+mod shm;
 #[cfg(test)]
 mod tests;
+
+// pixman formats describe a pixel as a native-endian word, which the
+// framebuffer reads as little-endian bytes.
+#[cfg(not(target_endian = "little"))]
+compile_error!("the qemu platform reads qemu's pixel formats as little-endian");
 
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
@@ -87,6 +100,9 @@ pub struct QemuPlatform {
     clipboard: watch::Sender<Option<Arc<str>>>,
     /// Held open for as long as the platform is.
     _connections: Connections,
+    /// Keeps the platform's thread waiting on the display connection;
+    /// see [`QemuPlatform::start`].
+    _keep: tokio::sync::oneshot::Sender<()>,
 }
 
 impl QemuPlatform {
@@ -118,6 +134,10 @@ impl QemuPlatform {
         let shared = Arc::new(Shared::new());
         let (gone, gone_signal) = GoneSignal::new();
         let (attached_sender, attached) = std::sync::mpsc::channel();
+        // Held by the platform: dropped, as it is when attaching fails
+        // after the thread has handed over the connections, it tells the
+        // thread to let go of its own.
+        let (keep, kept) = tokio::sync::oneshot::channel::<()>();
         let thread_shared = shared.clone();
         std::thread::Builder::new()
             .name("andris-qemu".to_string())
@@ -128,11 +148,23 @@ impl QemuPlatform {
                     }
                     Ok(attachment) => {
                         let display = attachment.0.display.clone();
-                        let _ = attached_sender.send(Ok(attachment));
-                        zbus::block_on(display.closed());
-                        let why = "qemu closed its D-Bus display connection".to_string();
-                        gone.set(why.clone());
-                        let _ = thread_shared.damage.gone(why);
+                        // Nobody waits any more: attaching timed out.
+                        if attached_sender.send(Ok(attachment)).is_err() {
+                            return;
+                        }
+                        let closed = zbus::block_on(async {
+                            tokio::select! {
+                                () = display.closed() => true,
+                                _ = kept => false,
+                            }
+                        });
+                        if closed {
+                            // The damage hub first, so that whoever sees
+                            // the signal set finds the hub gone too.
+                            let why = "qemu closed its D-Bus display connection".to_string();
+                            let _ = thread_shared.damage.gone(why.clone());
+                            gone.set(why);
+                        }
                     }
                 },
             )
@@ -155,6 +187,7 @@ impl QemuPlatform {
             input,
             clipboard: watch::channel(None).0,
             _connections: connections,
+            _keep: keep,
         }))
     }
 

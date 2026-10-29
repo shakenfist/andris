@@ -311,6 +311,17 @@ impl Args {
             ),
         };
 
+        #[cfg(feature = "qemu")]
+        if let Some(qmp) = &self.qmp
+            && self.platform != PlatformKind::Qemu
+        {
+            bail!(
+                "--qmp {} names qemu's QMP socket, which only --platform qemu uses: leave --qmp \
+                 out, or use --platform qemu",
+                qmp.display()
+            );
+        }
+
         let platform = match self.platform {
             PlatformKind::X11 => match self.display {
                 Some(display) if !display.is_empty() => PlatformConfig::X11 { display },
@@ -836,6 +847,24 @@ mod tests {
         ])
         .unwrap();
         assert!(error(args).contains("--platform qemu"));
+
+        for platform in ["x11", "synthetic"] {
+            let args = Args::try_parse_from([
+                "andris",
+                "--ticket-file",
+                path,
+                "--platform",
+                platform,
+                "--display",
+                ":10",
+                "--qmp",
+                "/run/qemu/qmp.sock",
+            ])
+            .unwrap();
+            let message = error(args);
+            assert!(message.contains("--qmp /run/qemu/qmp.sock"), "{message}");
+            assert!(message.contains("only --platform qemu"), "{message}");
+        }
     }
 
     #[test]

@@ -29,13 +29,20 @@ pub struct Qmp {
 
 impl Qmp {
     /// Connect to the QMP socket at `path`, read the greeting and leave
-    /// capabilities negotiation. Each read waits at most `timeout`.
+    /// capabilities negotiation. Each read and each write waits at most
+    /// `timeout`, so a qemu that stops answering cannot hold andris for
+    /// ever.
     pub fn connect(path: &Path, timeout: Duration) -> Result<Self> {
         let stream = UnixStream::connect(path)
             .with_context(|| format!("connecting to qemu's QMP socket {}", path.display()))?;
+        // The timeouts belong to the socket, so the writer's clone below
+        // shares them.
         stream
             .set_read_timeout(Some(timeout))
-            .context("setting a timeout on the QMP socket")?;
+            .context("setting a read timeout on the QMP socket")?;
+        stream
+            .set_write_timeout(Some(timeout))
+            .context("setting a write timeout on the QMP socket")?;
         let writer = stream.try_clone().context("cloning the QMP socket")?;
         let mut qmp = Self {
             reader: BufReader::new(stream),
@@ -184,6 +191,20 @@ mod tests {
             seen
         });
         (path, handle)
+    }
+
+    #[test]
+    fn a_qemu_that_never_greets_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("qmp.sock");
+        let _listener = UnixListener::bind(&path).unwrap();
+        let error = Qmp::connect(&path, Duration::from_millis(100))
+            .err()
+            .unwrap();
+        assert!(
+            format!("{error:#}").contains("reading from QMP"),
+            "{error:#}"
+        );
     }
 
     #[test]

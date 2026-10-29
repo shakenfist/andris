@@ -86,8 +86,8 @@ mod evdev_names;
 mod input;
 mod keymap;
 mod randr;
-// Unsafe code, as only this and the libpulse bindings are: the shared
-// memory mapping. See the module's documentation for why it is sound.
+// Unsafe code, as only this, the qemu platform's mapping and the libpulse
+// bindings are: the shared memory mapping. See the module's documentation for why it is sound.
 #[allow(unsafe_code)]
 mod shm;
 

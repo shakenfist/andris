@@ -21,8 +21,9 @@ clap = { version = "4", features = ["derive", "env"] }
 # For O_NONBLOCK, and memfd_create and file seals for the MIT-SHM capture
 # segment; already in the tree through tokio.
 libc = "0.2"
-# Maps the MIT-SHM capture segment, a memfd shared with the X server, so
-# andris does not hand-roll mmap and munmap.
+# Maps the MIT-SHM capture segment, a memfd shared with the X server, and
+# the screen the qemu platform's qemu shares, so andris does not hand-roll
+# mmap and munmap.
 memmap2 = "0.9"
 # Loads libpulse at run time, for PulseAudio's simple API, which
 # captures the desktop's sound from a sink's monitor (the protocol is
@@ -80,8 +81,8 @@ qemu = ["dep:qemu-display", "dep:rustix", "dep:serde_bytes", "dep:serde_json", "
 # builds them.
 #
 # qemu-display: zbus bindings to qemu's D-Bus display interfaces (MIT),
-# for the console proxy that registers a listener and the read-only
-# mapping of a shared scanout. Pinned to a commit, not the crates.io
+# for the proxies of the console that registers a listener, and of its
+# keyboard and mouse. Pinned to a commit, not the crates.io
 # release: 0.2.1 has the Unix.Map listener, but depends unconditionally on
 # usbredirhost, which links the system's libusbredirhost and libusb
 # through pkg-config. af33f32 moved that host backend out of the crate,

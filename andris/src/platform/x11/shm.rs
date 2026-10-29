@@ -7,8 +7,9 @@
 //! with `memmap2`'s raw mapping, which hands out a pointer rather than a
 //! slice.
 //!
-//! This and the libpulse bindings (`platform/pulse/ffi.rs`) are andris's
-//! only `unsafe` code; the crate denies it everywhere else. Its trust
+//! This, the libpulse bindings (`platform/pulse/ffi.rs`) and the qemu
+//! platform's mapping (`platform/qemu/shm.rs`) are andris's only
+//! `unsafe` code; the crate denies it everywhere else. Its trust
 //! boundary is this: andris is not the segment's only user. The X server
 //! writes it to serve andris's `ShmGetImage`, but any client of the
 //! display can name the segment's XID and write it too (draw into a

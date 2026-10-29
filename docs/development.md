@@ -441,7 +441,8 @@ reviewing its code.
 Runs only on `merge_group` and gates `Can merge`. Four jobs run.
 `Build and test the merge commit` runs `make release test`, then
 `make test FEATURES=qemu`, against the commit the queue has built
-from the pull request and the current tip of `develop`. The smoke tier's jobs do not run on `merge_group`.
+from the pull request and the current tip of `develop`. The smoke
+tier's jobs do not run on `merge_group`.
 
 The other three also run on `workflow_dispatch`, and `Can merge`
 requires each of them. A retest of a branch dispatches them, so they

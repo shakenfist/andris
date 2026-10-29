@@ -304,15 +304,64 @@ fn a_fake_qemu_shares_its_screen_and_takes_input() {
         let patch = platform.capture(&[flushed]).unwrap();
         assert_eq!(patch.patches()[0].rect(), flushed);
 
-        // A shared screen in a format andris refuses ends the sharing:
+        // A shared screen in a format andris refuses is refused to qemu,
+        // which then sends pixels in the message, and ends the sharing:
         // later updates are not read from the screen shared before it.
-        map.scanout_map(Fd::from(&screen), 0, WIDTH, HEIGHT, STRIDE, 0x0804_0000)
+        let error = map
+            .scanout_map(Fd::from(&screen), 0, WIDTH, HEIGHT, STRIDE, 0x0804_0000)
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(error.to_string().contains("0x08040000"), "{error}");
         paint(&screen, full, 4);
         map.update_map(0, 0, 8, 8).await.unwrap();
         let [b, g, r, _] = bgrx(1, 1, 1);
         assert_eq!(captured(&platform, 1, 1), [b, g, r, 0]);
+        // The picture comes back with the pixels qemu sends instead.
+        let mut pixels = vec![0; (STRIDE * HEIGHT) as usize];
+        screen.read_exact_at(&mut pixels, 0).unwrap();
+        plain
+            .scanout(WIDTH, HEIGHT, STRIDE, X8R8G8B8, &pixels)
+            .await
+            .unwrap();
+        let [b, g, r, _] = bgrx(1, 1, 4);
+        assert_eq!(captured(&platform, 1, 1), [b, g, r, 0]);
+
+        // A screen shared from an offset that is not page aligned.
+        let offset = 4099;
+        let offset_screen = tempfile::tempfile().unwrap();
+        offset_screen
+            .set_len(u64::from(offset + STRIDE * HEIGHT))
+            .unwrap();
+        let mut rows = vec![0; (STRIDE * HEIGHT) as usize];
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                let at = (y * STRIDE + x * 4) as usize;
+                rows[at..at + 4].copy_from_slice(&bgrx(x, y, 5));
+            }
+        }
+        offset_screen
+            .write_all_at(&rows, u64::from(offset))
+            .unwrap();
+        map.scanout_map(
+            Fd::from(&offset_screen),
+            offset,
+            WIDTH,
+            HEIGHT,
+            STRIDE,
+            X8R8G8B8,
+        )
+        .await
+        .unwrap();
+        let [b, g, r, _] = bgrx(WIDTH - 1, HEIGHT - 1, 5);
+        assert_eq!(captured(&platform, WIDTH - 1, HEIGHT - 1), [b, g, r, 0]);
+        // And an update of it, read at the offset too.
+        let at = u64::from(offset + 3 * STRIDE + 2 * 4);
+        offset_screen.write_all_at(&bgrx(2, 3, 6), at).unwrap();
+        map.update_map(2, 3, 1, 1).await.unwrap();
+        let [b, g, r, _] = bgrx(2, 3, 6);
+        assert_eq!(captured(&platform, 2, 3), [b, g, r, 0]);
+        let [b, g, r, _] = bgrx(3, 3, 5);
+        assert_eq!(captured(&platform, 3, 3), [b, g, r, 0]);
 
         // Keys arrive as qnums, in order, a release included.
         platform

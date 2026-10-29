@@ -18,10 +18,11 @@
 //! the connection to the X display fails, say. [`synthetic`] is a
 //! deterministic implementation for tests and load testing, and [`x11`]
 //! exports an X display. With the `qemu` feature, `qemu` exports a
-//! guest's screen from qemu's D-Bus display. Sound does not come from the display system, so
-//! it is a seam of its own: [`pulse`] captures it from the session's sound
-//! server, beside either display backend, and the synthetic platform plays
-//! a tone. Audio is optional, and a platform may have none.
+//! guest's screen from qemu's D-Bus display. Sound does not come from the
+//! display system, so it is a seam of its own: [`pulse`] captures it from
+//! the session's sound server, beside the X11 platform, and the synthetic
+//! platform plays a tone. Audio is optional, and a platform may have
+//! none.
 //!
 //! # Threads
 //!

@@ -34,6 +34,20 @@ ignore = [
     # same migration. ryll's deny.toml carries the same entry.
     # https://rustsec.org/advisories/RUSTSEC-2025-0134
     "RUSTSEC-2025-0134",
+
+    # RUSTSEC-2026-0370, -0371 and -0372: zvariant, zbus_names and
+    # zvariant_derive unmaintained, because zbus 6 absorbed them. They
+    # are not vulnerabilities. They reach andris only through the
+    # optional qemu feature, by way of zbus 5, which the qemu-display
+    # bindings are built on, so no upgrade is open until those bindings
+    # move to zbus 6 or andris carries its own. The default build does
+    # not include them.
+    # https://rustsec.org/advisories/RUSTSEC-2026-0370
+    "RUSTSEC-2026-0370",
+    # https://rustsec.org/advisories/RUSTSEC-2026-0371
+    "RUSTSEC-2026-0371",
+    # https://rustsec.org/advisories/RUSTSEC-2026-0372
+    "RUSTSEC-2026-0372",
 ]
 
 [licenses]

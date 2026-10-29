@@ -28,8 +28,8 @@ container runs as your uid and gid.
 ```bash
 make build      # debug build of the whole workspace
 make release    # release build
-make test       # cargo test across the workspace (FEATURES=qemu adds the qemu platform)
-make lint       # cargo fmt --check, then clippy with -D warnings, with and without the qemu feature
+make test       # cargo test (FEATURES=qemu adds the qemu platform)
+make lint       # cargo fmt --check, then clippy -D warnings, both builds
 make ryll-headless  # build ryll's headless client at the pinned revision
 make e2e        # run andris against Xvfb, driven by ryll
 make e2e-xrdp   # run andris against a real xrdp session, in a container

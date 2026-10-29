@@ -86,7 +86,7 @@ qemu = ["dep:qemu-display", "dep:rustix", "dep:serde_bytes", "dep:serde_json", "
 # release: 0.2.1 has the Unix.Map listener, but depends unconditionally on
 # usbredirhost, which links the system's libusbredirhost and libusb
 # through pkg-config. af33f32 moved that host backend out of the crate,
-# and 6ffedb9 is the newest commit, from 2026-09-02.
+# and the pin, 6ffedb9, is the commit of 2026-09-02.
 [dependencies.qemu-display]
 version = "0.2.1"
 git = "https://gitlab.com/marcandre.lureau/qemu-display"

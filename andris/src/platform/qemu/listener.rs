@@ -184,9 +184,7 @@ impl Shared {
             match screen.as_mut() {
                 Some(screen) => screen.replace(size, source)?,
                 None => {
-                    let mut fresh = Framebuffer::new(size)?;
-                    fresh.replace(size, source)?;
-                    *screen = Some(fresh);
+                    *screen = Some(Framebuffer::from_source(size, source)?);
                     self.first_screen.notify_all();
                 }
             }

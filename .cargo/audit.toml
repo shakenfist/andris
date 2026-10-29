@@ -13,4 +13,10 @@ ignore = [
 
     # rustls-pemfile unmaintained. See deny.toml.
     "RUSTSEC-2025-0134",
+
+    # zvariant, zbus_names and zvariant_derive unmaintained, through the
+    # qemu feature's zbus 5. See deny.toml.
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0372",
 ]

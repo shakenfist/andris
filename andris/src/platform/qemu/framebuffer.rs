@@ -192,10 +192,17 @@ impl Framebuffer {
     /// leaving the screen as it was, if andris refuses the size or the
     /// format, or `source` is too short for the image.
     pub fn replace(&mut self, size: Size, source: Source<'_>) -> Result<()> {
-        let mut next = Framebuffer::new(size)?;
-        next.copy(Rectangle::full(size), source, (0, 0))?;
-        *self = next;
+        *self = Framebuffer::from_source(size, source)?;
         Ok(())
+    }
+
+    /// A screen of `size` holding `source`, a `size` image. Fails if
+    /// andris refuses the size or the format, or `source` is too short
+    /// for the image.
+    pub fn from_source(size: Size, source: Source<'_>) -> Result<Self> {
+        let mut screen = Framebuffer::new(size)?;
+        screen.copy(Rectangle::full(size), source, (0, 0))?;
+        Ok(screen)
     }
 
     /// Copy `rect` of the screen from `source`, an image whose pixel

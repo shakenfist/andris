@@ -137,13 +137,21 @@ fn send_with_fd(stream: &UnixStream, bytes: &[u8], fd: BorrowedFd<'_>) -> Result
     if !control.push(SendAncillaryMessage::ScmRights(&fds)) {
         bail!("no room to attach a descriptor to a QMP command");
     }
-    let sent = rustix::net::sendmsg(
-        stream.as_fd(),
-        &[IoSlice::new(bytes)],
-        &mut control,
-        SendFlags::empty(),
-    )
-    .context("writing a QMP command with a descriptor")?;
+    // A signal during the call sends nothing, so it is simply made again.
+    let sent = loop {
+        match rustix::net::sendmsg(
+            stream.as_fd(),
+            &[IoSlice::new(bytes)],
+            &mut control,
+            SendFlags::empty(),
+        ) {
+            Err(rustix::io::Errno::INTR) => continue,
+            result => break result.context("writing a QMP command with a descriptor")?,
+        }
+    };
+    if sent == 0 {
+        bail!("QMP took none of a command with a descriptor");
+    }
     // The descriptor went with the first byte; the rest, if a short write
     // left any, goes plainly.
     let mut writer = stream;

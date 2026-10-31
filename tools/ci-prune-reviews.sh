@@ -40,15 +40,15 @@ take_push_token() {
 # code, as the static runners do, so that anything an earlier job
 # could write there is hostile. The workflow runs it on an ephemeral
 # vm runner, a fresh machine per job, where none of that holds; the
-# isolation is kept as defence in depth, and because the runner is
-# one line of the workflow, not a property of this script. On such a
-# runner ~/.gitconfig and ~/.sigstore are writable by any earlier job:
-# a url.<x>.insteadOf there could swap the development clone, whose
-# script this job runs, for another; a poisoned TUF cache could change
-# which Fulcio roots and Rekor keys gitsign trusts, or, through its
-# remote.json, which mirror it updates them from. A reused
-# workspace's own .git is such state too, which is why nothing here
-# runs git in it (clone_target).
+# isolation is kept as defence in depth, and because the runner is one
+# line of the workflow, not a property of this script. On a
+# long-lived, shared runner ~/.gitconfig and ~/.sigstore are writable
+# by any earlier job: a url.<x>.insteadOf there could swap the
+# development clone, whose script this job runs, for another; a
+# poisoned TUF cache could change which Fulcio roots and Rekor keys
+# gitsign trusts, or, through its remote.json, which mirror it updates
+# them from. A reused workspace's own .git is such state too, which is
+# why nothing here runs git in it (clone_target).
 #
 # GIT_CONFIG_GLOBAL=/dev/null replaces both ~/.gitconfig and
 # $XDG_CONFIG_HOME/git/config, and GIT_CONFIG_NOSYSTEM skips the

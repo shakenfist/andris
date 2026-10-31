@@ -154,11 +154,17 @@ jobs:
       # repository. The action is pinned to a commit, unlike the fleet's
       # other action references, because this step handles the key of
       # the identity that bypasses the ruleset, and a moved tag would
-      # hand that key to whatever the tag then named.
+      # hand that key to whatever the tag then named. The vm runners set
+      # a proxy in the environment, and the action refuses to start
+      # while one is set unless Node.js is told to honour it, rather
+      # than let its requests bypass the proxy; NODE_USE_ENV_PROXY does
+      # that, and changes nothing on a runner with no proxy set.
       - name: Mint the push token
         id: app-token
         if: env.HAS_REVIEW_MARKS_KEY == 'true'
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        env:
+          NODE_USE_ENV_PROXY: '1'
         with:
           client-id: ${{ vars.REVIEW_MARKS_APP_CLIENT_ID }}
           private-key: ${{ secrets.REVIEW_MARKS_APP_KEY }}

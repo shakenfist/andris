@@ -124,9 +124,13 @@ locally:
 - **Python, if any appears** (tooling under `tools/`, say), uses
   single quotes for strings, double quotes for docstrings, and lines
   wrapped at 120 characters.
-- **Human review tracking is deliberately absent.** Andris carries
-  no `REVIEWS.md`, `.vscode/review-scope.toml` or prune-reviews
-  workflow. Do not copy them across from ryll.
+- **Human review tracking is adopted.** `REVIEWS.md` is generated:
+  regenerate it with the review tooling, never edit it by hand.
+  `.github/workflows/prune-reviews.yml`, `tools/ci-prune-reviews.sh`
+  and `tools/review-tracking.sh` are byte-for-byte copies of
+  shakenfist/development's `templates/review-tracking/`, which the
+  `review-tracking-templates` audit checks; change the template
+  first, then re-sync. `.vscode/review-scope.toml` is andris's own.
 
 ## Process documents
 

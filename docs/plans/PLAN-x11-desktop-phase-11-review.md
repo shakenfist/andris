@@ -367,6 +367,19 @@ happen at any time before step 6 and step 7 respectively.
   `release` environment secret listings were all empty, while ryll's
   shows it. Nothing needs it before the merge; step 7 checks again
   before dispatching the prune bot.
+- 2026-10-31 (AEDT): `DEPENDENCIES_TOKEN` became a repository secret
+  here on 2026-10-29, and the prune bot's pushes then landed as
+  `shakenfist-bot`. From the review-tracking re-sync pull request
+  (#65) on, the `prune-reviews` workflow no longer reads that secret:
+  it pushes as the `shakenfist-review-marks` GitHub App, minting a
+  token from `REVIEW_MARKS_APP_KEY` in the `review-marks` environment
+  (branch policy `develop` only), and the App is a bypass actor on
+  the develop ruleset. Steps 4 to 6 and brief 5 below describe the
+  token setup as it was when this phase was planned; the setup that
+  matters now is step 7 of "Adopting a repository" in
+  shakenfist/development's `docs/code-review-tracking.md`, and it
+  was done for andris on 2026-10-30 by `PLAN-bot-bypass-identity.md`
+  there.
 
 ### Brief 1: the reading guide
 

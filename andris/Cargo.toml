@@ -116,7 +116,7 @@ optional = true
 # 5, the version qemu-display uses. Andris serves the listener interfaces
 # itself, so it names zbus directly; `p2p` for the peer-to-peer
 # connections the display and its listener use.
-version = "5"
+version = "6"
 features = ["p2p"]
 optional = true
 

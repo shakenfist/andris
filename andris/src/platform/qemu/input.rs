@@ -355,6 +355,7 @@ impl Injector {
             .keyboard
             .modifiers()
             .await
+            .map(KeyboardModifiers::from_bits_truncate)
             .map(|modifiers| lock_state(|modifier| modifiers.contains(modifier)))
             .context("reading the guest's lock state from qemu")
     }

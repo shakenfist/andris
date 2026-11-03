@@ -86,11 +86,12 @@ qemu = ["dep:qemu-display", "dep:rustix", "dep:serde_bytes", "dep:serde_json", "
 # release: 0.2.1 has the Unix.Map listener, but depends unconditionally on
 # usbredirhost, which links the system's libusbredirhost and libusb
 # through pkg-config. af33f32 moved that host backend out of the crate,
-# and the pin, 6ffedb9, is the commit of 2026-09-02.
+# and the pin, c0518be, is the commit of 2026-11-02, after 8faa436 moved
+# qemu-display to zbus 6.
 [dependencies.qemu-display]
 version = "0.2.1"
 git = "https://gitlab.com/marcandre.lureau/qemu-display"
-rev = "6ffedb95967dcd864991e1ac581d9e9d62d3e84a"
+rev = "c0518be24de0da016ed0690250a660dcd564392c"
 optional = true
 
 [dependencies.rustix]
@@ -113,11 +114,13 @@ version = "1"
 optional = true
 
 [dependencies.zbus]
-# 5, the version qemu-display uses. Andris serves the listener interfaces
-# itself, so it names zbus directly; `p2p` for the peer-to-peer
-# connections the display and its listener use.
-version = "6"
-features = ["p2p"]
+# 6, the version qemu-display uses: the two must match, since andris
+# hands qemu-display's proxies zbus types. Andris serves the listener
+# interfaces itself, so it names zbus directly; `p2p` for the
+# peer-to-peer connections the display and its listener use, and
+# `serde_bytes` for the listener's `ByteBuf` pixel arguments.
+version = "6.2"
+features = ["p2p", "serde_bytes"]
 optional = true
 
 [dev-dependencies]

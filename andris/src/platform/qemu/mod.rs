@@ -64,8 +64,8 @@ use anyhow::{Context, Result, bail};
 use qemu_display::{ConsoleProxy, KeyboardProxy, MouseProxy};
 use tokio::sync::watch;
 use tracing::{debug, info};
+use zbus::Fd;
 use zbus::proxy::CacheProperties;
-use zbus::zvariant::Fd;
 
 use super::{
     Capture, Clipboard, ClipboardReceiver, CursorReceiver, CursorSource, DamageHub,
@@ -228,27 +228,27 @@ fn attach(display: UnixStream, shared: &Arc<Shared>) -> Result<(Connections, Dev
         .build()
         .context("starting the qemu platform's runtime")?;
     runtime.block_on(async {
-        let display = zbus::connection::Builder::async_io_unix_stream(display)
+        let display = zbus::connection::Builder::unix_stream(display)
             .p2p()
             .method_timeout(CALL_TIMEOUT)
             .build()
             .await
             .context("opening qemu's D-Bus display")?;
         let console = ConsoleProxy::builder(&display)
-            .path(CONSOLE_PATH)?
+            .path(CONSOLE_PATH)
             .cache_properties(CacheProperties::No)
             .build()
             .await
             .context("finding qemu's first console")?;
         let devices = Devices {
             keyboard: KeyboardProxy::builder(&display)
-                .path(CONSOLE_PATH)?
+                .path(CONSOLE_PATH)
                 .cache_properties(CacheProperties::No)
                 .build()
                 .await
                 .context("finding the first console's keyboard")?,
             mouse: MouseProxy::builder(&display)
-                .path(CONSOLE_PATH)?
+                .path(CONSOLE_PATH)
                 .cache_properties(CacheProperties::No)
                 .build()
                 .await
@@ -265,10 +265,10 @@ fn attach(display: UnixStream, shared: &Arc<Shared>) -> Result<(Connections, Dev
             .await
             .context("registering andris's display listener with qemu")?;
         drop(theirs);
-        let listener = zbus::connection::Builder::async_io_unix_stream(listener)
+        let listener = zbus::connection::Builder::unix_stream(listener)
             .p2p()
-            .serve_at(LISTENER_PATH, Listener::new(shared.clone()))?
-            .serve_at(LISTENER_PATH, MapListener::new(shared.clone()))?
+            .serve_at(LISTENER_PATH, Listener::new(shared.clone()))
+            .serve_at(LISTENER_PATH, MapListener::new(shared.clone()))
             .build()
             .await
             .context("serving andris's display listener to qemu")?;

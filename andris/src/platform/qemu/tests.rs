@@ -105,8 +105,7 @@ impl FakeMouse {
 #[zbus::proxy(
     interface = "org.qemu.Display1.Listener",
     default_service = "org.qemu",
-    default_path = "/org/qemu/Display1/Listener",
-    gen_blocking = false
+    default_path = "/org/qemu/Display1/Listener"
 )]
 trait QemuListener {
     fn scanout(
@@ -149,8 +148,7 @@ trait QemuListener {
 #[zbus::proxy(
     interface = "org.qemu.Display1.Listener.Unix.Map",
     default_service = "org.qemu",
-    default_path = "/org/qemu/Display1/Listener",
-    gen_blocking = false
+    default_path = "/org/qemu/Display1/Listener"
 )]
 trait QemuMap {
     fn scanout_map(
@@ -208,9 +206,8 @@ fn a_fake_qemu_shares_its_screen_and_takes_input() {
 
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async move {
-        let display = zbus::connection::Builder::async_io_unix_stream(theirs)
+        let display = zbus::connection::Builder::unix_stream(theirs)
             .server(zbus::Guid::generate())
-            .unwrap()
             .p2p()
             .serve_at(
                 CONSOLE_PATH,
@@ -218,25 +215,21 @@ fn a_fake_qemu_shares_its_screen_and_takes_input() {
                     listeners: listener_sender,
                 },
             )
-            .unwrap()
             .serve_at(
                 CONSOLE_PATH,
                 FakeKeyboard {
                     calls: call_sender.clone(),
                 },
             )
-            .unwrap()
             .serve_at(CONSOLE_PATH, FakeMouse { calls: call_sender })
-            .unwrap()
             .build()
             .await
             .unwrap();
 
         // qemu serves the listener's connection, as it does the display's.
         let listener = listeners.recv_timeout(WAIT).unwrap();
-        let listener = zbus::connection::Builder::async_io_unix_stream(UnixStream::from(listener))
+        let listener = zbus::connection::Builder::unix_stream(UnixStream::from(listener))
             .server(zbus::Guid::generate())
-            .unwrap()
             .p2p()
             .build()
             .await

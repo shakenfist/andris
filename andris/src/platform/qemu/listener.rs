@@ -41,8 +41,8 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde_bytes::ByteBuf;
 use tokio::sync::watch;
 use tracing::{debug, warn};
+use zbus::Fd;
 use zbus::fdo;
-use zbus::zvariant::Fd;
 
 use super::framebuffer::{Framebuffer, PixelFormat, Source};
 use super::shm::Mapping;

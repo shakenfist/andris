@@ -1,0 +1,18 @@
+# skillsaw configuration. See .pre-commit-config.yaml for why skillsaw
+# runs at all.
+#
+# Setting `exclude` replaces skillsaw's built-in exclude list, so the
+# first four entries restate those defaults.
+#
+# The Docker builds keep their cargo home in the git-ignored
+# .cargo-cache/, which holds every dependency's source, agent context
+# included (zbus 6's zruntime ships an AGENTS.md over skillsaw's budget).
+# skillsaw does not consult .gitignore, so without this exclude it lints
+# those files as if they were ours, and fails any clone that has built.
+exclude:
+  - "**/template/**"
+  - "**/templates/**"
+  - "**/_template/**"
+  - "**/__pycache__/**"
+  - ".cargo-cache/**"
+  - ".cargo-tools/**"

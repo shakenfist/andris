@@ -8,6 +8,10 @@ kerbside. The options, the ticket file and TLS are described in
 what happens when an RDP client and a SPICE client use the same
 desktop.
 
+If you would rather andris had a desktop to itself, rather than a share
+of xrdp's, see [own-session.md](own-session.md); the two can both be set
+up on one machine.
+
 Andris does not replace xrdp or take over its session. xrdp starts an
 Xorg server for the user (xorgxrdp), and the RDP client draws on it.
 Andris connects to that same X server as an ordinary client, so both

@@ -310,6 +310,18 @@ target/release/andris --ticket-file ticket \
     --tls-listen 0.0.0.0:5901 --tls-cert cert.pem --tls-key key.pem
 ```
 
+`--tls-cert` must be an *end-entity* certificate, leaf first, with the
+addresses clients reach andris by among its subject alternative names.
+A certificate authority's own certificate will not do, even though
+`openssl req -x509` makes one by default and the result serves
+spice-gtk clients perfectly well: ryll, which verifies with rustls,
+refuses it with
+`invalid peer certificate: Other(OtherError(CaUsedAsEndEntity))`. Make
+a certificate authority, keep its certificate for clients to trust,
+and sign a server certificate with `CA:FALSE`,
+`extendedKeyUsage=serverAuth` and those names, as spice-server's own
+instructions do.
+
 With TLS configured, the plain listener stops serving sessions: it
 answers every link with "need secured", which sends a SPICE client
 to the TLS listener. With TLS configured, `--listen` may be any

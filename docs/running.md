@@ -315,6 +315,15 @@ answers every link with "need secured", which sends a SPICE client
 to the TLS listener. With TLS configured, `--listen` may be any
 address. Clients are not asked for certificates.
 
+The redirect names no port, so the client has to have been told the
+TLS one already: it is the port the client would have used had it
+started with TLS. A client configured with only the plain port gives
+up there instead -- spice-gtk logs
+`Missing port value, not attempting TLS connection` and disconnects
+before it authenticates. A `.vv` file therefore needs `tls-port`,
+with or without `port`, and a client with one port field wants the
+TLS port in it.
+
 Unauthenticated connections are limited, so that no one peer can
 lock others out:
 

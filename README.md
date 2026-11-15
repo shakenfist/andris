@@ -47,6 +47,9 @@ DISPLAY=:10 andris --ticket-file ticket
 To run it as a service beside xrdp, `andris install-unit` sets up its
 systemd unit; see
 [Running andris alongside xrdp](https://github.com/shakenfist/andris/blob/develop/docs/xrdp.md).
+A machine with no monitor can instead start an X server and a desktop
+session of its own for andris to export; see
+[Running andris on a desktop of its own](https://github.com/shakenfist/andris/blob/develop/docs/own-session.md).
 To build it from source, see
 [Running andris](https://github.com/shakenfist/andris/blob/develop/docs/running.md#installing-and-building).
 
@@ -61,6 +64,7 @@ built, is set out in the
 - [X11 desktop over SPICE](https://github.com/shakenfist/andris/blob/develop/docs/plans/PLAN-x11-desktop.md) - The master plan: what andris is for and how it will be built
 - [Running andris](https://github.com/shakenfist/andris/blob/develop/docs/running.md) - Options, the ticket file, TLS, connecting with ryll and fronting andris with kerbside
 - [Running andris alongside xrdp](https://github.com/shakenfist/andris/blob/develop/docs/xrdp.md) - The systemd user unit, and how RDP and SPICE share a desktop
+- [Running andris on a desktop of its own](https://github.com/shakenfist/andris/blob/develop/docs/own-session.md) - Starting an X server and a desktop session for andris to export
 - [Development](https://github.com/shakenfist/andris/blob/develop/docs/development.md) - Building, testing and the CI pipeline
 - [Releasing andris](https://github.com/shakenfist/andris/blob/develop/docs/releasing.md) - Publishing the wheels to PyPI
 

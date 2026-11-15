@@ -25,6 +25,9 @@ is meant to become.
 - [Running andris alongside xrdp](xrdp.md) - The systemd user unit, what
   happens when the session ends, how RDP and SPICE input,
   clipboard and resizing interact, and how to give both clients sound
+- [Running andris on a desktop of its own](own-session.md) - Starting an
+  X server and a desktop session for andris to export, as systemd user
+  units, and how that desktop differs from the xrdp session
 - [Development](development.md) - Building, testing, pre-commit, CI
   and the merge queue
 - [Releasing andris](releasing.md) - Publishing the wheels to PyPI:

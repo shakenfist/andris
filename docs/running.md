@@ -19,7 +19,9 @@ pipx install andris        # or: pip install --user andris
 
 It holds the compiled binary, with the H.264 encoder built in, for
 x86_64 and aarch64 Linux with glibc 2.28 or newer. To run it as a
-service beside xrdp, continue at [xrdp.md](xrdp.md#installing).
+service beside xrdp, continue at [xrdp.md](xrdp.md#installing); to
+give it a desktop of its own to export, see
+[own-session.md](own-session.md).
 
 To build it yourself:
 
@@ -119,7 +121,9 @@ xrdp session is the session's user. The display comes from
 to start. Authorisation uses the usual X mechanisms, so set
 `XAUTHORITY` if the session's cookie is not in `~/.Xauthority`.
 
-To run andris as a service beside xrdp, see [xrdp.md](xrdp.md).
+To run andris as a service beside xrdp, see [xrdp.md](xrdp.md). To
+run it on a display and desktop it has to itself, see
+[own-session.md](own-session.md).
 
 Before it listens, andris checks the X server and refuses to start,
 naming every problem it found, unless:
@@ -310,10 +314,31 @@ target/release/andris --ticket-file ticket \
     --tls-listen 0.0.0.0:5901 --tls-cert cert.pem --tls-key key.pem
 ```
 
+`--tls-cert` must be an *end-entity* certificate, leaf first, with the
+addresses clients reach andris by among its subject alternative names.
+A certificate authority's own certificate will not do, even though
+`openssl req -x509` makes one by default and the result serves
+spice-gtk clients perfectly well: ryll, which verifies with rustls,
+refuses it with
+`invalid peer certificate: Other(OtherError(CaUsedAsEndEntity))`. Make
+a certificate authority, keep its certificate for clients to trust,
+and sign a server certificate with `CA:FALSE`,
+`extendedKeyUsage=serverAuth` and those names, as spice-server's own
+instructions do.
+
 With TLS configured, the plain listener stops serving sessions: it
 answers every link with "need secured", which sends a SPICE client
 to the TLS listener. With TLS configured, `--listen` may be any
 address. Clients are not asked for certificates.
+
+The redirect names no port, so the client has to have been told the
+TLS one already: it is the port the client would have used had it
+started with TLS. A client configured with only the plain port gives
+up there instead -- spice-gtk logs
+`Missing port value, not attempting TLS connection` and disconnects
+before it authenticates. A `.vv` file therefore needs `tls-port`,
+with or without `port`, and a client with one port field wants the
+TLS port in it.
 
 Unauthenticated connections are limited, so that no one peer can
 lock others out:

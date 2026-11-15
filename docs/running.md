@@ -19,7 +19,9 @@ pipx install andris        # or: pip install --user andris
 
 It holds the compiled binary, with the H.264 encoder built in, for
 x86_64 and aarch64 Linux with glibc 2.28 or newer. To run it as a
-service beside xrdp, continue at [xrdp.md](xrdp.md#installing).
+service beside xrdp, continue at [xrdp.md](xrdp.md#installing); to
+give it a desktop of its own to export, see
+[own-session.md](own-session.md).
 
 To build it yourself:
 
@@ -119,7 +121,9 @@ xrdp session is the session's user. The display comes from
 to start. Authorisation uses the usual X mechanisms, so set
 `XAUTHORITY` if the session's cookie is not in `~/.Xauthority`.
 
-To run andris as a service beside xrdp, see [xrdp.md](xrdp.md).
+To run andris as a service beside xrdp, see [xrdp.md](xrdp.md). To
+run it on a display and desktop it has to itself, see
+[own-session.md](own-session.md).
 
 Before it listens, andris checks the X server and refuses to start,
 naming every problem it found, unless:

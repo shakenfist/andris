@@ -57,6 +57,7 @@ include = [
     'docs/index.md',
     'docs/running.md',
     'docs/xrdp.md',
+    'docs/own-session.md',
     'docs/reading-guide.md',
     'andris/src/main.rs',
     'andris/src/lib.rs',

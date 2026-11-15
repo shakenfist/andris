@@ -113,6 +113,14 @@ an RDP client and a SPICE client share one desktop: input, clipboard,
 resizing and sound. "When the session ends" explains the exit statuses
 that `main.rs` and the unit agree on.
 
+### `docs/own-session.md`
+
+A recipe rather than code: an Xvfb display and a desktop session of
+andris's own, as systemd user units beside `andris@.service`, and how
+that differs from the xrdp session. Nothing in it is part of andris;
+check its claims about resizing and the scrub against "What a client
+gets" in `docs/running.md`.
+
 ### `docs/reading-guide.md`
 
 This guide. It is in the queue so that it is reviewed like any other

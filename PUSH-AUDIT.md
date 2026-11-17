@@ -98,6 +98,29 @@ alone, and the audit report says so.
 Every command must pass. If one fails, fix the cause and re-run
 before spending on wave 2.
 
+Then the file-size measurement on the diff:
+
+```
+# origin/develop is a cached ref: without this a stale clone
+# widens the audit silently
+git fetch origin
+
+# Touched source files long enough for `source-file-size` in 2a to
+# be worth raising -- 800 lines to ask the question, 1,500 past
+# which a file may not grow. Judging them is wave 2's job; this
+# only produces the number, so that the judgement is made about a
+# named file rather than left to whether anyone happened to
+# notice. wc measures each touched file whole, not the branch's
+# hunks, because 2a reads the files a diff touches: a small
+# addition to a long file is how slow growth gets past a review of
+# the diff alone. The extension list is this repository's: Rust,
+# plus the shell and Python helpers in tools/. --diff-filter=d
+# keeps a deleted path out of wc's argv.
+git diff --name-only --diff-filter=d develop...HEAD \
+    -- '*.rs' '*.py' '*.sh' |
+    xargs -r -d '\n' wc -l | awk '$2 != "total" && $1 > 800'
+```
+
 ### Style conformance -- judgment portion
 
 | Setting | Value |
@@ -154,6 +177,9 @@ and `.expect()` calls. Then add the judgment-level review:
 - **Triage the scan's raw findings:** for each TODO, unwrap or
   `unsafe` found, say blocking or advisory and why. Skip ones in
   `#[cfg(test)]` blocks.
+- **Touched files that are long:** wave 1 listed the touched
+  source files over 800 lines. Read each of those whole, not only
+  its hunks, and judge it against `source-file-size` below.
 
 <!-- shared-block: comment-proportion v1 -->
 Comment proportion (shared block; do not edit -- the canonical
@@ -177,7 +203,7 @@ copy lives in shakenfist/development at
   reduced to a pointer.
 <!-- shared-block-end -->
 
-<!-- shared-block: source-file-size v1 -->
+<!-- shared-block: source-file-size v2 -->
 Source file size (shared block; do not edit -- the canonical
 copy lives in shakenfist/development at
 `templates/shared-blocks/source-file-size.md`):
@@ -191,13 +217,29 @@ copy lives in shakenfist/development at
   split, and one over roughly 1,500 as wanting a stated reason to
   stay whole. These hold whether or not a repository tracks review
   per file: tracking is what makes the cost repeat and become
-  measurable, not what makes a long file expensive to read. Both
-  are advisory. Neither is a gate, there is no hard cap, and a
-  reviewer who raises one is opening a question, not recording a
-  defect.
+  measurable, not what makes a long file expensive to read.
+- There is no cap, and no file is ever forced to split: a file
+  already over 1,500 lines may stay exactly that long. What it may
+  not do is grow, and no file may cross 1,500, without a reviewed
+  edit to the repository's baseline of oversize files -- the
+  ratchet in shakenfist/development's
+  `templates/source-size-ratchet/` checks that on every commit.
+  Raising an entry is allowed: it is the stated reason, asked for
+  where a reviewer cannot scroll past it. Where a repository has
+  not adopted the ratchet, the push auditor applies the same rule
+  by hand.
+- The push auditor reads the files the diff touches, not only the
+  diff. A branch that grows a file already over 800 lines is a
+  finding to raise even when its own addition is small, because
+  per-diff review is how slow growth gets past: every step looks
+  reasonable on its own. Under 1,500 the finding opens a question
+  rather than recording a defect. A raised baseline entry is
+  reviewed as the decision it is, and its reason belongs in the
+  pull request description.
 - Generated files, vendored trees and protocol or data tables are
   exempt: they are not read the way source is, and a tool that
-  counts them is measuring the wrong thing.
+  counts them -- the ratchet included -- is measuring the wrong
+  thing, so they belong in its exclusion list, not its baseline.
 - Split along a seam that already exists -- one module's public
   entry point, one check, one subcommand, one endpoint -- so that
   a later change touches one of the pieces rather than all of
@@ -206,10 +248,24 @@ copy lives in shakenfist/development at
 - Length is never reduced by deleting the comments and docstrings
   that explain why the code is the way it is. Those are what make
   a long file reviewable, and trading them for a line count makes
-  the review worse while making the number better. Cut duplicated
-  scaffolding first; see `comment-proportion` for what earns its
-  length.
+  the review worse while making the number better. A diff that
+  shrinks a baselined file by deleting rationale comments or
+  docstrings is a finding, not a win: the ratchet counts lines and
+  cannot tell the difference, so the reviewer has to. Cut
+  duplicated scaffolding first; see `comment-proportion` for what
+  earns its length.
 <!-- shared-block-end -->
+
+!!! note "In this project"
+
+    Andris has not adopted shakenfist/development's
+    `templates/source-size-ratchet/`, so there is no baseline file
+    of oversize files and no pre-commit check: the push auditor
+    applies the ratchet by hand, against the list of touched files
+    wave 1 produces. A branch that grows a file already over 1,500
+    lines, or that pushes one across 1,500, needs its reason in the
+    pull request description -- that is where a reviewed baseline
+    entry would otherwise have recorded it.
 
 <!-- shared-block: python-version-discipline v1 -->
 Python version and typing (shared block; do not edit -- the

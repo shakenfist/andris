@@ -122,7 +122,9 @@ Design commitments:
 - **One client at a time.** A new connection replaces the old one,
   as spice-server does.
 
-Not covered: Wayland, multiple simultaneous viewers, migration,
+Not covered: Wayland, multiple simultaneous viewers (planned
+separately in [PLAN-multi-client.md](PLAN-multi-client.md),
+which reverses the commitment above), migration,
 the record, usbredir, webdav and smartcard channels,
 multi-monitor, and splitting ryll's shared crates into their own
 repository (see Future work for the trigger).

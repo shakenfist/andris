@@ -98,27 +98,51 @@ alone, and the audit report says so.
 Every command must pass. If one fails, fix the cause and re-run
 before spending on wave 2.
 
-Then the file-size measurement on the diff:
+Then the file-size measurement. It lists each touched source file
+over 800 lines with its length before and after the change, because
+`source-file-size` in 2a rules on growth rather than length: 800
+lines is where it asks the question, and past 1,500 a file may not
+grow. Record the list in the audit report, or "no touched file over
+800 lines" when it is empty, so that an empty result cannot be
+mistaken for one that was never produced. The extensions are this
+repository's: Rust, plus the shell and Python helpers in `scripts/`
+and `tools/`.
+
+Set `base` and the path list for the mode the runbook is running
+in. As a pre-push gate, against a freshly fetched `origin/develop`
+-- the local `develop` may be stale or absent:
 
 ```
-# origin/develop is a cached ref: without this a stale clone
-# widens the audit silently
 git fetch origin
+base=origin/develop
+git diff --name-only -z --diff-filter=d "$base...HEAD" \
+    -- '*.rs' '*.py' '*.sh' > /tmp/size-paths
+```
 
-# Touched source files long enough for `source-file-size` in 2a to
-# be worth raising -- 800 lines to ask the question, 1,500 past
-# which a file may not grow. Judging them is wave 2's job; this
-# only produces the number, so that the judgement is made about a
-# named file rather than left to whether anyone happened to
-# notice. wc measures each touched file whole, not the branch's
-# hunks, because 2a reads the files a diff touches: a small
-# addition to a long file is how slow growth gets past a review of
-# the diff alone. The extension list is this repository's: Rust,
-# plus the shell and Python helpers in tools/. --diff-filter=d
-# keeps a deleted path out of wc's argv.
-git diff --name-only --diff-filter=d develop...HEAD \
-    -- '*.rs' '*.py' '*.sh' |
-    xargs -r -d '\n' wc -l | awk '$2 != "total" && $1 > 800'
+As a master plan's closing phase, `develop...HEAD` holds only the
+audit's own edits, so take the paths from the combined patch, and
+the earlier lengths from just before the plan's first phase landed:
+
+```
+base=<first phase merge>^1    # or <first>^ for a recorded range
+sed -n 's|^+++ b/||p' /tmp/plan-audit.patch | sort -u |
+    grep -E '\.(rs|py|sh)$' | tr '\n' '\0' > /tmp/size-paths
+```
+
+Then, in either mode:
+
+```
+# Whole files, not the hunks: a small addition to a long file is
+# what this exists to catch. A new file's earlier length prints as
+# 0; a path the plan later deleted has nothing to measure.
+while IFS= read -r -d '' f; do
+    [ -f "$f" ] || continue
+    now=$(wc -l < "$f")
+    was=$(git show "$base:$f" 2>/dev/null | wc -l)
+    if [ "$now" -gt 800 ]; then
+        printf '%s\t%s -> %s\n' "$f" "$was" "$now"
+    fi
+done < /tmp/size-paths
 ```
 
 ### Style conformance -- judgment portion
@@ -178,8 +202,10 @@ and `.expect()` calls. Then add the judgment-level review:
   `unsafe` found, say blocking or advisory and why. Skip ones in
   `#[cfg(test)]` blocks.
 - **Touched files that are long:** wave 1 listed the touched
-  source files over 800 lines. Read each of those whole, not only
-  its hunks, and judge it against `source-file-size` below.
+  source files over 800 lines, each with its length before and
+  after. Read each of those whole, not only its hunks, and judge
+  it against `source-file-size` below: past 1,500 lines, it is the
+  growth that needs a reason.
 
 <!-- shared-block: comment-proportion v1 -->
 Comment proportion (shared block; do not edit -- the canonical

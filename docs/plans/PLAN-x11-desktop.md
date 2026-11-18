@@ -575,6 +575,58 @@ block is a version behind, and v2 changes what the auditor does
 root commit, which has no parent, so the runbook's `git diff first^
 last` recipe cannot express it.
 
+#### The audit range, as derived
+
+Recorded here so it never has to be derived again. The range is the
+16 landings in the `Merged` column above that landed in andris.
+Fifteen are merge commits, each contributing `git diff <m>^1 <m>`:
+
+```
+cf34d91 a9e79cf 591e062 1950cdb 68b1058 43bfe88 498a72c b7ba2dd
+c2fe8a7 1ecafa5 d8f316a 553ecfb c0617e9 c36e87a 568a43b
+```
+
+The sixteenth is phase 0, recorded as `60c0c4d..e89539f`. `60c0c4d`
+is the repository's root commit and has no parent, so `60c0c4d^` is
+not a revision and the runbook's range recipe fails on it. The diff
+is taken against the empty tree instead, which is right because
+phase 0 *is* the start of the repository:
+
+```
+git diff "$(git hash-object -t tree /dev/null)" e89539f
+```
+
+Together those 16 are **365 diff rows, 63,239 insertions and 2,560
+deletions over 149 distinct paths**. Four numbers a later auditor can
+check the assembly against before trusting anything downstream.
+
+The patch was split seven ways for the judgment agents, and the
+slices partition it exactly -- rows, insertions and deletions each
+sum to the totals:
+
+| Slice | Pathspec | Rows | + | - |
+|-------|----------|------|---|---|
+| server | `andris/src/server` | 46 | 13,012 | 720 |
+| platform | `andris/src/platform` | 47 | 12,120 | 318 |
+| core | `andris/src` less the two above | 15 | 2,382 | 95 |
+| tests | `andris/tests` | 30 | 8,361 | 529 |
+| harness | build, CI, scripts, packaging, manifests | 119 | 12,039 | 371 |
+| docs | `*.md` outside `docs/plans/` | 61 | 4,889 | 310 |
+| plans | `docs/plans` | 47 | 10,436 | 217 |
+
+The `plans` slice was measured for the coverage proof and
+deliberately not given to any agent: it is this plan describing
+itself.
+
+Exactly 22 tracked files outside `.vscode/` are absent from that
+patch, and each belongs to work that is not this plan's -- the qemu
+D-Bus backend (#56, which landed the day after the last phase), the
+release scripts (#34, development's release-gating plan), the issue
+#26 fix (#47), one later documentation page (#83), a Renovate
+addition, the generated configuration exports, and phase 12's own
+plan file. So the audit saw the whole of the plan, and the `Merged`
+column is not missing a landing.
+
 ## Agent guidance
 
 ### Execution model

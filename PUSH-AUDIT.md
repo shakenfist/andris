@@ -106,8 +106,11 @@ may not grow without a stated reason, and a long file that shrank
 may have lost its rationale comments. It writes the list to
 `/tmp/size-list`, which the 2a brief reads, and writes "no touched
 file over 800 lines" there rather than nothing, so that an empty
-result cannot be mistaken for one that was never produced. Record
-the list in the audit report. The extensions are this repository's:
+result cannot be mistaken for one that was never produced. A
+`base` that does not resolve -- a failed fetch, an unsubstituted
+placeholder -- writes "size measurement void" instead, which the
+audit report records as a failed step, not a pass. Record the list
+in the audit report. The extensions are this repository's:
 Rust, plus the shell and Python helpers in `scripts/` and `tools/`.
 
 Set `base` and the path list for the mode the runbook is running
@@ -120,37 +123,47 @@ charged with other people's changes to the same file:
 cd "$(git rev-parse --show-toplevel)"
 git fetch origin
 base=$(git merge-base origin/develop HEAD)
-git diff --name-only -z --diff-filter=d "$base...HEAD" \
+git diff --name-only -z --diff-filter=d "$base" HEAD \
     -- '*.rs' '*.py' '*.sh' > /tmp/size-paths
 ```
 
 As a master plan's closing phase, `develop...HEAD` holds only the
-audit's own edits, so take the paths from the combined patch, and
-the earlier lengths from just before the plan's first phase landed:
+audit's own edits, so take the paths from the phase commits that
+built the combined patch, and the earlier lengths from just before
+the plan's first phase landed. A phase recorded as a range
+contributes `first^ last` in place of `"$m^1" "$m"`:
 
 ```
 base=<first phase merge>^1    # or <first>^ for a recorded range
-sed -n 's|^+++ b/||p' /tmp/plan-audit.patch | sort -u |
-    grep -E '\.(rs|py|sh)$' | tr '\n' '\0' > /tmp/size-paths
+for m in <the phase merge commits>; do
+    git diff --name-only -z --diff-filter=d "$m^1" "$m" \
+        -- '*.rs' '*.py' '*.sh'
+done | sort -zu > /tmp/size-paths
 ```
 
 Then, in either mode:
 
 ```
 # Whole files, not the hunks: a small addition to a long file is
-# what this exists to catch. A new file's earlier length prints as
-# 0; a path the plan later deleted has nothing to measure.
+# what this exists to catch. A new or renamed file's earlier
+# length prints as 0; a path the plan later deleted has nothing to
+# measure.
 cd "$(git rev-parse --show-toplevel)"
-while IFS= read -r -d '' f; do
-    [ -f "$f" ] || continue
-    now=$(wc -l < "$f")
-    was=$(git show "$base:$f" 2>/dev/null | wc -l)
-    if [ "$now" -gt 800 ] || [ "$was" -gt 800 ]; then
-        printf '%s\t%s -> %s\n' "$f" "$was" "$now"
-    fi
-done < /tmp/size-paths > /tmp/size-list
-[ -s /tmp/size-list ] ||
-    echo 'no touched file over 800 lines' > /tmp/size-list
+if ! git rev-parse --verify -q "$base^{commit}" > /dev/null; then
+    echo "size measurement void: base '$base' does not resolve" \
+        > /tmp/size-list
+else
+    while IFS= read -r -d '' f; do
+        [ -f "$f" ] || continue
+        now=$(wc -l < "$f")
+        was=$(git show "$base:$f" 2>/dev/null | wc -l)
+        if [ "$now" -gt 800 ] || [ "$was" -gt 800 ]; then
+            printf '%s\t%s -> %s\n' "$f" "$was" "$now"
+        fi
+    done < /tmp/size-paths > /tmp/size-list
+    [ -s /tmp/size-list ] ||
+        echo 'no touched file over 800 lines' > /tmp/size-list
+fi
 cat /tmp/size-list
 ```
 
@@ -302,10 +315,13 @@ copy lives in shakenfist/development at
     wave 1 produces. A branch that grows a file already over 1,500
     lines, or that pushes one across 1,500, needs its reason in the
     pull request description -- that is where a reviewed baseline
-    entry would otherwise have recorded it. As a master plan's
-    closing phase, whose phase pull requests have already merged,
-    the reason goes in the master plan instead, beside the
-    audit's other declined or accepted findings.
+    entry would otherwise have recorded it. Lines are counted
+    whole, an inline `#[cfg(test)]` module included, as the
+    ratchet's own count is; growth that is only new tests still
+    needs its reason, though one line usually gives it. As a
+    master plan's closing phase, whose phase pull requests have
+    already merged, the reason goes in the master plan instead,
+    beside the audit's other declined or accepted findings.
 
 <!-- shared-block: python-version-discipline v1 -->
 Python version and typing (shared block; do not edit -- the

@@ -756,4 +756,53 @@ eight criteria with verdicts and let them decide.
 
 ## Result
 
-Not started.
+**Complete, 2026-11-18.** Wave 1 passed and there was no blocking
+finding. Twenty-nine findings, all still present on `develop`, all
+tracked: eight new issues (#87 to #94) grouped by cause, and three
+existing issues sharpened (#13, #14, #15). Nothing was declined.
+
+The assembled patch matched the plan's four gate numbers exactly --
+365 diff rows, 63,239 insertions, 2,560 deletions, 149 distinct paths
+-- verified twice, and the seven slices partition it with every sum
+balancing. The derivation is recorded in the master plan so it never
+has to be done again, including the empty-tree form phase 0 needs
+because its range starts at the repository's root commit.
+
+The audit saw the whole of the plan: exactly 22 tracked files outside
+`.vscode/` are absent from the patch and each belongs to work that is
+not this plan's, so the `Merged` column is not missing a landing.
+
+The three findings worth a reader's attention, in order:
+
+1. **#87**, the only unauthenticated denial of service. `MAX_HANDSHAKES`
+   8 against `MAX_HANDSHAKES_PER_PEER` 4 means two addresses take
+   every permit and hold them by saying nothing. The code's own
+   comment asserts a guarantee here that is literally true and
+   operationally useless, and three documents repeat the reasoning.
+2. **#89 with #90**, the pair that matters most for confidence in the
+   test suite. The synthetic backend no longer models the real one on
+   four counts, *and* the real X11 input and cursor paths have no test
+   at all, *and* the tests that would need a real X server skip
+   silently and report green. Each is survivable; together they mean
+   the path from a client's bytes to events on the operator's desktop
+   is covered by nothing that runs in CI.
+3. **#14 as sharpened.** Andris copies the operator's clipboard into
+   its own memory at thread start and on every ownership change, with
+   no client connected and before any ticket is presented.
+
+The clean areas are recorded in full above, because an audit that
+lists only problems cannot be checked. The ones worth repeating: no
+path reaches a message loop before authentication; there is no
+`unsafe impl Send` or `Sync` anywhere in the crate; the memfd is
+sealed before mapping so a read cannot `SIGBUS`; a client cannot name
+an arbitrary X keycode; every wire body is bounded before buffering;
+no production `unwrap()` or `expect()` exists; and no plan-phase
+reference appears in any code or documentation file.
+
+Two steps did not run as briefed, both recorded in the execution
+notes with the reason: 12f, because its premise that findings would
+need checking against a newer `develop` was disproved by the agents
+reading current files, and 12g, because the skill for push-audit
+phases puts the record in the management session. The master plan's
+phase 12 row reads `Complete`; the plan itself stays `In progress`,
+with its two unmeasured performance criteria named as the reason.

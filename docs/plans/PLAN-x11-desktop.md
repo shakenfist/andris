@@ -191,7 +191,7 @@ as each phase comes up.
 | 9. Audio | PLAN-x11-desktop-phase-09-audio.md | Complete | ryll `38c51ef` (#578); andris `d8f316a` (#27) |
 | 10. Packaging and dogfood soak | PLAN-x11-desktop-phase-10-packaging.md | Complete | andris `553ecfb` (#28), `c0617e9` (#29), `c36e87a` (#49) |
 | 11. Human review | PLAN-x11-desktop-phase-11-review.md | Complete | andris `568a43b` (#51); development `810ce4d` (#335) |
-| 12. Push audit | PLAN-x11-desktop-phase-12-push-audit.md | Not started | |
+| 12. Push audit | PLAN-x11-desktop-phase-12-push-audit.md | Complete | |
 
 Rough sizing, as judgement rather than measurement: phases 0–5
 reach a usable LAN desktop in about three to four weeks; phases 6–9
@@ -672,10 +672,18 @@ because the following statements will be true:
   SSH tunnel, with RDP available and never needed. Kerbside is
   exercised only by the `Through kerbside` merge-tier lane.
 * With a static screen, andris uses under 2% of one core on
-  the development host.
+  the development host. **Not measured.** The phase 10 soak recorded
+  2.5% of one core averaged over 165 hours of use *and* idle, and said
+  itself that this "is not the success criterion's static-screen
+  figure, which the soak did not measure". Nothing since measured it.
+  This is one of the two reasons this plan is not `Complete`.
 * Scrolling a full-screen terminal at the session's native size
   sustains at least 30 frames per second on the LAN, as ryll's GUI
-  reports it: its FPS is the rate of `MARK` messages.
+  reports it: its FPS is the rate of `MARK` messages. **Not
+  measured.** The soak's figures are whole-session averages of 2.4 to
+  3.9 fps over seven days, which is what an idle desktop looks like
+  and says nothing about a scrolling peak. The second reason this plan
+  is not `Complete`.
 * Copy and paste of text work in both directions, with RDP
   connected to the same session. Resizing the ryll window resizes
   the desktop on an X server that allows it; on xrdp the desktop
@@ -700,6 +708,55 @@ because the following statements will be true:
   reading takes: the audit has no exemption mechanism, and the issue
   is the reading's work queue rather than a defect in this plan's
   work.
+
+### Items deferred from the push audit
+
+Phase 12 ran `PUSH-AUDIT.md` over this plan's accumulated diff --
+63,239 insertions across 149 files in 16 landings -- in two mechanical
+waves and six judgment reviews. **Wave 1 passed and there was no
+blocking finding.** Twenty-nine findings were recorded, all still
+present on `develop`, and every one is tracked. None is declined:
+each became a GitHub issue, or sharpened one that already existed.
+The finding detail and the clean areas are in
+[PLAN-x11-desktop-phase-12-push-audit.md](PLAN-x11-desktop-phase-12-push-audit.md);
+this is the disposition.
+
+Grouped by cause, because several findings share one:
+
+| Issue | What | From |
+|-------|------|------|
+| #87 | Two source addresses can hold every handshake permit and lock all other clients out, unauthenticated and indefinitely. The per-peer cap's stated guarantee does not survive a second address, and four documents repeat the reasoning | S1 |
+| #88 | Client-driven resize is unthrottled: a client can thrash the operator's real screen while making the server reallocate and re-encode the whole desktop each time. Found independently by both security reviewers | S3, X4 |
+| #89 | The synthetic platform backend has drifted from the X11 one on `Gone`, the input-queue bound, the clipboard cap and resize clamping, so tests using the stand-in are weaker than they look | P1-P5 |
+| #90 | CI reports green for the X11 and audio paths it never runs: those tests skip silently, and the real XTEST input sink and XFixes cursor source have no test at all though Xvfb could run them | T5, T6 |
+| #91 | The desktop clipboard cannot be turned off, and a crackable 32-bit hash of its text reaches debug logs | X2, X3 |
+| #92 | Five small server hardening items: a pre-authentication session-id oracle, a 48 MiB transient on the lossy UTF-8 path, log amplification in the key decoder, a failed resize leaving a changed DPI, and the ticket created in a directory known to be open to others | S2, S4, S5, X5, X6 |
+| #93 | Scaffolding duplicated across the phases -- the `Stats` field list written five times above all -- and the oversize files, each with a seam named | Q1-Q4, P6, P7 |
+| #94 | Documentation facts stated in two places that will drift, and `ARCHITECTURE.md`'s stale backend count | D1-D3 |
+
+Three existing issues were sharpened rather than duplicated: **#14**
+gains the finding that the clipboard fetch is eager, client-independent
+and happens before any ticket is presented, which is a stronger claim
+than the issue made; **#13** gains three adversarial cases, the
+priority being the inputs pointer messages, which drive XTEST;
+**#15** gains the named follow/serve seam and its file list.
+
+One thing the audit could not do, recorded rather than glossed:
+phases 2, 3, 7, 8 and 9 each landed work in ryll, and this plan cites
+the audit run in ryll's own pull request rather than re-auditing that
+code under andris's runbook. Phases 2, 3 and 7 have an audit to cite
+(ryll #477, #487 and #534, each recording wave 1 and its wave 2
+findings). **Phases 8 and 9 do not**: ryll #552, #554, #557 and #578
+carry no audit record in any pull request body or commit message. That
+is ryll's to resolve and is filed there as ryll#738.
+
+Why this plan is not `Complete`: two of its nine success criteria --
+the 2% idle CPU figure and the 30 fps scrolling figure -- were never
+measured, as noted against them above. They are the plan's only
+quantitative claims about whether andris is good enough to replace
+RDP for daily use, and the week's soak demonstrated the thing in
+practice without ever producing either number. The status stays `In
+progress` until they are measured or deliberately dropped.
 
 ### Documentation index maintenance
 
@@ -803,6 +860,27 @@ file) and keep its status in step with the Execution table.
 - In phase 2 ryll also learned to read a pixmap with
   `PAL_FROM_CACHE` after its 8-byte palette id, as spice.proto lays
   it out.
+- ryll#475: ryll's LZ4 decoder did not match spice-server -- it read
+  no `data_size` prefix, decoded independent per-row blocks rather
+  than one stream over multi-line chunks, and mapped bitmap format
+  bytes differently from `enums.h`. Phase 3's survey found it, and the
+  decoder was fixed against a capture from spice-server before the
+  encoder was written, because a round trip against the old decoder
+  would have proved nothing.
+- #36, found during the phase 10 soak on 2026-10-20 and fixed by #41
+  on 10-25: a replaced client was dropped silently, so
+  auto-reconnecting clients fought over the session.
+- #22, fixed 2026-10-26: the inputs channel closed after Enter, and
+  the cause was logged only at debug.
+- #26, fixed by #47 on 2026-10-27: a stalled X request served a
+  silent session -- on 2026-10-17 a session got no picture and no
+  input for its whole 37.5 s life, because the first capture took
+  37,496 ms. Every call into the X11 capture and input threads now
+  warns when the X server stops answering.
+- The closing push audit found no bug that was already broken in a
+  way a user would meet: no blocking finding, and nothing that
+  corrupts or crashes on well-formed input. What it did find is in
+  *Items deferred from the push audit* below.
 
 ### Back brief
 

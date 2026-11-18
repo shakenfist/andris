@@ -826,8 +826,22 @@ impl Agent {
         if data.is_empty() {
             return;
         }
-        // Checked after the conversion, since replacing invalid UTF-8 can
-        // make the text up to three times longer.
+        // Checked before the conversion, which can only lengthen the text:
+        // replacing an invalid byte with U+FFFD costs three. So a body
+        // already over the limit would be dropped whatever it converts to,
+        // and checking first avoids building the conversion to find out.
+        // The order used to be the other way round, which meant an
+        // all-invalid 16 MiB body allocated about 48 MiB before being
+        // dropped.
+        if data.len() > MAX_CLIPBOARD_TEXT {
+            warn!(
+                session = self.session,
+                bytes = data.len(),
+                "dropping the client's clipboard text: it is over the \
+                 {MAX_CLIPBOARD_TEXT}-byte limit"
+            );
+            return;
+        }
         let text: Arc<str> = match String::from_utf8(data) {
             Ok(text) => Arc::from(text),
             Err(error) => Arc::from(String::from_utf8_lossy(error.as_bytes())),
@@ -836,8 +850,8 @@ impl Agent {
             warn!(
                 session = self.session,
                 bytes = text.len(),
-                "dropping the client's clipboard text: it is over the \
-                 {MAX_CLIPBOARD_TEXT}-byte limit"
+                "dropping the client's clipboard text: replacing its invalid UTF-8 took it \
+                 over the {MAX_CLIPBOARD_TEXT}-byte limit"
             );
             return;
         }

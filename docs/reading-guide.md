@@ -210,9 +210,14 @@ read_link_mess, send_need_secured}`.
 
 The link handshake and ticket authentication, in kerbside's order.
 `handshake()` reads the link message, refuses a client without
-`AUTH_SELECTION` and `MINI_HEADER`, a channel andris does not serve, or
-a secondary channel that does not name the current session, then
-generates a fresh RSA key per connection, reads the ticket and answers.
+`AUTH_SELECTION` and `MINI_HEADER` or a channel andris does not serve,
+then generates a fresh RSA key per connection, reads the ticket and
+answers. A secondary channel that does not name the current session is
+refused only after the ticket, as `PermissionDenied`: checked before it,
+as it once was, the refusal told a peer that had authenticated nothing
+whether a guessed 32-bit connection id was the live session. The comment
+there says why the code cannot be the more informative
+`BadConnectionId` by then.
 Look at the link-and-ticket check: every stage is under a time limit
 (`HandshakeTimeouts`), key generation runs on the blocking pool under a
 semaphore whose permit moves into the task, `ticket_matches()` compares

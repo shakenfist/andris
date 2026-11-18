@@ -13,7 +13,7 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use andris::platform::{DisplayGeometry, Size};
+use andris::platform::{DisplayGeometry, MAX_CLIPBOARD_TEXT, Size};
 use andris::server::agent::{MAX_AGENT_MESSAGE, MAX_CHUNK};
 use shakenfist_spice_protocol::constants::vd_agent::{
     VD_AGENT_ANNOUNCE_CAPABILITIES, VD_AGENT_CAP_CLIPBOARD_BY_DEMAND,
@@ -550,6 +550,46 @@ async fn clipboard_data_over_the_limit_is_dropped_and_the_channel_stays_open() {
         .await;
     agent.sync(&server).await;
     assert_eq!(server.platform.clipboard_sets().unwrap(), 0);
+}
+
+/// Replacing invalid UTF-8 can make a text up to three times longer, so
+/// the length is checked before the conversion as well as after. It used
+/// to be checked only after, which meant an all-invalid 16 MiB body
+/// allocated about 48 MiB before being dropped for being too long.
+#[tokio::test]
+async fn invalid_clipboard_text_is_dropped_by_whichever_check_catches_it() {
+    let server = TestServer::start().await;
+    let mut agent = AgentClient::ready(&server).await;
+    let invalid = |len: usize| Clipboard {
+        selection: VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD,
+        clipboard_type: VD_AGENT_CLIPBOARD_UTF8_TEXT,
+        data: vec![0xff; len],
+    };
+
+    // Over the limit as it arrived, so it is never converted.
+    agent
+        .send_agent(VD_AGENT_CLIPBOARD, &clip(&invalid(MAX_CLIPBOARD_TEXT + 1)))
+        .await;
+    agent.sync(&server).await;
+    assert_eq!(server.platform.clipboard_sets().unwrap(), 0);
+
+    // Under the limit, but a three-byte U+FFFD for each byte takes it over.
+    agent
+        .send_agent(VD_AGENT_CLIPBOARD, &clip(&invalid(MAX_CLIPBOARD_TEXT / 2)))
+        .await;
+    agent.sync(&server).await;
+    assert_eq!(server.platform.clipboard_sets().unwrap(), 0);
+
+    // Short invalid text still crosses, with its bytes replaced.
+    agent
+        .send_agent(VD_AGENT_CLIPBOARD, &clip(&invalid(3)))
+        .await;
+    agent.sync(&server).await;
+    assert_eq!(server.platform.clipboard_sets().unwrap(), 1);
+    assert_eq!(
+        server.platform.clipboard_set().unwrap().as_deref(),
+        Some("\u{fffd}\u{fffd}\u{fffd}")
+    );
 }
 
 #[tokio::test]

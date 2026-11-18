@@ -206,6 +206,10 @@ pub enum TicketState {
     /// There was one, and it was left alone, but andris would refuse it,
     /// for this reason.
     Refused(String),
+    /// There was none, and none was written, because the directory it
+    /// would go in is open to group or other: these are its permission
+    /// bits.
+    NotCreated { mode: u32 },
 }
 
 /// What [`install`] did.
@@ -258,7 +262,7 @@ pub fn install(config_home: &Path, exe: &Path) -> Result<Report> {
     let config_dir_state = make_config_dir(&config_dir)?;
 
     let ticket_path = config_dir.join("ticket");
-    let ticket = make_ticket(&ticket_path)?;
+    let ticket = make_ticket(&ticket_path, config_dir_state)?;
 
     Ok(Report {
         unit_path,
@@ -352,7 +356,21 @@ fn make_config_dir(path: &Path) -> Result<ConfigDirState> {
 
 /// Write a new ticket to `path` if there is no ticket there, or check the
 /// one that is.
-fn make_ticket(path: &Path) -> Result<TicketState> {
+///
+/// No new ticket is written into a directory `dir` says is open to group
+/// or other. The file itself would be created `O_EXCL` and mode 0600, so
+/// nobody else could read it, but anyone who can write the directory can
+/// unlink it and put their own ticket there -- and a ticket andris wrote
+/// is one the operator is about to trust. A ticket already in such a
+/// directory is still reported as it was: it is the operator's, it may
+/// predate the loose permissions, and refusing to look at it would help
+/// nobody.
+fn make_ticket(path: &Path, dir: ConfigDirState) -> Result<TicketState> {
+    if let ConfigDirState::OpenToOthers { mode } = dir
+        && !path.try_exists().unwrap_or(false)
+    {
+        return Ok(TicketState::NotCreated { mode });
+    }
     let created = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -429,6 +447,14 @@ impl fmt::Display for Report {
                 f,
                 "{ticket} already exists, and is unchanged, but andris would refuse it: \
                  {reason}"
+            ),
+            TicketState::NotCreated { mode } => writeln!(
+                f,
+                "No ticket was written to {ticket}: {} is open to group or other (mode \
+                 {mode:04o}), where another user could replace a ticket andris wrote. Run \
+                 chmod 700 {}, then install again.",
+                self.config_dir.display(),
+                shell_quote(&self.config_dir.display().to_string())
             ),
         }
     }
@@ -819,6 +845,40 @@ mod tests {
         let shown = report.to_string();
         assert!(shown.contains("mode 0755"), "{shown}");
         assert!(shown.contains("chmod 700"), "{shown}");
+
+        // And no ticket is written into it: the file would be 0600, but
+        // anyone who can write the directory can replace it.
+        assert_eq!(report.ticket, TicketState::NotCreated { mode: 0o755 });
+        assert!(
+            !report.ticket_path.try_exists().unwrap(),
+            "no ticket was left behind"
+        );
+        assert!(shown.contains("No ticket was written"), "{shown}");
+    }
+
+    /// A ticket already in a loose directory is the operator's, and may
+    /// predate the permissions, so it is reported as it would be anywhere.
+    #[test]
+    fn an_existing_ticket_in_an_open_directory_is_still_read() {
+        let (dir, exe) = home();
+        let config_dir = dir.path().join("andris");
+        fs::create_dir(&config_dir).unwrap();
+        let ticket = config_dir.join("ticket");
+        fs::write(&ticket, "theirs, all theirs\n").unwrap();
+        fs::set_permissions(&ticket, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let report = install(dir.path(), &exe).unwrap();
+        assert_eq!(
+            report.config_dir_state,
+            ConfigDirState::OpenToOthers { mode: 0o755 }
+        );
+        assert_eq!(report.ticket, TicketState::Existing);
+        assert_eq!(
+            fs::read_to_string(&ticket).unwrap(),
+            "theirs, all theirs\n",
+            "it is unchanged"
+        );
     }
 
     #[test]

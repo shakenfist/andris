@@ -544,7 +544,10 @@ server whose RandR allows a client to change the screen size. Xvfb
 does, up to the size it started with. xorgxrdp does not (see
 [xrdp.md](xrdp.md#resizing)). Where it is refused, the client gets an
 error reply, the desktop keeps its size, and andris logs one warning
-for the connection, not one for each request. RandR is optional:
+for the connection, not one for each request. A resize that fails part
+way is undone, and where undoing it also fails the error reply says so
+rather than claiming the size was kept: the desktop can be left part
+way, which the log describes step by step. RandR is optional:
 without it, or without RandR 1.2, andris still serves the desktop and
 refuses every resize in the same way.
 

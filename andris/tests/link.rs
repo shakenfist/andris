@@ -113,6 +113,10 @@ async fn client_without_mini_header_gets_version_mismatch() {
     assert_eq!(reply.error, SpiceError::VersionMismatch);
 }
 
+/// The connection id is checked after the ticket, so that a peer which
+/// has authenticated nothing cannot ask whether a guessed id is the live
+/// session. The link therefore succeeds, and the refusal arrives as the
+/// auth result, saying only that permission was denied.
 #[tokio::test]
 async fn secondary_channel_with_wrong_connection_id_is_refused() {
     let server = TestServer::start().await;
@@ -120,7 +124,12 @@ async fn secondary_channel_with_wrong_connection_id_is_refused() {
     // No session at all.
     let mut client = TestClient::connect(server.addr()).await;
     let reply = client.link(1234, ChannelType::Display).await;
-    assert_eq!(reply.error, SpiceError::BadConnectionId);
+    assert_eq!(reply.error, SpiceError::Ok, "the link itself is answered");
+    let error = client.auth(ticket()).await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("PermissionDenied"),
+        "{error:#}"
+    );
     client.expect_closed().await;
 
     // A session, but not this one.
@@ -128,7 +137,31 @@ async fn secondary_channel_with_wrong_connection_id_is_refused() {
     let wrong = session.wrapping_add(1).max(1);
     let mut client = TestClient::connect(server.addr()).await;
     let reply = client.link(wrong, ChannelType::Inputs).await;
-    assert_eq!(reply.error, SpiceError::BadConnectionId);
+    assert_eq!(reply.error, SpiceError::Ok);
+    let error = client.auth(ticket()).await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("PermissionDenied"),
+        "{error:#}"
+    );
+}
+
+/// A peer that has not authenticated learns nothing about which ids are
+/// live: a guessed id and the real one are answered identically, and only
+/// the ticket tells them apart.
+#[tokio::test]
+async fn an_unauthenticated_peer_cannot_probe_connection_ids() {
+    let server = TestServer::start().await;
+    let (_main, session) = server.open_main().await;
+
+    let mut guessed = TestClient::connect(server.addr()).await;
+    let for_guess = guessed
+        .link(session.wrapping_add(1).max(1), ChannelType::Display)
+        .await;
+    let mut real = TestClient::connect(server.addr()).await;
+    let for_real = real.link(session, ChannelType::Display).await;
+
+    assert_eq!(for_guess.error, for_real.error, "the same verdict");
+    assert_eq!(for_real.error, SpiceError::Ok);
 }
 
 #[tokio::test]
@@ -167,10 +200,16 @@ async fn second_main_link_closes_first_sessions_channels() {
     display.expect_closed().await;
     inputs.expect_closed().await;
 
-    // The old id no longer links; the new one does.
+    // The old id no longer links; the new one does. The refusal comes
+    // after the ticket, so the link is answered first.
     let mut client = TestClient::connect(server.addr()).await;
     let reply = client.link(first, ChannelType::Cursor).await;
-    assert_eq!(reply.error, SpiceError::BadConnectionId);
+    assert_eq!(reply.error, SpiceError::Ok);
+    let error = client.auth(ticket()).await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("PermissionDenied"),
+        "{error:#}"
+    );
     let mut cursor = server.open(second, ChannelType::Cursor).await;
     expect_set_ack(&mut cursor).await;
 }

@@ -188,7 +188,7 @@ written with `/next-phase` as each phase comes up.
 | 8. Video streams | PLAN-x11-desktop-phase-08-video.md | Complete | ryll `a157ced` (#552), `601b9dc` (#554), `49072fc` (#557); andris `c2fe8a7` (#21), `1ecafa5` (#23) |
 | 9. Audio | PLAN-x11-desktop-phase-09-audio.md | Complete | ryll `38c51ef` (#578); andris `d8f316a` (#27) |
 | 10. Packaging and dogfood soak | PLAN-x11-desktop-phase-10-packaging.md | Complete | andris `553ecfb` (#28), `c0617e9` (#29), `c36e87a` (#49) |
-| 11. Human review | PLAN-x11-desktop-phase-11-review.md | In progress | |
+| 11. Human review | PLAN-x11-desktop-phase-11-review.md | Complete | andris `568a43b` (#51); development `810ce4d` (#335) |
 | 12. Push audit | This file, below | Not started | |
 
 Rough sizing, as judgement rather than measurement: phases 0–5
@@ -541,10 +541,18 @@ review-tracking tooling, as ryll is, by the steps of development's
 The phase also writes a reading guide in `docs/`: an order to read the
 code in, from the binary's entry point through the server, the
 channels and the platform backends, saying for each part what it does
-and what to look at. The operator then reviews the files in review
-sessions, each landing as a pull request. Findings land as their own
-pull requests. The phase is done when every in-scope file is reviewed
-on one commit of `develop`.
+and what to look at.
+
+The phase is done when that tooling is installed and working. **The
+reading itself is not part of this plan.** As planned, the phase ran
+until every in-scope file was reviewed on one commit of `develop`;
+the operator moved the reading out on 2026-11-18, because 127 files
+is open ended, prunes take marks back as other work lands, and a
+phase held open against that does not close -- it stops being looked
+at, which is what happened for three weeks. The operator reads andris
+as time allows, in sessions that each land as their own pull request,
+and the `review-coverage` audit issue is that work's queue. Future
+work records it.
 
 ### Phase 12: Push audit
 
@@ -601,8 +609,13 @@ because the following statements will be true:
   connected to the same session. Resizing the ryll window resizes
   the desktop on an X server that allows it; on xrdp the desktop
   follows the RDP client's size, and andris says so.
-* Every file in andris's review scope carries a current human
-  review mark.
+* Andris is adopted into development's review tracking, with a
+  reading guide, so that whole-file human review of it is possible
+  and measurable. *Met in phase 11.* Whole-file coverage itself is
+  not a criterion of this plan: at the close of phase 11, 9 of 136
+  in-scope files carried a mark and all 9 were imported from
+  development. The reading continues outside the plan; see Future
+  work.
 * A video played on the desktop arrives as an H.264 stream with
   audio. *Met in phase 10:* step 7's check, and 33 streams with sound
   during the soak.
@@ -611,9 +624,11 @@ because the following statements will be true:
 * `docs/` describes running andris alongside xrdp, without
   reference to plan phases.
 * The daily consistency audit runs against andris and files no
-  issues. Until phase 11's review is done, review-coverage keeps one
-  open; the audit has no exemption mechanism, and that issue is the
-  review's work queue.
+  issues, other than `review-coverage`. That one stays open while
+  whole-file review is outstanding, which will be for as long as the
+  reading takes: the audit has no exemption mechanism, and the issue
+  is the reading's work queue rather than a defect in this plan's
+  work.
 
 ### Documentation index maintenance
 
@@ -622,6 +637,18 @@ file) and keep its status in step with the Execution table.
 
 ### Future work
 
+- **Reading andris.** Phase 11 installed the review tracking, the
+  reading guide and the prune bot, and then handed over: 127 of 136
+  in-scope files have never been read, and the nine that carry marks
+  carry them because they were imported from shakenfist/development.
+  The operator reads andris as time allows, one session at a time,
+  each landing as its own pull request, with findings filed as
+  issues and fixed in pull requests of their own. The work queue is
+  the `review-coverage` audit issue, and
+  `./tools/review-tracking.sh next` says what to read next. This is
+  deliberately not a phase: it is open-ended work with no end date,
+  and the only thing a plan could add is a deadline that would be
+  missed.
 - A Wayland backend: PipeWire screen capture via
   xdg-desktop-portal, and libei for input.
 - Splitting ryll's shared crates (protocol, compression, usbredir)

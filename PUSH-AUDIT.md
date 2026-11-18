@@ -99,22 +99,27 @@ Every command must pass. If one fails, fix the cause and re-run
 before spending on wave 2.
 
 Then the file-size measurement. It lists each touched source file
-over 800 lines with its length before and after the change, because
-`source-file-size` in 2a rules on growth rather than length: 800
-lines is where it asks the question, and past 1,500 a file may not
-grow. Record the list in the audit report, or "no touched file over
-800 lines" when it is empty, so that an empty result cannot be
-mistaken for one that was never produced. The extensions are this
-repository's: Rust, plus the shell and Python helpers in `scripts/`
-and `tools/`.
+over 800 lines before or after the change, with both lengths,
+because `source-file-size` in 2a rules on change rather than
+length: 800 lines is where it asks the question, past 1,500 a file
+may not grow without a stated reason, and a long file that shrank
+may have lost its rationale comments. It writes the list to
+`/tmp/size-list`, which the 2a brief reads, and writes "no touched
+file over 800 lines" there rather than nothing, so that an empty
+result cannot be mistaken for one that was never produced. Record
+the list in the audit report. The extensions are this repository's:
+Rust, plus the shell and Python helpers in `scripts/` and `tools/`.
 
 Set `base` and the path list for the mode the runbook is running
 in. As a pre-push gate, against a freshly fetched `origin/develop`
--- the local `develop` may be stale or absent:
+-- the local `develop` may be stale or absent -- and from its merge
+base with the branch, so that a branch behind `develop` is not
+charged with other people's changes to the same file:
 
 ```
+cd "$(git rev-parse --show-toplevel)"
 git fetch origin
-base=origin/develop
+base=$(git merge-base origin/develop HEAD)
 git diff --name-only -z --diff-filter=d "$base...HEAD" \
     -- '*.rs' '*.py' '*.sh' > /tmp/size-paths
 ```
@@ -135,14 +140,18 @@ Then, in either mode:
 # Whole files, not the hunks: a small addition to a long file is
 # what this exists to catch. A new file's earlier length prints as
 # 0; a path the plan later deleted has nothing to measure.
+cd "$(git rev-parse --show-toplevel)"
 while IFS= read -r -d '' f; do
     [ -f "$f" ] || continue
     now=$(wc -l < "$f")
     was=$(git show "$base:$f" 2>/dev/null | wc -l)
-    if [ "$now" -gt 800 ]; then
+    if [ "$now" -gt 800 ] || [ "$was" -gt 800 ]; then
         printf '%s\t%s -> %s\n' "$f" "$was" "$now"
     fi
-done < /tmp/size-paths
+done < /tmp/size-paths > /tmp/size-list
+[ -s /tmp/size-list ] ||
+    echo 'no touched file over 800 lines' > /tmp/size-list
+cat /tmp/size-list
 ```
 
 ### Style conformance -- judgment portion
@@ -201,11 +210,13 @@ and `.expect()` calls. Then add the judgment-level review:
 - **Triage the scan's raw findings:** for each TODO, unwrap or
   `unsafe` found, say blocking or advisory and why. Skip ones in
   `#[cfg(test)]` blocks.
-- **Touched files that are long:** wave 1 listed the touched
-  source files over 800 lines, each with its length before and
-  after. Read each of those whole, not only its hunks, and judge
-  it against `source-file-size` below: past 1,500 lines, it is the
-  growth that needs a reason.
+- **Touched files that are long:** wave 1 wrote the touched
+  source files over 800 lines before or after the change, each
+  with both lengths, to `/tmp/size-list`. Read that file, then
+  read each source file it names whole, not only its hunks, and
+  judge it against `source-file-size` below: past 1,500 lines, it
+  is the growth that needs a reason, and a long file that shrank
+  is checked for lost rationale.
 
 <!-- shared-block: comment-proportion v1 -->
 Comment proportion (shared block; do not edit -- the canonical
@@ -291,7 +302,10 @@ copy lives in shakenfist/development at
     wave 1 produces. A branch that grows a file already over 1,500
     lines, or that pushes one across 1,500, needs its reason in the
     pull request description -- that is where a reviewed baseline
-    entry would otherwise have recorded it.
+    entry would otherwise have recorded it. As a master plan's
+    closing phase, whose phase pull requests have already merged,
+    the reason goes in the master plan instead, beside the
+    audit's other declined or accepted findings.
 
 <!-- shared-block: python-version-discipline v1 -->
 Python version and typing (shared block; do not edit -- the

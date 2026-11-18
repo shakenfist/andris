@@ -191,7 +191,7 @@ as each phase comes up.
 | 9. Audio | PLAN-x11-desktop-phase-09-audio.md | Complete | ryll `38c51ef` (#578); andris `d8f316a` (#27) |
 | 10. Packaging and dogfood soak | PLAN-x11-desktop-phase-10-packaging.md | Complete | andris `553ecfb` (#28), `c0617e9` (#29), `c36e87a` (#49) |
 | 11. Human review | PLAN-x11-desktop-phase-11-review.md | Complete | andris `568a43b` (#51); development `810ce4d` (#335) |
-| 12. Push audit | PLAN-x11-desktop-phase-12-push-audit.md | Complete | |
+| 12. Push audit | PLAN-x11-desktop-phase-12-push-audit.md | Complete | andris `3e60a74` (#95) |
 
 Rough sizing, as judgement rather than measurement: phases 0–5
 reach a usable LAN desktop in about three to four weeks; phases 6–9
@@ -733,9 +733,12 @@ because the following statements will be true:
 Phase 12 ran `PUSH-AUDIT.md` over this plan's accumulated diff --
 63,239 insertions across 149 files in 16 landings -- in two mechanical
 waves and six judgment reviews. **Wave 1 passed and there was no
-blocking finding.** Thirty-two findings were recorded, all still
-present on `develop`, and every one is tracked. None is declined:
-each became a GitHub issue, or sharpened one that already existed.
+blocking finding.** Thirty-two findings were recorded and every one is tracked. None is
+declined: each became a GitHub issue, or sharpened one that already
+existed. Eleven of them, the security ones, have since been fixed --
+#87, #88, #91 and #92, in the pull request that filled phase 12's
+`Merged` cell above. The twenty-one in #89, #90, #93 and #94, and in
+#13, #14 and #15, are still present on `develop`.
 The finding detail and the clean areas are in
 [PLAN-x11-desktop-phase-12-push-audit.md](PLAN-x11-desktop-phase-12-push-audit.md);
 this is the disposition.
@@ -769,35 +772,38 @@ findings). **Phases 8 and 9 do not**: ryll #552, #554, #557 and #578
 carry no audit record in any pull request body or commit message. That
 is ryll's to resolve and is filed there as ryll#738.
 
-Why this plan is not `Complete`. Three conditions are outstanding,
-and the first is a rule rather than a judgement.
+Why this plan is not `Complete`. Of the three conditions recorded
+here, two are outstanding and the third has been discharged; the first
+is a rule rather than a judgement. All three are kept, struck through
+as they are met, so that a reader can see what the status waited on.
 
-1. **The findings are unresolved.** `PLAN-TEMPLATE.md`'s
+1. **Findings remain unresolved.** `PLAN-TEMPLATE.md`'s
    `plan-push-audit-phase` block and `PUSH-AUDIT.md` both say the plan
    is not complete until every finding is resolved or explicitly
-   declined. All 32 are open and none is declined -- they are filed,
-   which is tracking, not resolution. This alone settles the status;
-   the two below are why it would not be `Complete` even if they were
-   fixed tomorrow. The first version of this paragraph named only the
-   unmeasured criteria and called #87 "a third reason to hesitate",
-   which read as optional weighing of something that is actually the
-   governing condition.
+   declined. Eleven are now fixed and none is declined, which leaves
+   twenty-one filed -- and filing is tracking, not resolution. This
+   alone settles the status; the one below is why it would not be
+   `Complete` even if the rest were fixed tomorrow. The first version
+   of this paragraph named only the unmeasured criteria and called #87
+   "a third reason to hesitate", which read as optional weighing of
+   something that is actually the governing condition.
 2. **Three success criteria are short, not two.** The 2% idle CPU
    figure and the 30 fps scrolling figure were never measured. The
    first criterion -- ryll through kerbside as the daily connection
    for a week -- is *partly* met: the soak ran ryll to andris over an
    SSH tunnel, and kerbside is exercised only by a CI lane, so the
    chain the criterion names has never carried a day's work.
-3. **Phase 12 owes a `Merged` cell.** The `plan-phase-landing` block
-   lets the push-audit phase omit it only where the audit found
-   nothing -- "it is the only row permitted to omit one" -- and where
-   there are findings, their pull request is the carrier and records
-   the audit phase's merge commit, which is known by then. This audit
-   raised 32, so the cell is owed, and the pull request that resolves
-   them fills it and sets this plan's status. Recorded here because an
-   empty cell in a `Complete` row is exactly what never gets filled
-   later; whichever of #87 to #94's fixes lands first is the carrier,
-   and #87 carries a note saying so.
+3. ~~**Phase 12 owes a `Merged` cell.**~~ Discharged. The
+   `plan-phase-landing` block lets the push-audit phase omit it only
+   where the audit found nothing -- "it is the only row permitted to
+   omit one" -- and where there are findings, their pull request is
+   the carrier and records the audit phase's merge commit, which is
+   known by then. This audit raised 32, so the cell was owed, and the
+   first pull request to resolve any of them -- the one fixing #87,
+   #88, #91 and #92 -- filled it with `3e60a74`, the merge of #95. It
+   was recorded as a condition because an empty cell in a `Complete`
+   row is exactly what never gets filled later, and #87 carried the
+   instruction naming the carrier.
 
 The two unmeasured figures in condition 2 are this plan's only
 quantitative claims about whether andris is good enough to replace

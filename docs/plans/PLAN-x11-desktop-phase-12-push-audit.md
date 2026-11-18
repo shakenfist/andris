@@ -484,6 +484,93 @@ run in parallel. 12f needs all of them.
   against the qemu backend or `test_logs.rs`. Each 12e brief says
   so.
 
+### Wave 2 findings (step 12e)
+
+All six judgment agents reported. **No blocking finding.** Severities
+below are the agents', as moderated by the management session's own
+checks; each agent read the current worktree files as well as its
+patch, so a finding is a statement about the tree unless marked
+otherwise. Identifiers are for steps 12f and 12h to cite.
+
+**Security, server half (2d-1, opus).** Six, one of which is the most
+substantial finding of this audit.
+
+| Id | Sev | Finding |
+|----|-----|---------|
+| S1 | medium | **Handshake-permit starvation.** `MAX_HANDSHAKES` is 8 and `MAX_HANDSHAKES_PER_PEER` is 4 (`server/mod.rs:77-87`), so two source addresses -- or two IPv6 /64s from one host, since `peer_key` buckets by /64 -- take every permit and hold them by simply not sending a link message, for 3 s each and far longer by advancing a stage or guessing a ticket. Every other connection is then refused. Unauthenticated and trivially sustained. The management session verified the caps and the doc comment, which states the guarantee "it still keeps one address from holding all `MAX_HANDSHAKES`": that sentence is literally true and operationally useless, because the attacker picks the number of addresses. 2c independently found those two numbers copied into `ARCHITECTURE.md:23`, `docs/running.md:346` and `:350` and `docs/reading-guide.md:194`, so the documentation repeats the reasoning. Fix: make the global pool a multiple of the per-peer cap, or admit against free permits, and release a permit held by a peer that has sent nothing |
+| S2 | low | **Pre-authentication session-id oracle.** `link.rs:263-277` looks up `link.connection_id` and refuses with `BadConnectionId` before the ticket check, so an unauthenticated peer learns in one round trip whether a guessed 32-bit id is the live session; `:241-259` likewise discloses which channels are served and whether audio is on. Ids are CSPRNG over 2^32 and the ticket is still required. Fix: look up after the ticket check and return the same refusal as a wrong ticket |
+| S3 | low | **Client-driven resize amplifies.** `agent.rs:523-545` into `display.rs:645-700`: each accepted `VD_AGENT_MONITORS_CONFIG` destroys and recreates the surface and reallocates the shadow, lossy and heat maps, then re-encodes the whole desktop. Tens of bytes in, megabytes out. **Same underlying defect as X4**, seen from the server side |
+| S4 | low | **48 MiB transient on the lossy UTF-8 path.** `agent.rs:103-110` and `~700-712`: `from_utf8_lossy` on an all-invalid 16 MiB body allocates about 48 MiB before the length test, and the comment acknowledges the ordering. One main channel can hold about 32 MiB queued plus a 16 MiB reassembly buffer. Bounded but generous |
+| S5 | low | **Log amplification in the key decoder.** `keymap.rs:189-196` keys its log-once set on the 16-bit E1 pair, so a client can emit about 65,536 `warn` lines per inputs channel, and relinking resets the decoder |
+| S6 | info | Forged `ACK`s defeat flow-control pacing (`channel.rs:244-259` subtracts a window per `ACK` without accounting for what was sent; CPU only). Client `i32` motion deltas reach the platform unvalidated (`inputs.rs:437-447`). The ticket is never zeroized (`config.rs:209`). An unauthenticated peer can hold both RSA keygen permits (`link.rs:276-294`) |
+
+2d-1 cleared five areas with evidence: untrusted parsing (every body bounded by `O::MAX_CLIENT_BODY`, no unchecked indexing of wire data, negative `DisplayInit` fields refused, u64 intermediates in rate control); authentication apart from S2 (ticket via `open_private_file` checking regular-file, owner-equals-euid and no group or other bits, `Debug` redacted, compared with `subtle::ct_eq`, and **no path reaches a message loop before authentication**); TLS and exposure (a non-loopback plain listener refused unless TLS is configured, no fallback to plain on a bad certificate); concurrency (no `unsafe`, no hand-written `Send`/`Sync`, no lock across an await, ordered session replacement); and path construction (no server path is built from client data).
+
+**Security, platform half (2d-2, opus).** Six. 2d-2 noted that S-side authentication would raise X1 and X4 if any pre-auth path existed; 2d-1 found none, so they stand as written.
+
+| Id | Sev | Finding |
+|----|-----|---------|
+| X1 | medium | **Unsolicited clipboard egress.** `x11/clipboard.rs:572-577`: at thread start, if any program owns `CLIPBOARD`, andris fetches and converts that text into its own memory -- with no client connected and before any ticket is presented -- and `:713-734` repeats it on every ownership change. Only `UTF8_STRING`/`STRING` are requested and no password-manager hint target is inspected. Verified by the management session. This **confirms and sharpens issue #14**: the defect is not only an unhonoured hint when a client asks, but that the fetch is eager and client-independent. Two real mitigations exist and are worth keeping: `changes()` calls `mark_unchanged()` so a newly connected client is not offered what was already there, and `offer(None)` withdraws with `CLIPBOARD_RELEASE`. Fix: inspect `TARGETS` for the hint atoms, and defer the fetch until a client has attached and announced `CLIPBOARD_BY_DEMAND` |
+| X2 | low | **No clipboard opt-out.** Sharing is unconditional in both directions; `grep -n clipboard andris/src/config.rs` is empty, while `--no-audio` exists for the analogous case. Fix: `--no-clipboard` |
+| X3 | low | **Crackable clipboard fingerprint in debug logs.** `platform/mod.rs:91-96`: `text_hash` is 32-bit FNV-1a over the clipboard text, logged at `debug` from `clipboard.rs:683` and several `agent.rs` sites. Its own doc comment says a short text can be recovered by trying candidates, so the hazard was known and the mitigation chosen was "debug only" -- which is thin, because debug logging is exactly what an operator enables to diagnose a clipboard problem. A decision rather than a defect |
+| X4 | medium | **Unthrottled geometry change on the operator's real session.** `x11/randr.rs:355`, driven from `agent.rs:523-551`: nothing bounds how often a client may resize, so a client can thrash the real screen size, relaying out the operator's windows and stalling capture behind the RandR round trips. **Dimensions themselves are sound** -- `Size::check` enforces at least 1, at most 16384 a side and 64 Mpixel with a `checked_mul`, then `clamp` confines to `RRGetScreenSizeRange`. **Same defect as S3.** Fix: a minimum interval between accepted resizes, coalescing a burst to the last |
+| X5 | low | **A failed resize can leave the desktop changed.** `x11/randr.rs:512-540`: `undo` restores in reverse but through `carry_on`, which logs and continues, and restores the physical size at 96 DPI rather than the original. A resize that fails mid-way with a failing undo leaves the desktop at an intermediate size and DPI, reported only in a log. Documented at `:507-511` |
+| X6 | low | **The ticket is created in a directory already known to be open to others.** `install.rs:330-350`: `make_config_dir` returns `OpenToOthers { mode }` when the `0o077` bits are set and only reports it; `make_ticket` then creates the ticket there anyway. Verified. The file is `O_EXCL` 0600 so it cannot be read, but another user can unlink and substitute it. Fix: refuse to create a *new* ticket in such a directory |
+
+2d-2 cleared four areas with evidence: input injection (keys go evdev code to `EVDEV_NAMES` to XKB key name to *this server's* keycode, so a client cannot name an arbitrary keycode; buttons come from a 7-variant enum; the XTEST `detail` is never client-chosen; coordinates saturate into i16; events go only to the configured display's root, and nothing touches the X auth cookie; the queue is bounded at `INPUT_QUEUE_LIMIT` 8192 with a `RELEASE_RESERVE` of 512 so an owed release never blocks behind a flood, and overflow fails `inject`, which closes the channel -- fail-safe); both `unsafe` sites (libpulse signatures checked against the headers with a layout test, **no `unsafe impl Send`/`Sync` anywhere in the crate**, `PaSimple` is `!Send`/`!Sync` by `PhantomData`, and in `x11/shm.rs` the memfd is sealed before mapping so a read cannot `SIGBUS`, no Rust reference is ever made into the mapping, `Mapping::copy` bounds-checks with `checked_add` before `copy_nonoverlapping`, and the segment size is never client-supplied); capture arithmetic (every rectangle edge widens to `u64`, `Frame::new` checks stride and buffer length with checked arithmetic); and `install.rs` path handling (no configuration value becomes a path component, and `quote_executable` refuses control characters and quotes, checked against systemd 257's manual with `systemd-analyze verify`).
+
+One informational note worth keeping: andris never consults the screensaver or lock state, so XTEST input from a ticketed client wakes a blanked screen and reaches a locker's grab. That is standard remote-desktop behaviour and wants a line in the documentation rather than a code change.
+
+**Code quality, server half (2a-1, sonnet).** Four advisories, all accretion across phases.
+
+| Id | Finding |
+|----|---------|
+| Q1 | The test read-until-message loop is copy-pasted four times, each with a different chunk size: `main_channel.rs:362-373` and `:426-437`, `inputs.rs:~522-537`, `channel.rs:603`. A shared helper would stop a fifth copy |
+| Q2 | **The `Stats` field list is written five times** -- `stats.rs:189`, `:341`, `:391`, `:502` and `:515` (verified) -- so the stream and audio blocks each had to touch all five places, and only the `since!` macro guards against a missing field. A forgotten `summary()` field compiles silently |
+| Q3 | The recv-and-ignore select arm is duplicated: `cursor.rs:83-88`, `playback.rs:488-493`, and a drain loop of the same shape at `inputs.rs:126-129` |
+| Q4 | `display.rs` repeats the `send(Mark)` then `frame_sent(..)` pair in `frame()` and `refresh()`, and spells `self.conn.session().counters()` about twelve times |
+
+2a-1 confirmed that wire handling sits in `shakenfist-spice-protocol` and codecs in `shakenfist-spice-compression`, with no hand-rolled protocol framing in `server/`: the four `to_le_bytes`/`from_le_bytes` hits are PCM in `playback.rs`, cursor pixels in `cursor.rs` and scancodes in `keymap.rs`, none of them framing (verified). It found nothing worth moving into ryll today.
+
+**Code quality, platform half (2a-2, sonnet).** Seven advisories. The first four are one theme and the most valuable code-quality result of the audit.
+
+| Id | Finding |
+|----|---------|
+| P1 | **The synthetic backend has drifted from the real one: `Gone`.** `synthetic/mod.rs:249-252`: `vanish()` sets the gone signal and fails damage subscriptions, but `capture`, `capture_all`, `size`, `inject`, `set_size` and `Clipboard::set` all still succeed afterwards, where the trait contract promises `Gone` (`platform/mod.rs:564`, `:666`) and X11 delivers it through `stopped()`. Verified. **So no test using the synthetic backend can exercise the server's gone-handling mid-capture or mid-resize** |
+| P2 | Drift: the input queue. `InputSink` says `inject` errors when the queue is full, and X11 enforces `INPUT_QUEUE_LIMIT` plus `RELEASE_RESERVE`; synthetic never refuses and has no release reserve, so "queue full" and "a release survives a full queue" are untestable through it |
+| P3 | Drift: the clipboard cap. X11 drops text over `MAX_CLIPBOARD_TEXT` with a warning; synthetic stores it unconditionally. Verified: the constant is enforced at `x11/clipboard.rs:373`, `:699`, `:830`, `:884` and `server/agent.rs:715`, `:783`, and never in the synthetic backend or `platform/mod.rs`. Milder than stated, because the server checks it too, so only platform-level tests are weakened |
+| P4 | Drift: resize. Real RandR clamps to the server's range and refuses with "the nearest it allows"; synthetic has only accept, unchanged and refuse-all, so clamping and at-limit behaviour is untestable through it |
+| P5 | `InputQueue` and its limits (`x11/input.rs:30-90`, `x11/mod.rs:129-137`) are a backend-neutral bounded FIFO and belong in `platform/`. The qemu backend has since copied the constants, which is out of range but confirms the abstraction |
+| P6 | The three X event-loop threads (`x11/cursor.rs:62-110`, `x11/damage.rs:165-215`, `x11/clipboard.rs:572-632`) each repeat the same skeleton: `wait_for_event`, wake-cookie check, warn-once on X errors, `lost(..)` on failure |
+| P7 | `SyntheticPlatform::platform()` installs a `ToneSource` that `run` then overwrites (`lib.rs:59-77`, `synthetic/mod.rs:234-244`), so the default is dead on the production path and the tone choice is decided twice |
+
+2a-2 confirmed and refined **issue #15** rather than re-filing it: the follow/serve seam is real, `follow.rs` would take `Fetch`, `Incoming` and the INCR-in path (`:713-940`) and `serve.rs` would take `Owned`, `Transfer` and `acquire` through `next_piece` (`:941-1155`), with the atoms, timer, handle, `run` and `housekeeping` staying in the parent and `earliest` staying because it spans both sides. It found no `comment-proportion` problems: the long module docs carry contract and rationale.
+
+**Tests (2b, sonnet).** Six advisories. It verified the ryll pin independently -- `38c51eff` with protocol and compression 0.3.0, in both `andris/Cargo.toml` and `Cargo.lock`.
+
+| Id | Finding |
+|----|---------|
+| T1 | **`VD_AGENT_CLIPBOARD_RELEASE` is sent and never parsed by a test.** `server/agent.rs:774` queues it; no occurrence anywhere in `andris/tests/`. Verified. It is wire output with no round trip, which is the one genuine gap in an otherwise complete table |
+| T2 | The clipboard decode path without the SELECTION capability (`has_selection=false`) is untested: every test decodes with `true` |
+| T3 | The inputs pointer messages (position, motion, press, release, wheel) have no truncated or short-body tests, though the key event does. These drive XTEST, so they are the priority of this group. Also untested: cursor-channel client messages, main `ATTACH_CHANNELS`/`PONG` short bodies, overflowing channel-cap counts, truncated display `INIT` |
+| T4 | Fragile assertions on log text and formatting: `main_channel.rs:242-253` and `:285-319` match a log level, field names and an exact summary string; `stream.rs:667-671` and `:943-961` match a log line and the stats format; `stream.rs:825` and `:932-940` read session internals. Several timing-sensitive sleeps will flake on a loaded runner |
+| T5 | **The X11 and PulseAudio tests skip silently and report green.** `tests/x11.rs` (six tests) and `tests/pulse.rs` (two) need a real X or sound server and are covered only by `make e2e`. A skip that reports success is the failure mode worth fixing: a skip counter, or a CI job asserting the environment variable is set |
+| T6 | **The real X11 `InputSink` and `CursorSource` have no test at all**, though Xvfb provides XTEST and XFixes so they are testable rather than untestable. Server tests use the synthetic backend only, and the e2e cursor check asserts only a log line. This is the largest real-X coverage gap, and it compounds P1 to P4: the stand-in is weaker than the real thing *and* the real thing is untested |
+
+2b confirmed that everything else andris puts on the wire is round-tripped against the parser ryll's client uses, channel by channel, and that **issue #13** is still accurate: none of its seven adversarial cases appears in `tests/agent.rs`. It recommends widening #13 with T1 and T2 rather than filing new issues.
+
+**Documentation (2c, sonnet).** Three advisories, no blocking finding.
+
+| Id | Finding |
+|----|---------|
+| D1 | The master-plan links in `AGENTS.md`, `ARCHITECTURE.md`, `README.md`, `docs/development.md` and `docs/index.md` present the plan as unfinished -- "how will it be built?", "the order in which it will be built", the authority for "what is still to be built". Allowed while the plan has unbuilt work; step 12h decides whether that is still true |
+| D2 | `ARCHITECTURE.md` has grown the most of the three agent documents (194 lines) and several component-table cells are paragraph-length and carry tunables -- 8 permits, 4 slots, 64x64 tiles, 32 rectangles, 4 Mi -- that `docs/running.md` and `docs/reading-guide.md` also hold |
+| D3 | Numbers duplicated between `ARCHITECTURE.md` and `docs/` currently agree with the code but will drift: the handshake limits, the 20-frames-in-2-seconds stream trigger, the default listen address. Point `ARCHITECTURE.md` at `docs/running.md` instead of restating them |
+
+2c found **no plan-phase references in code or documentation** -- the two apparent hits, `codeql-analysis.yml:18` and `tools/ci-prune-reviews.sh:194`, cite development's "Adopting a repository" procedure, not this plan -- and no contradictions between documents. It checked all 14 documented `--` options against `config.rs` and every documented `make` target and script path: all exist, with matching defaults. It found nothing describing planned behaviour as if it existed.
+
+**Out of range, for issues rather than findings.** `ARCHITECTURE.md` contradicts itself about the platform backends: line 35 documents the qemu backend in full and line 36 calls its `shm.rs` "the crate's third `unsafe` module", while the "Platform seams" commitment at line 186 still says "an X11 implementation and a synthetic one". This plan wrote line 186; pull request #56 added the backend and left it stale. Not this audit's finding, but it should be filed.
+
 ## Risks and mitigations
 
 - **The audit reports "no findings" because it looked at nothing.**

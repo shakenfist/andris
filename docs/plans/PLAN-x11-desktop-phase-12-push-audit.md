@@ -799,6 +799,27 @@ recorded in #93, and the right fix for a future audit of this
 repository is to give the harness slice its own code-quality and
 security reviewer rather than treating it as documentation context.
 
+**On publishing an unfixed denial of service in the open.** This
+record, issue #87 and this phase's pull request all state the
+constants, the mechanism and the minimum resources for S1 while it is
+unfixed on `develop`, and the same for S2's pre-authentication oracle.
+The review round raised that, and the operator's decision on
+2026-11-18 was to leave it and say why.
+
+The reasoning, so a later reader can disagree with it knowingly.
+Andris is pre-1.0 with one deployment, the operator's own. Its default
+listener is `127.0.0.1:5900`, and a non-loopback plain listener is
+refused unless all three TLS options are given (`config.rs:273-279`),
+so reaching the handshake from off the host means going through
+kerbside, which authenticates separately. Against that, an audit whose
+findings cannot be checked is not an audit: a reader who cannot see
+the mechanism cannot tell whether S1 is real, and this record exists
+to be checked rather than believed. The detail is in any case already
+published across this branch's commits, #87 and the pull request body,
+so redacting it now would cost the record its checkability without
+un-publishing anything. The window closes by fixing #87, which is
+where the effort belongs.
+
 **Out of range, so an issue rather than a finding.**
 `ARCHITECTURE.md`'s "Platform seams" commitment names two backends
 where its own inventory documents three.

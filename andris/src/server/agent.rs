@@ -59,6 +59,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use shakenfist_spice_protocol::constants::vd_agent::{
@@ -162,6 +163,59 @@ fn requested_size(config: &MonitorsConfig) -> Result<Size> {
     );
     size.check()?;
     Ok(size)
+}
+
+/// How many resizes a client may ask for in a burst, before
+/// [`RESIZE_REFILL`] starts to apply. Three covers a client that sends a
+/// configuration more than once as its window settles.
+const RESIZE_BURST: u32 = 3;
+
+/// How long one resize of the burst takes to come back. A resize
+/// reconfigures the operator's real screen and makes the server
+/// re-encode the whole desktop, so a client that wants to keep resizing
+/// is held to one every couple of seconds.
+const RESIZE_REFILL: Duration = Duration::from_secs(2);
+
+/// A token bucket over how often a client may resize the desktop:
+/// [`RESIZE_BURST`] at once, and one more each [`RESIZE_REFILL`].
+///
+/// `take` is given the time rather than reading the clock, so that tests
+/// can drive it without waiting.
+#[derive(Debug)]
+struct ResizeBudget {
+    /// Resizes available now.
+    tokens: u32,
+    /// When the last token was added, or the bucket was created.
+    refilled: Instant,
+}
+
+impl ResizeBudget {
+    fn new(now: Instant) -> Self {
+        Self {
+            tokens: RESIZE_BURST,
+            refilled: now,
+        }
+    }
+
+    /// Spend one resize, if there is one to spend at `now`.
+    fn take(&mut self, now: Instant) -> bool {
+        let earned =
+            now.saturating_duration_since(self.refilled).as_nanos() / RESIZE_REFILL.as_nanos();
+        if earned >= u128::from(RESIZE_BURST) {
+            self.tokens = RESIZE_BURST;
+            self.refilled = now;
+        } else if earned > 0 {
+            // Below RESIZE_BURST, so both of these are in range.
+            let earned = u32::try_from(earned).unwrap_or(RESIZE_BURST);
+            self.tokens = self.tokens.saturating_add(earned).min(RESIZE_BURST);
+            self.refilled += RESIZE_REFILL * earned;
+        }
+        if self.tokens == 0 {
+            return false;
+        }
+        self.tokens -= 1;
+        true
+    }
 }
 
 /// The client's agent window, as andris counts it.
@@ -270,6 +324,11 @@ pub struct Agent {
     client_caps: Option<AnnounceCapabilities>,
     /// Whether a refused resize has been logged on this connection.
     refusal_logged: bool,
+    /// How many more resizes the client may ask for.
+    resizes: ResizeBudget,
+    /// Whether a resize refused for being too frequent has been logged at
+    /// warning level on this connection.
+    throttle_logged: bool,
     /// Whether a message dropped from a full queue has been logged at
     /// warning level on this connection.
     drop_logged: bool,
@@ -294,6 +353,8 @@ impl Agent {
             started: false,
             client_caps: None,
             refusal_logged: false,
+            resizes: ResizeBudget::new(Instant::now()),
+            throttle_logged: false,
             drop_logged: false,
             last_crossed: None,
             offered: None,
@@ -523,7 +584,11 @@ impl Agent {
     async fn monitors_config(&mut self, body: &[u8]) -> Result<()> {
         let config = MonitorsConfig::decode(body).context("a malformed agent MONITORS_CONFIG")?;
         let applied = match requested_size(&config) {
-            Ok(size) => self.resize(size).await,
+            Ok(size) if self.resizes.take(Instant::now()) => self.resize(size).await,
+            Ok(size) => {
+                self.refuse_frequent_resize(size);
+                false
+            }
             Err(error) => {
                 debug!(
                     session = self.session,
@@ -543,6 +608,27 @@ impl Agent {
         };
         self.queue(VD_AGENT_REPLY, &reply)?;
         Ok(())
+    }
+
+    /// Say that a resize was refused for arriving too soon after others.
+    /// Nothing is asked of the desktop, so the operator's screen is left
+    /// alone and nothing is re-encoded.
+    fn refuse_frequent_resize(&mut self, size: Size) {
+        if self.throttle_logged {
+            debug!(
+                session = self.session,
+                "refusing a resize to {size}: the client is asking too often"
+            );
+        } else {
+            self.throttle_logged = true;
+            warn!(
+                session = self.session,
+                "refusing the client's resize to {size}: it has asked for more than \
+                 {RESIZE_BURST} resizes faster than one every {}s, so the desktop keeps \
+                 its size and the client is sent an error (logged once per connection)",
+                RESIZE_REFILL.as_secs()
+            );
+        }
     }
 
     /// Ask the desktop to be `size`; true if it now is.
@@ -854,6 +940,36 @@ fn lf_line_ends(text: Arc<str>) -> Arc<str> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_resize_burst_is_allowed_and_then_throttled() {
+        let start = Instant::now();
+        let mut budget = ResizeBudget::new(start);
+        for n in 0..RESIZE_BURST {
+            assert!(budget.take(start), "resize {n} of the burst");
+        }
+        assert!(!budget.take(start), "one resize past the burst");
+    }
+
+    #[test]
+    fn a_spent_resize_budget_refills_one_at_a_time() {
+        let start = Instant::now();
+        let mut budget = ResizeBudget::new(start);
+        for _ in 0..RESIZE_BURST {
+            assert!(budget.take(start));
+        }
+        // Just short of a refill buys nothing.
+        assert!(!budget.take(start + RESIZE_REFILL - Duration::from_millis(1)));
+        // One refill is one resize, and not two.
+        assert!(budget.take(start + RESIZE_REFILL));
+        assert!(!budget.take(start + RESIZE_REFILL));
+        // Idling refills the bucket, and never past the burst.
+        let later = start + RESIZE_REFILL * 100;
+        for _ in 0..RESIZE_BURST {
+            assert!(budget.take(later), "the bucket refilled while idle");
+        }
+        assert!(!budget.take(later), "and no further than the burst");
+    }
     use shakenfist_spice_protocol::messages::vd_agent::MonConfig;
 
     use super::*;

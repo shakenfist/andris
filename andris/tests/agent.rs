@@ -550,6 +550,35 @@ async fn a_resize_is_applied_or_unchanged() {
     assert_eq!(server.platform.size().unwrap().width, 320);
 }
 
+/// A client may resize a few times in a row and is then held to one every
+/// couple of seconds, because each resize reconfigures the operator's real
+/// screen and re-encodes the whole desktop. The refusal happens before the
+/// desktop is asked, so the screen is left alone.
+#[tokio::test]
+async fn resizes_past_the_burst_are_refused_without_touching_the_desktop() {
+    let server = TestServer::start().await;
+    let mut agent = AgentClient::start(&server, u32::MAX).await;
+    agent.expect(VD_AGENT_ANNOUNCE_CAPABILITIES).await;
+
+    // Each is a different size, so each spends one of the burst.
+    for width in [320, 400, 480] {
+        assert!(
+            agent.resize(width, 200).await,
+            "a {width} wide resize within the burst"
+        );
+    }
+    let settled = server.platform.size().unwrap();
+    assert_eq!(settled.width, 480, "the last of the burst was applied");
+
+    // The next is an error reply, and the desktop keeps the size it had.
+    assert!(!agent.resize(560, 200).await, "a resize past the burst");
+    assert_eq!(
+        server.platform.size().unwrap(),
+        settled,
+        "the desktop was not asked for the refused size"
+    );
+}
+
 /// A writer for a test's own log subscriber, that keeps what it is given.
 #[derive(Clone, Default)]
 struct Captured(Arc<Mutex<Vec<u8>>>);

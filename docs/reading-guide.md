@@ -462,7 +462,10 @@ crossed in either direction to break loops between two clipboard
 bridges, and normalised to LF line ends before comparing because RDP
 carries CRLF. The module comment names the known gap in that comparison.
 A monitors config resizes through `DisplayControl` on the blocking pool,
-and the main channel waits for the answer. Ryll types:
+and the main channel waits for the answer. `ResizeBudget` is consulted
+first, so a client that asks too often is refused before the desktop is
+touched; a resize the desktop refuses spends budget too, since the cost
+being limited is the attempt. Ryll types:
 `messages::agent_stream::{AgentReassembler, AgentMessage,
 AgentStreamItem}`, `messages::vd_agent::*`, `constants::vd_agent::*`,
 `AgentTokens`.

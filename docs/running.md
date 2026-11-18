@@ -533,6 +533,18 @@ for the connection, not one for each request. RandR is optional:
 without it, or without RandR 1.2, andris still serves the desktop and
 refuses every resize in the same way.
 
+How often a client may resize is limited, because each resize
+reconfigures the operator's real screen and makes andris re-encode
+the whole desktop: three may be asked for at once, and one more
+becomes available every two seconds. A resize past that is refused
+before the X server is asked, so the screen is left alone; the client
+gets the same error reply as any other refusal, and one warning is
+logged for the connection. A client that sends a configuration more
+than once as its window settles is unaffected. One that streams them
+while a window is dragged will have some refused, and the desktop
+then keeps the last size that was accepted rather than the last one
+asked for.
+
 ### Video streams
 
 An area that keeps changing like a video can go to the client as an

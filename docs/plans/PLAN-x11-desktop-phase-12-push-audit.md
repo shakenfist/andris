@@ -880,24 +880,27 @@ Falsifiable items only.
 
 - `PUSH-AUDIT.md`'s `source-file-size` block is byte-identical to
   development `main`'s `templates/shared-blocks/source-file-size.md`.
-  This prints `ok`:
-
-  ```
-  Needs network access; it fails on an offline check for a reason
-  unrelated to the block's contents, and removes its clone afterwards.
+  The extracted block and development's template both hash to
+  `ec6cdfae29fd58fa6fe672ae9309550070dc4522`, recorded here so the
+  claim can be checked without a clone: `git hash-object` on the
+  block's byte range, including its trailing newline, prints it. This
+  check prints `ok`, needs network access, and removes its clone
+  afterwards:
 
   ```
   python3 -I - <<'EOF'
-  import re, shutil, subprocess, sys, tempfile, pathlib
+  import pathlib, re, shutil, subprocess, tempfile
   d = tempfile.mkdtemp()
   try:
       subprocess.run(['git', 'clone', '--depth', '1', '-q',
                       'https://github.com/shakenfist/development', d],
                      check=True)
-  want = pathlib.Path(d, 'templates/shared-blocks/source-file-size.md').read_text()
-  have = open('PUSH-AUDIT.md').read()
-      m = re.search(r'<!-- shared-block: source-file-size v\d+ -->.*?<!-- shared-block-end -->\n',
-                    have, re.S)
+      want = pathlib.Path(
+          d, 'templates/shared-blocks/source-file-size.md').read_text()
+      have = open('PUSH-AUDIT.md').read()
+      m = re.search(
+          r'<!-- shared-block: source-file-size v\d+ -->'
+          r'.*?<!-- shared-block-end -->\n', have, re.S)
       assert m, 'block not found'
       assert m.group(0) == want, 'block differs from development main'
       print('ok')
@@ -1003,6 +1006,16 @@ The three findings worth a reader's attention, in order:
 3. **#14 as sharpened.** Andris copies the operator's clipboard into
    its own memory at thread start and on every ownership change, with
    no client connected and before any ticket is presented.
+
+**What this audit did not cover, stated as a limit on the phase
+rather than a footnote.** A seventh of the audited diff got no
+code-quality and no security review, and the phase is `Complete`
+anyway. That is defensible only because it is said plainly: every
+step of the plan ran, and the gap is in what the plan asked for, not
+in what was delivered against it. A reader should treat this audit as
+covering `andris/src` and the documentation thoroughly, and the
+build, CI, scripts and packaging only for whether the documented
+facts about them are true. #93 carries the remainder.
 
 One thing the split got wrong, recorded in the triage section: the
 `harness` slice -- 12,039 insertions of scripts, CI and packaging --

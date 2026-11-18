@@ -670,20 +670,23 @@ because the following statements will be true:
   available against the same session. *Partly met in phase 10:* the
   week's soak (2026-10-19 to 10-27) used ryll → andris through an
   SSH tunnel, with RDP available and never needed. Kerbside is
-  exercised only by the `Through kerbside` merge-tier lane.
+  exercised only by the `Through kerbside` merge-tier lane. Partly met
+  is not met: this is one of the three criteria counted as short in
+  *Items deferred from the push audit*, because the chain the criterion
+  names -- ryll through kerbside -- has never carried a day's work.
 * With a static screen, andris uses under 2% of one core on
   the development host. **Not measured.** The phase 10 soak recorded
   2.5% of one core averaged over 165 hours of use *and* idle, and said
   itself that this "is not the success criterion's static-screen
   figure, which the soak did not measure". Nothing since measured it.
-  This is one of the two reasons this plan is not `Complete`.
+  What this means for the plan's status is in *Items deferred from the
+  push audit*, which is the single authority on that.
 * Scrolling a full-screen terminal at the session's native size
   sustains at least 30 frames per second on the LAN, as ryll's GUI
   reports it: its FPS is the rate of `MARK` messages. **Not
   measured.** The soak's figures are whole-session averages of 2.4 to
   3.9 fps over seven days, which is what an idle desktop looks like
-  and says nothing about a scrolling peak. The second reason this plan
-  is not `Complete`.
+  and says nothing about a scrolling peak.
 * Copy and paste of text work in both directions, with RDP
   connected to the same session. Resizing the ryll window resizes
   the desktop on an X server that allows it; on xrdp the desktop
@@ -793,11 +796,13 @@ and the first is a rule rather than a judgement.
    raised 32, so the cell is owed, and the pull request that resolves
    them fills it and sets this plan's status. Recorded here because an
    empty cell in a `Complete` row is exactly what never gets filled
-   later. They are the plan's only
+   later; whichever of #87 to #94's fixes lands first is the carrier,
+   and #87 carries a note saying so.
+
+The two unmeasured figures in condition 2 are this plan's only
 quantitative claims about whether andris is good enough to replace
 RDP for daily use, and the week's soak demonstrated the thing in
-practice without ever producing either number. The status stays `In
-progress` until they are measured or deliberately dropped.
+practice without ever producing either number.
 
 ### Documentation index maintenance
 

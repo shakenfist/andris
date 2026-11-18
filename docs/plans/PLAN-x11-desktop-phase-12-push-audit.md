@@ -342,13 +342,15 @@ a finding against this plan, and the step says to report which.
    push-audit shared block asks for.
 
 8. **This phase does not assume the master plan goes `Complete`.**
-   The plan has eight success criteria. Two are annotated as met or
-   partly met in phase 10; the rest -- the 2% idle CPU figure, 30
-   frames per second while scrolling, clipboard in both directions,
-   the end-to-end CI lanes, `docs/` describing xrdp coexistence
-   without plan references, and the consistency audit filing no
-   issues other than `review-coverage` -- carry no evidence in the
-   plan one way or the other. Step 12h reads each against evidence
+   The plan has nine success criteria. Three carry an annotation --
+   the soak partly met in phase 10, the video stream met in phase
+   10, and the review-tracking adoption met in phase 11. The other
+   six -- the 2% idle CPU figure, 30 frames per second while
+   scrolling, clipboard in both directions, the end-to-end CI lanes,
+   `docs/` describing xrdp coexistence without plan references, and
+   the consistency audit filing no issues other than
+   `review-coverage` -- carry no evidence in the plan one way or the
+   other. Step 12h reads each against evidence
    and records a verdict. The status moves to `Complete` only if
    every criterion is met and every finding is resolved or declined;
    otherwise it stays `In progress` with the reason named, which is
@@ -379,6 +381,46 @@ run in parallel. 12f needs all of them.
 | 12f | high | opus | none | Triage. Take every finding from 12c, 12d and 12e and classify each against **current `develop`** as `still-present`, `already-fixed` or `moved`. All audited files are still at the same paths, and the drift is small -- the newest landing is three weeks old, and the only things that have touched `develop` since are Renovate bumps, two review-tracking template re-syncs (#65, #66), one consistency-fix pull request (#71) and the prune bot. So assume a finding is live unless you can point at what fixed it: `already-fixed` **requires** naming the commit or the current code that resolves it, and a finding you cannot locate stays `still-present` for a human to look at. For each `still-present` finding give the current file and line. Check each against the open issue list before reporting it as new -- #13 (adversarial agent tests), #14 (clipboard password-manager hints), #15 (clipboard module split), #25 (waiting for a local X display) and #62 (D-Bus spike deferred work) already exist, and a finding that restates one of those should say so. Output one table: finding, source agent, severity, status, current location, existing issue if any. |
 | 12g | low | sonnet | none | Record the derivation in the master plan so it never has to be done again, in its own commit, subject "Record the push audit's range derivation." The `Merged` column is already complete, so this step adds to the phase 12 section the 16 landings as the audit range, the empty-tree form phase 0 needs and why, and the seven-slice partition with its numbers. Put commits and ranges in that section, not in the `Status` column, which holds one vocabulary term. Do not restate the findings here; they go in step 12h's section. |
 | 12h | medium | management | none | Management step, not a sub-agent step. Three parts. (i) Review 12f's table, decide fix-or-decline for every finding, and record the outcome in the master plan under a new *Items deferred from the push audit* heading, with a reason in writing for each declination. If the audit found nothing, that is one sentence and a real result. (ii) Fill in the master plan's *Bugs fixed during this work* section, which currently names two ryll bugs from phase 2 and nothing since -- twelve phases either fixed things or did not, and both are answers. (iii) Work through the eight success criteria one at a time and record a verdict with evidence for each, per decision 8. Then set the master plan's status and its `docs/plans/index.md` row: `Complete` only if every criterion is met and every finding is resolved or declined; otherwise `In progress` with the reason named in the plan. Note that the consistency criterion now reads "files no issues other than `review-coverage`", and that #85 is closed by this phase's own pull request. Fixes land as their own pull request; this step decides and records. |
+
+### Execution notes
+
+- **2026-11-18 (AEDT).** The back brief was approved. Two answers:
+  all six judgment agents of 12e run together after the gate rather
+  than security first, and this session has permission to push and
+  open the pull request once the definition of done passes.
+- Steps 12a and 12b ran in parallel. Only 12a writes the worktree;
+  12b writes patches to a scratch directory and changes no tracked
+  file, so they cannot collide.
+- **The gate after 12b passed exactly.** The assembled patch is 365
+  diff rows, 63,239 insertions, 2,560 deletions over 149 distinct
+  paths, and the seven slices' rows, insertions and deletions each
+  sum to those totals. Verified twice: by `--numstat` over the 16
+  landings, and by `git apply --stat` on each of the seven written
+  patch files. The root-commit failure the plan predicted reproduced
+  verbatim (`fatal: ambiguous argument '60c0c4d^'`), and the
+  empty-tree form against `e89539f` gives 17 files and 2,357
+  insertions. Nothing downstream is auditing the wrong thing.
+- 12a's sub-agent left a two-word line where its sentence met the
+  existing prose; the management session rewrapped that paragraph
+  before committing. The block copy itself was byte-exact, confirmed
+  against an independent clone of development's `main`.
+- **Correction: the master plan has nine success criteria, not
+  eight.** Decision 8 and the definition of done said eight and
+  enumerated six unannotated ones, having missed that the
+  review-tracking criterion rewritten in phase 11's close-out is
+  itself annotated. Three are annotated and six are not. Corrected
+  above rather than left for step 12h to trip over.
+- **The ryll audits this phase cites are not uniform, and two
+  phases have nothing to cite.** Checked before 12h needs it: ryll
+  #477 (phase 2), #487 (phase 3) and #534 (phase 7) each record a
+  push audit in the pull request body, with findings taken and
+  declined. Ryll #552, #554 and #557 (phase 8) and #578 (phase 9)
+  record none -- not in the pull request body, and not in any commit
+  message under the merge. So phase 8's and phase 9's ryll work was
+  never push-audited in ryll. That predates this phase, belongs to
+  another repository, and is not a finding of this audit; step 12h
+  says so plainly rather than implying coverage, and it wants an
+  issue in ryll.
 
 ## Risks and mitigations
 
@@ -475,7 +517,7 @@ Falsifiable items only.
 - The master plan's *Bugs fixed during this work* section says
   something about phases 4 to 11, not only about phase 2's two ryll
   bugs.
-- Each of the master plan's eight success criteria carries a verdict
+- Each of the master plan's nine success criteria carries a verdict
   with evidence.
 - The master plan's phase 12 row reads `Complete`. The plan's own
   status, in both the master plan and `docs/plans/index.md`, reads

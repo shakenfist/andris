@@ -741,7 +741,7 @@ Grouped by cause, because several findings share one:
 
 | Issue | What | From |
 |-------|------|------|
-| #87 | Two source addresses can hold every handshake permit and lock all other clients out, unauthenticated and indefinitely. The per-peer cap's stated guarantee does not survive a second address, and four documents repeat the reasoning | S1 |
+| #87 | Two source addresses can hold every handshake permit and lock all other clients out, unauthenticated and indefinitely. The per-peer cap's stated guarantee does not survive a second address, and the reasoning is repeated in five locations across three documents plus the code comment that asserts it -- `docs/running.md:343-344` ("so that no one peer can lock others out") being the sentence a reader checking whether andris is safe to expose would stop at | S1 |
 | #88 | Client-driven resize is unthrottled: a client can thrash the operator's real screen while making the server reallocate and re-encode the whole desktop each time. Found independently by both security reviewers | S3, X4 |
 | #89 | The synthetic platform backend has drifted from the X11 one on `Gone`, the input-queue bound, the clipboard cap and resize clamping, so tests using the stand-in are weaker than they look | P1-P5 |
 | #90 | CI reports green for the X11 and audio paths it never runs: those tests skip silently, and the real XTEST input sink and XFixes cursor source have no test at all though Xvfb could run them. Also the tests that assert on log text and formatting | T4, T5, T6 |
@@ -766,15 +766,34 @@ findings). **Phases 8 and 9 do not**: ryll #552, #554, #557 and #578
 carry no audit record in any pull request body or commit message. That
 is ryll's to resolve and is filed there as ryll#738.
 
-Why this plan is not `Complete`: two of its nine success criteria --
-the 2% idle CPU figure and the 30 fps scrolling figure -- were never
-measured, as noted against them above. #87 is a third reason to
-hesitate, and a better-evidenced one: an unauthenticated client can
-deny the service to every other client, which bears on "replace RDP
-for dogfooding" more directly than either unmeasured figure. It is
-filed rather than fixed here because the shared block puts findings in
-their own pull request, but a reader deciding whether this plan is
-finished should weigh it alongside the two criteria. They are the plan's only
+Why this plan is not `Complete`. Three conditions are outstanding,
+and the first is a rule rather than a judgement.
+
+1. **The findings are unresolved.** `PLAN-TEMPLATE.md`'s
+   `plan-push-audit-phase` block and `PUSH-AUDIT.md` both say the plan
+   is not complete until every finding is resolved or explicitly
+   declined. All 32 are open and none is declined -- they are filed,
+   which is tracking, not resolution. This alone settles the status;
+   the two below are why it would not be `Complete` even if they were
+   fixed tomorrow. The first version of this paragraph named only the
+   unmeasured criteria and called #87 "a third reason to hesitate",
+   which read as optional weighing of something that is actually the
+   governing condition.
+2. **Three success criteria are short, not two.** The 2% idle CPU
+   figure and the 30 fps scrolling figure were never measured. The
+   first criterion -- ryll through kerbside as the daily connection
+   for a week -- is *partly* met: the soak ran ryll to andris over an
+   SSH tunnel, and kerbside is exercised only by a CI lane, so the
+   chain the criterion names has never carried a day's work.
+3. **Phase 12 owes a `Merged` cell.** The `plan-phase-landing` block
+   lets the push-audit phase omit it only where the audit found
+   nothing -- "it is the only row permitted to omit one" -- and where
+   there are findings, their pull request is the carrier and records
+   the audit phase's merge commit, which is known by then. This audit
+   raised 32, so the cell is owed, and the pull request that resolves
+   them fills it and sets this plan's status. Recorded here because an
+   empty cell in a `Complete` row is exactly what never gets filled
+   later. They are the plan's only
 quantitative claims about whether andris is good enough to replace
 RDP for daily use, and the week's soak demonstrated the thing in
 practice without ever producing either number. The status stays `In
@@ -787,6 +806,12 @@ file) and keep its status in step with the Execution table.
 
 ### Future work
 
+- **The ryll audit gap (ryll#738).** Phases 8 and 9 landed work in
+  ryll that this plan cites as audited there, and four of those
+  merges carry no audit record. It is filed as ryll#738 and is ryll's
+  to resolve, but it is tracked here too: if that issue is never
+  actioned, this plan's citation quietly stays empty, and nothing in
+  ryll will remind andris of it.
 - **Reading andris.** Phase 11 installed the review tracking, the
   reading guide and the prune bot, and then handed over: 127 of 136
   in-scope files have never been read, and the nine that carry marks

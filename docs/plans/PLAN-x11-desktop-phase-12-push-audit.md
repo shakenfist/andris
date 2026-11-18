@@ -504,9 +504,22 @@ substantial finding of this audit.
 | S5 | low | **Log amplification in the key decoder.** `keymap.rs:189-196` keys its log-once set on the 16-bit E1 pair, so a client can emit about 65,536 `warn` lines per inputs channel, and relinking resets the decoder |
 | S6 | info | Forged `ACK`s defeat flow-control pacing (`channel.rs:244-259` subtracts a window per `ACK` without accounting for what was sent; CPU only). Client `i32` motion deltas reach the platform unvalidated (`inputs.rs:437-447`). The ticket is never zeroized (`config.rs:209`). An unauthenticated peer can hold both RSA keygen permits (`link.rs:276-294`) |
 
-2d-1 cleared five areas with evidence: untrusted parsing (every body bounded by `O::MAX_CLIENT_BODY`, no unchecked indexing of wire data, negative `DisplayInit` fields refused, u64 intermediates in rate control); authentication apart from S2 (ticket via `open_private_file` checking regular-file, owner-equals-euid and no group or other bits, `Debug` redacted, compared with `subtle::ct_eq`, and **no path reaches a message loop before authentication**); TLS and exposure (a non-loopback plain listener refused unless TLS is configured, no fallback to plain on a bad certificate); concurrency (no `unsafe`, no hand-written `Send`/`Sync`, no lock across an await, ordered session replacement); and path construction (no server path is built from client data).
+2d-1 cleared five areas with evidence: untrusted parsing (every body
+bounded by `O::MAX_CLIENT_BODY`, no unchecked indexing of wire data,
+negative `DisplayInit` fields refused, u64 intermediates in rate
+control); authentication apart from S2 (ticket via `open_private_file`
+checking regular-file, owner-equals-euid and no group or other bits,
+`Debug` redacted, compared with `subtle::ct_eq`, and **no path reaches
+a message loop before authentication**); TLS and exposure (a
+non-loopback plain listener refused unless TLS is configured, no
+fallback to plain on a bad certificate); concurrency (no `unsafe`, no
+hand-written `Send`/`Sync`, no lock across an await, ordered session
+replacement); and path construction (no server path is built from
+client data).
 
-**Security, platform half (2d-2, opus).** Six. 2d-2 noted that S-side authentication would raise X1 and X4 if any pre-auth path existed; 2d-1 found none, so they stand as written.
+**Security, platform half (2d-2, opus).** Six. 2d-2 noted that S-side
+authentication would raise X1 and X4 if any pre-auth path existed;
+2d-1 found none, so they stand as written.
 
 | Id | Sev | Finding |
 |----|-----|---------|
@@ -517,11 +530,36 @@ substantial finding of this audit.
 | X5 | low | **A failed resize can leave the desktop changed.** `x11/randr.rs:512-540`: `undo` restores in reverse but through `carry_on`, which logs and continues, and restores the physical size at 96 DPI rather than the original. A resize that fails mid-way with a failing undo leaves the desktop at an intermediate size and DPI, reported only in a log. Documented at `:507-511` |
 | X6 | low | **The ticket is created in a directory already known to be open to others.** `install.rs:330-350`: `make_config_dir` returns `OpenToOthers { mode }` when the `0o077` bits are set and only reports it; `make_ticket` then creates the ticket there anyway. Verified. The file is `O_EXCL` 0600 so it cannot be read, but another user can unlink and substitute it. Fix: refuse to create a *new* ticket in such a directory |
 
-2d-2 cleared four areas with evidence: input injection (keys go evdev code to `EVDEV_NAMES` to XKB key name to *this server's* keycode, so a client cannot name an arbitrary keycode; buttons come from a 7-variant enum; the XTEST `detail` is never client-chosen; coordinates saturate into i16; events go only to the configured display's root, and nothing touches the X auth cookie; the queue is bounded at `INPUT_QUEUE_LIMIT` 8192 with a `RELEASE_RESERVE` of 512 so an owed release never blocks behind a flood, and overflow fails `inject`, which closes the channel -- fail-safe); both `unsafe` sites (libpulse signatures checked against the headers with a layout test, **no `unsafe impl Send`/`Sync` anywhere in the crate**, `PaSimple` is `!Send`/`!Sync` by `PhantomData`, and in `x11/shm.rs` the memfd is sealed before mapping so a read cannot `SIGBUS`, no Rust reference is ever made into the mapping, `Mapping::copy` bounds-checks with `checked_add` before `copy_nonoverlapping`, and the segment size is never client-supplied); capture arithmetic (every rectangle edge widens to `u64`, `Frame::new` checks stride and buffer length with checked arithmetic); and `install.rs` path handling (no configuration value becomes a path component, and `quote_executable` refuses control characters and quotes, checked against systemd 257's manual with `systemd-analyze verify`).
+2d-2 cleared four areas with evidence: input injection (keys go evdev
+code to `EVDEV_NAMES` to XKB key name to *this server's* keycode, so a
+client cannot name an arbitrary keycode; buttons come from a 7-variant
+enum; the XTEST `detail` is never client-chosen; coordinates saturate
+into i16; events go only to the configured display's root, and nothing
+touches the X auth cookie; the queue is bounded at `INPUT_QUEUE_LIMIT`
+8192 with a `RELEASE_RESERVE` of 512 so an owed release never blocks
+behind a flood, and overflow fails `inject`, which closes the channel
+-- fail-safe); both `unsafe` sites (libpulse signatures checked
+against the headers with a layout test, **no `unsafe impl Send`/`Sync`
+anywhere in the crate**, `PaSimple` is `!Send`/`!Sync` by
+`PhantomData`, and in `x11/shm.rs` the memfd is sealed before mapping
+so a read cannot `SIGBUS`, no Rust reference is ever made into the
+mapping, `Mapping::copy` bounds-checks with `checked_add` before
+`copy_nonoverlapping`, and the segment size is never client-supplied);
+capture arithmetic (every rectangle edge widens to `u64`, `Frame::new`
+checks stride and buffer length with checked arithmetic); and
+`install.rs` path handling (no configuration value becomes a path
+component, and `quote_executable` refuses control characters and
+quotes, checked against systemd 257's manual with `systemd-analyze
+verify`).
 
-One informational note worth keeping: andris never consults the screensaver or lock state, so XTEST input from a ticketed client wakes a blanked screen and reaches a locker's grab. That is standard remote-desktop behaviour and wants a line in the documentation rather than a code change.
+One informational note worth keeping: andris never consults the
+screensaver or lock state, so XTEST input from a ticketed client wakes
+a blanked screen and reaches a locker's grab. That is standard
+remote-desktop behaviour and wants a line in the documentation rather
+than a code change.
 
-**Code quality, server half (2a-1, sonnet).** Four advisories, all accretion across phases.
+**Code quality, server half (2a-1, sonnet).** Four advisories, all
+accretion across phases.
 
 | Id | Finding |
 |----|---------|
@@ -530,9 +568,16 @@ One informational note worth keeping: andris never consults the screensaver or l
 | Q3 | The recv-and-ignore select arm is duplicated: `cursor.rs:83-88`, `playback.rs:488-493`, and a drain loop of the same shape at `inputs.rs:126-129` |
 | Q4 | `display.rs` repeats the `send(Mark)` then `frame_sent(..)` pair in `frame()` and `refresh()`, and spells `self.conn.session().counters()` about twelve times |
 
-2a-1 confirmed that wire handling sits in `shakenfist-spice-protocol` and codecs in `shakenfist-spice-compression`, with no hand-rolled protocol framing in `server/`: the four `to_le_bytes`/`from_le_bytes` hits are PCM in `playback.rs`, cursor pixels in `cursor.rs` and scancodes in `keymap.rs`, none of them framing (verified). It found nothing worth moving into ryll today.
+2a-1 confirmed that wire handling sits in `shakenfist-spice-protocol`
+and codecs in `shakenfist-spice-compression`, with no hand-rolled
+protocol framing in `server/`: the four `to_le_bytes`/`from_le_bytes`
+hits are PCM in `playback.rs`, cursor pixels in `cursor.rs` and
+scancodes in `keymap.rs`, none of them framing (verified). It found
+nothing worth moving into ryll today.
 
-**Code quality, platform half (2a-2, sonnet).** Seven advisories. The first four are one theme and the most valuable code-quality result of the audit.
+**Code quality, platform half (2a-2, sonnet).** Seven advisories. The
+first four are one theme and the most valuable code-quality result of
+the audit.
 
 | Id | Finding |
 |----|---------|
@@ -544,9 +589,18 @@ One informational note worth keeping: andris never consults the screensaver or l
 | P6 | The three X event-loop threads (`x11/cursor.rs:62-110`, `x11/damage.rs:165-215`, `x11/clipboard.rs:572-632`) each repeat the same skeleton: `wait_for_event`, wake-cookie check, warn-once on X errors, `lost(..)` on failure |
 | P7 | `SyntheticPlatform::platform()` installs a `ToneSource` that `run` then overwrites (`lib.rs:59-77`, `synthetic/mod.rs:234-244`), so the default is dead on the production path and the tone choice is decided twice |
 
-2a-2 confirmed and refined **issue #15** rather than re-filing it: the follow/serve seam is real, `follow.rs` would take `Fetch`, `Incoming` and the INCR-in path (`:713-940`) and `serve.rs` would take `Owned`, `Transfer` and `acquire` through `next_piece` (`:941-1155`), with the atoms, timer, handle, `run` and `housekeeping` staying in the parent and `earliest` staying because it spans both sides. It found no `comment-proportion` problems: the long module docs carry contract and rationale.
+2a-2 confirmed and refined **issue #15** rather than re-filing it: the
+follow/serve seam is real, `follow.rs` would take `Fetch`, `Incoming`
+and the INCR-in path (`:713-940`) and `serve.rs` would take `Owned`,
+`Transfer` and `acquire` through `next_piece` (`:941-1155`), with the
+atoms, timer, handle, `run` and `housekeeping` staying in the parent
+and `earliest` staying because it spans both sides. It found no
+`comment-proportion` problems: the long module docs carry contract and
+rationale.
 
-**Tests (2b, sonnet).** Six advisories. It verified the ryll pin independently -- `38c51eff` with protocol and compression 0.3.0, in both `andris/Cargo.toml` and `Cargo.lock`.
+**Tests (2b, sonnet).** Six advisories. It verified the ryll pin
+independently -- `38c51eff` with protocol and compression 0.3.0, in
+both `andris/Cargo.toml` and `Cargo.lock`.
 
 | Id | Finding |
 |----|---------|
@@ -557,7 +611,11 @@ One informational note worth keeping: andris never consults the screensaver or l
 | T5 | **The X11 and PulseAudio tests skip silently and report green.** `tests/x11.rs` (six tests) and `tests/pulse.rs` (two) need a real X or sound server and are covered only by `make e2e`. A skip that reports success is the failure mode worth fixing: a skip counter, or a CI job asserting the environment variable is set |
 | T6 | **The real X11 `InputSink` and `CursorSource` have no test at all**, though Xvfb provides XTEST and XFixes so they are testable rather than untestable. Server tests use the synthetic backend only, and the e2e cursor check asserts only a log line. This is the largest real-X coverage gap, and it compounds P1 to P4: the stand-in is weaker than the real thing *and* the real thing is untested |
 
-2b confirmed that everything else andris puts on the wire is round-tripped against the parser ryll's client uses, channel by channel, and that **issue #13** is still accurate: none of its seven adversarial cases appears in `tests/agent.rs`. It recommends widening #13 with T1 and T2 rather than filing new issues.
+2b confirmed that everything else andris puts on the wire is
+round-tripped against the parser ryll's client uses, channel by
+channel, and that **issue #13** is still accurate: none of its seven
+adversarial cases appears in `tests/agent.rs`. It recommends widening
+#13 with T1 and T2 rather than filing new issues.
 
 **Documentation (2c, sonnet).** Three advisories, no blocking finding.
 
@@ -567,9 +625,22 @@ One informational note worth keeping: andris never consults the screensaver or l
 | D2 | `ARCHITECTURE.md` has grown the most of the three agent documents (194 lines) and several component-table cells are paragraph-length and carry tunables -- 8 permits, 4 slots, 64x64 tiles, 32 rectangles, 4 Mi -- that `docs/running.md` and `docs/reading-guide.md` also hold |
 | D3 | Numbers duplicated between `ARCHITECTURE.md` and `docs/` currently agree with the code but will drift: the handshake limits, the 20-frames-in-2-seconds stream trigger, the default listen address. Point `ARCHITECTURE.md` at `docs/running.md` instead of restating them |
 
-2c found **no plan-phase references in code or documentation** -- the two apparent hits, `codeql-analysis.yml:18` and `tools/ci-prune-reviews.sh:194`, cite development's "Adopting a repository" procedure, not this plan -- and no contradictions between documents. It checked all 14 documented `--` options against `config.rs` and every documented `make` target and script path: all exist, with matching defaults. It found nothing describing planned behaviour as if it existed.
+2c found **no plan-phase references in code or documentation** -- the
+two apparent hits, `codeql-analysis.yml:18` and
+`tools/ci-prune-reviews.sh:194`, cite development's "Adopting a
+repository" procedure, not this plan -- and no contradictions between
+documents. It checked all 14 documented `--` options against
+`config.rs` and every documented `make` target and script path: all
+exist, with matching defaults. It found nothing describing planned
+behaviour as if it existed.
 
-**Out of range, for issues rather than findings.** `ARCHITECTURE.md` contradicts itself about the platform backends: line 35 documents the qemu backend in full and line 36 calls its `shm.rs` "the crate's third `unsafe` module", while the "Platform seams" commitment at line 186 still says "an X11 implementation and a synthetic one". This plan wrote line 186; pull request #56 added the backend and left it stale. Not this audit's finding, but it should be filed.
+**Out of range, for issues rather than findings.** `ARCHITECTURE.md`
+contradicts itself about the platform backends: line 35 documents the
+qemu backend in full and line 36 calls its `shm.rs` "the crate's third
+`unsafe` module", while the "Platform seams" commitment at line 186
+still says "an X11 implementation and a synthetic one". This plan
+wrote line 186; pull request #56 added the backend and left it stale.
+Not this audit's finding, but it should be filed.
 
 ### Triage (step 12f), and why it ran in the management session
 
@@ -708,11 +779,25 @@ end-to-end drivers got no size verdict.** `scripts/e2e-drive.py`
 (1,241 lines) and `scripts/e2e-xrdp-drive.py` (1,044) are both over
 the advisory line, and both fell in the `harness` slice, which
 decision 3 gave only to the documentation agent -- for checking
-documented build and CI facts -- and to no code-quality agent. So the
-split by area left 12,039 insertions of scripts, CI and packaging
-without a code-quality or size review. That is a real hole in
-decision 3, it is recorded in #93, and a future audit of this
-repository should give the harness slice a code-quality reviewer.
+documented build and CI facts -- and to no code-quality agent.
+
+**The size verdicts are the smallest part of that gap.** The
+`harness` slice is 12,039 insertions of GitHub workflows, shell and
+Python scripts, the packaging and the devcontainer, and it received
+**no code-quality and no security review at all**. What went
+unexamined is not just two long Python files: it is untrusted-input
+handling in workflow expressions, token scope and permissions blocks,
+what runs on a self-hosted runner, the kerbside lane's compose stack
+and the wheel build. Those are a different hazard class from the
+server's wire parsing, and a SPICE server's CI is a supply-chain
+surface in its own right. The one concrete consequence already found
+is the plan link in the systemd unit, which the clean-areas claim
+above wrongly denied existed.
+
+That is a hole in decision 3 rather than in any agent's work. It is
+recorded in #93, and the right fix for a future audit of this
+repository is to give the harness slice its own code-quality and
+security reviewer rather than treating it as documentation context.
 
 **Out of range, so an issue rather than a finding.**
 `ARCHITECTURE.md`'s "Platform seams" commitment names two backends
@@ -777,19 +862,26 @@ Falsifiable items only.
   This prints `ok`:
 
   ```
+  Needs network access; it fails on an offline check for a reason
+  unrelated to the block's contents, and removes its clone afterwards.
+
+  ```
   python3 -I - <<'EOF'
-  import re, subprocess, sys, tempfile, pathlib
+  import re, shutil, subprocess, sys, tempfile, pathlib
   d = tempfile.mkdtemp()
-  subprocess.run(['git', 'clone', '--depth', '1', '-q',
-                  'https://github.com/shakenfist/development', d],
-                 check=True)
+  try:
+      subprocess.run(['git', 'clone', '--depth', '1', '-q',
+                      'https://github.com/shakenfist/development', d],
+                     check=True)
   want = pathlib.Path(d, 'templates/shared-blocks/source-file-size.md').read_text()
   have = open('PUSH-AUDIT.md').read()
-  m = re.search(r'<!-- shared-block: source-file-size v\d+ -->.*?<!-- shared-block-end -->\n',
-                have, re.S)
-  assert m, 'block not found'
-  assert m.group(0) == want, 'block differs from development main'
-  print('ok')
+      m = re.search(r'<!-- shared-block: source-file-size v\d+ -->.*?<!-- shared-block-end -->\n',
+                    have, re.S)
+      assert m, 'block not found'
+      assert m.group(0) == want, 'block differs from development main'
+      print('ok')
+  finally:
+      shutil.rmtree(d, ignore_errors=True)
   EOF
   ```
 
@@ -864,7 +956,8 @@ by `git apply --stat` on each written patch file. The seven slices
 partition it with rows, insertions and deletions each summing to those
 totals: server 46/13,012/720, platform 47/12,120/318, core
 15/2,382/95, tests 30/8,361/529, harness 119/12,039/371, docs
-61/4,889/310, plans 47/10,436/217. The derivation is recorded in the master plan so it never
+61/4,889/310, plans 47/10,436/217. The derivation is recorded in the
+master plan so it never
 has to be done again, including the empty-tree form phase 0 needs
 because its range starts at the repository's root commit.
 
@@ -901,9 +994,39 @@ lists only problems cannot be checked. The ones worth repeating: no
 path reaches a message loop before authentication; there is no
 `unsafe impl Send` or `Sync` anywhere in the crate; the memfd is
 sealed before mapping so a read cannot `SIGBUS`; a client cannot name
-an arbitrary X keycode; every wire body is bounded before buffering;
-no production `unwrap()` or `expect()` exists; and no plan-phase
-reference appears in any code or documentation file.
+an arbitrary X keycode; and every wire body is bounded before
+buffering.
+
+Two clean-area claims in the first version of this Result were
+overstated, and the review round caught both.
+
+"No plan-phase reference appears in any code or documentation file"
+was **false**. `packaging/systemd/andris@.service:52` linked the
+master plan for `SystemCallFilter`, with the note "On trial, pending
+a week of daily use with MIT-SHM capture and sound, which decides
+whether it stays" -- and that trial had completed: phase 10's soak ran
+2026-10-19 to 10-27 with MIT-SHM capture and sound and raised no
+`status=31/SYS`. So by the `plan-references-in-code` block's own rule
+("the link comes out when the work lands") it should have come out at
+phase 10. It is removed here, with the trial's outcome recorded in its
+place, because leaving it while claiming it did not exist is worse
+than either. **This miss traces straight to the harness-slice gap
+below:** the unit file is in the `harness` slice, which no
+code-quality agent read, and 2c -- which had the slice for build and
+CI facts -- grepped the code slices rather than its own second patch.
+
+"No production `unwrap()` or `expect()` exists" was **true but not
+shown by the evidence given**. The clippy argument covers
+`unwrap_used` only; `expect_used` is not configured, as the execution
+notes say, so `.expect()` needed enumerating rather than linting. The
+enumeration: eight sites, all test code -- `config.rs:755`
+(`cfg(test)` at 493), `platform/audio.rs:432` and `:438` (317),
+`platform/x11/checks.rs:146` and `:154` (112),
+`server/inputs.rs:562` (494), `server/updates/stream.rs:1190` (845),
+and `server/updates/test_support.rs:350`, whose file carries no inner
+marker because `updates/mod.rs:69-70` declares the whole module
+`#[cfg(test)]`. 2d-1 reported "the only two", having looked only at
+`server/`.
 
 Two steps did not run as briefed, both recorded in the execution
 notes with the reason: 12f, because its premise that findings would

@@ -47,9 +47,10 @@ MemoryDenyWriteExecute=yes
 # the set kills andris with SIGSYS, which the journal shows as
 # status=31/SYS, rather than failing it with EPERM somewhere deep in
 # MIT-SHM or libpulse. A user unit can filter system calls only with
-# NoNewPrivileges=yes, set above. On trial, pending a week of daily use
-# with MIT-SHM capture and sound, which decides whether it stays; see
-# https://github.com/shakenfist/andris/blob/develop/docs/plans/PLAN-x11-desktop.md
+# NoNewPrivileges=yes, set above. Kept: a week of daily use with
+# MIT-SHM capture and sound, 2026-10-19 to 10-27, raised no
+# status=31/SYS and no other signal, so the set is wide enough for
+# andris as it stands.
 SystemCallFilter=@system-service
 # Only the native ABI's system calls, so that another ABI (on x86_64,
 # i386's or x32's) cannot reach calls the filter above would refuse; the

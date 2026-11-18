@@ -346,7 +346,7 @@ management session reviews each diff and makes each commit.
 | 5 | low | operator | none | Complete | Add `DEPENDENCIES_TOKEN` to andris, and ready the review account's clone. See brief 5. |
 | 6 | medium | management | none | Complete | Push audit, then both pull requests. See brief 6. |
 | 7 | low | management | none | Complete | After the merge, check that the prune bot and the audits work. See brief 7. |
-| 8 | high | operator | none | Out of scope | The review sessions. Moved out of the plan on 2026-11-18; see Scope and brief 8. |
+| 8 | high | operator | none | Abandoned | The review sessions. Not done as a step of this phase: moved out of the plan on 2026-11-18 and continuing outside it, so the step is abandoned rather than pending. See Scope and brief 8. |
 | 9 | low | management | none | Complete | Record the Result. See brief 9. |
 
 Step 1 comes first, because step 2's `include` order mirrors the

@@ -687,7 +687,12 @@ because the following statements will be true:
 * Copy and paste of text work in both directions, with RDP
   connected to the same session. Resizing the ryll window resizes
   the desktop on an X server that allows it; on xrdp the desktop
-  follows the RDP client's size, and andris says so.
+  follows the RDP client's size, and andris says so. *Met in phase
+  7:* the end-to-end clipboard check crossed both ways at 133 B,
+  6,196 B and 1.5 MB (the last through INCR, in two pieces) in 0.1 to
+  0.3 s each way, two lines set in ryll pasted onto FreeRDP's display
+  in 0.16 to 0.48 s, and the soak saw xorgxrdp refuse the resize with
+  andris reporting it, which is the documented behaviour.
 * Andris is adopted into development's review tracking, with a
   reading guide, so that whole-file human review of it is possible
   and measurable. *Met in phase 11.* Whole-file coverage itself is
@@ -699,15 +704,26 @@ because the following statements will be true:
   audio. *Met in phase 10:* step 7's check, and 33 streams with sound
   during the soak.
 * CI exercises andris end to end against Xvfb with ryll headless,
-  and through kerbside.
+  and through kerbside. *Met in phase 10:* `ci.yml` carries both the
+  Xvfb lane driven by `ryll --headless` and the `e2e-kerbside` job
+  ("Through kerbside"), and both are required by `can_merge`. Phase
+  12 noted the limit of that coverage: the real X11 input and cursor
+  paths have no test in either lane (#90).
 * `docs/` describes running andris alongside xrdp, without
-  reference to plan phases.
+  reference to plan phases. *Met:* `docs/xrdp.md` covers it, and
+  phase 12's documentation review found no plan-phase reference in
+  any document outside `docs/plans/`, nor in any code file. The two
+  apparent hits cite shakenfist/development's "Adopting a repository"
+  procedure rather than this plan.
 * The daily consistency audit runs against andris and files no
   issues, other than `review-coverage`. That one stays open while
   whole-file review is outstanding, which will be for as long as the
   reading takes: the audit has no exemption mechanism, and the issue
   is the reading's work queue rather than a defect in this plan's
-  work.
+  work. *Met once phase 12 merges:* the only other audit issue open
+  during this plan, #85 on the push-audit file's stale shared block,
+  is closed by phase 12's own pull request, which is what brought
+  that block current.
 
 ### Items deferred from the push audit
 

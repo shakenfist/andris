@@ -28,6 +28,7 @@ In scope:
   the file does and what to look at.
 - **Adding andris to development's table of adopters**, as one small
   pull request in shakenfist/development.
+
 Out of scope:
 
 - **The whole-file review sessions themselves.** Adopting the tooling

@@ -383,8 +383,8 @@ run in parallel. 12f needs all of them.
 | 12d | low | sonnet | none | Wave 2's mechanical scan plus the *Style conformance -- judgment portion* brief from `PUSH-AUDIT.md`, against `whole.patch` from step 12b rather than a revision range. Mechanical, over added lines only: TODO, FIXME, HACK and XXX; new `#[allow(dead_code)]`; new `unsafe` blocks and new `#[allow(unsafe_code)]`; new `.unwrap()` and `.expect()` outside `#[cfg(test)]`. The expected shape, from the survey, is small: three TODO-family comments in `andris/src` and `scripts` on current `develop`, and exactly three `allow(unsafe_code)` sites -- `platform/pulse/ffi.rs` module-wide, `platform/qemu/mod.rs` and `platform/x11/mod.rs` -- against a crate-wide `#![deny(unsafe_code)]`. A scan that finds many more has matched test code or comments; say so rather than reporting the count. Then the style-conformance judgment part, verbatim from the runbook, with its four andris-specific invariants: every SPICE message type andris sends is named in ryll's `logging::message_names` tables (a type ryll does not model is **blocking** -- kerbside terminates the session on it); nothing depends on `shakenfist-spice-renderer`; platform concerns sit behind their traits rather than being called from protocol code; and no field silently changed units without a rename or a doc comment. Report, do not fix. |
 | 12e | high | sonnet for 2a-1, 2a-2, 2b, 2c; opus for 2d-1, 2d-2 | none | Six judgment agents from `PUSH-AUDIT.md`'s wave 2, run in parallel, each given a **patch file path** from step 12b rather than a revision range, and each using the runbook's brief verbatim plus the additions below. All six: the patches are the accumulated diff of phases 0 to 11 as they landed between 2026-10-08 and 2026-10-28; report what the patch shows and do **not** check it against the current tree -- that is step 12f's job, and six agents redundantly doing it is the waste this split exists to avoid. All six: the `source-file-size` block in the runbook is the one at `HEAD` after step 12a, which is v2. **2a-1** (code quality, `server.patch`): twelve phases layered onto the same modules, so the duplication to look for is across channel handlers -- `channel.rs`, `display.rs`, `inputs.rs`, `agent.rs`, `playback.rs`, `session.rs` and `updates/` -- and wire handling that belongs in ryll's `shakenfist-spice-protocol` or `shakenfist-spice-compression` rather than here. Under v2's rule, read the whole of each file the patch touches, not only the diff: `updates/stream.rs` is 1,681 lines and over the 1,500 line that wants a stated reason, and `display.rs` (1,189), `agent.rs` (1,023), `channel.rs` (920) and `stats.rs` (845) are over 800. Say for each whether the length has a seam to split along. **2a-2** (code quality, `platform.patch` + `core.patch`): the X11, synthetic and QEMU backends implement the same traits, so look for logic that should sit in `platform/mod.rs` and is instead repeated per backend, and for the synthetic backend drifting from what the real one does. Whole-file reading again: `clipboard.rs` (1,362 -- issue #15 already proposes splitting it, so confirm or correct that rather than re-filing), `synthetic/mod.rs` (1,309), `damage.rs` (1,296), `randr.rs` (1,061), `platform/mod.rs` (989), `config.rs` (1,097) and `install.rs` (949). **2b** (test review, `tests.patch` + `whole.patch` for context): the runbook's question that matters most here is whether everything andris writes to the wire is round-trip tested against the parser ryll's client actually uses. Enumerate the message types the server sends and say which are round-tripped, which are asserted only on bytes, and which are untested. Also: four test files are over 800 lines (`stream.rs` 1,110, `x11.rs` 950, `agent.rs` 911, `display.rs` 887); say whether they have grown into integration suites that want splitting. Distinguish "untested" from "untestable on CI" -- the X11 and PulseAudio paths differ there -- because they are different findings. **2c** (documentation review, `docs.patch` plus `harness.patch` for the build and CI facts): the plan-reference invariants are the ones to check hardest, since this repository has just finished eleven phases -- grep the documentation slice and the code slices for "phase <number>" and for `docs/plans` or `PLAN-` citations outside `docs/plans/`, and report each as a finding with its line. Also check that `ARCHITECTURE.md` and `AGENTS.md` have not grown content belonging in `docs/`, that `README.md` is still a pitch, and that no document describes planned behaviour as if it exists. `docs/plans/**` is deliberately not in your patch (see decision 6). **2d-1** (security, opus, high effort, `server.patch`): the untrusted-input surface. Every byte a client sends is attacker-controlled. Check the channel readers for unchecked indexing, allocation sized from client-supplied lengths, and overflow in size arithmetic; the ticket path for a file read whose permissions are not checked, a ticket that reaches a log, a comparison that leaks timing, and any path that reaches a channel before authentication succeeds; the listener for a non-loopback bind that can run without TLS, and for certificate and key handling; the flow control and stream machinery for unbounded memory, descriptor leaks or CPU spin driven by a slow or hostile client; and the new `Arc`/`Mutex`/atomic patterns for deadlock and race. **2d-2** (security, opus, high effort, `platform.patch` + `core.patch`): where client bytes become effects on the operator's real desktop. XTEST input injection -- can a client reach input the SPICE session should not grant, or the X server's credentials? The clipboard in both directions, including what leaves the desktop unasked (issue #14 covers password-manager hints; confirm the surface rather than re-filing). RandR geometry from client-supplied monitor configuration. The three `allow(unsafe_code)` sites -- `platform/pulse/ffi.rs`, `platform/qemu/mod.rs`, `platform/x11/mod.rs` -- for documented and sound invariants, correct `Send`/`Sync` claims on FFI handles, and lifetime of shared-memory segments in `x11/shm.rs` and `qemu/shm.rs`. `install.rs` writes a systemd unit: check the paths it builds from configuration. |
 | 12f | high | management (planned: opus) | none | Triage. Take every finding from 12c, 12d and 12e and classify each against **current `develop`** as `still-present`, `already-fixed` or `moved`. All audited files are still at the same paths, and the drift is small -- the newest landing is three weeks old, and the only things that have touched `develop` since are Renovate bumps, two review-tracking template re-syncs (#65, #66), one consistency-fix pull request (#71) and the prune bot. So assume a finding is live unless you can point at what fixed it: `already-fixed` **requires** naming the commit or the current code that resolves it, and a finding you cannot locate stays `still-present` for a human to look at. For each `still-present` finding give the current file and line. Check each against the open issue list before reporting it as new -- #13 (adversarial agent tests), #14 (clipboard password-manager hints), #15 (clipboard module split), #25 (waiting for a local X display) and #62 (D-Bus spike deferred work) already exist, and a finding that restates one of those should say so. Output one table: finding, source agent, severity, status, current location, existing issue if any. |
-| 12g | low | sonnet | none | Record the derivation in the master plan so it never has to be done again, in its own commit, subject "Record the push audit's range derivation." The `Merged` column is already complete, so this step adds to the phase 12 section the 16 landings as the audit range, the empty-tree form phase 0 needs and why, and the seven-slice partition with its numbers. Put commits and ranges in that section, not in the `Status` column, which holds one vocabulary term. Do not restate the findings here; they go in step 12h's section. |
-| 12h | medium | management | none | Management step, not a sub-agent step. Three parts. (i) Review 12f's table, decide fix-or-decline for every finding, and record the outcome in the master plan under a new *Items deferred from the push audit* heading, with a reason in writing for each declination. If the audit found nothing, that is one sentence and a real result. (ii) Fill in the master plan's *Bugs fixed during this work* section, which currently names two ryll bugs from phase 2 and nothing since -- twelve phases either fixed things or did not, and both are answers. (iii) Work through the eight success criteria one at a time and record a verdict with evidence for each, per decision 8. Then set the master plan's status and its `docs/plans/index.md` row: `Complete` only if every criterion is met and every finding is resolved or declined; otherwise `In progress` with the reason named in the plan. Note that the consistency criterion now reads "files no issues other than `review-coverage`", and that #85 is closed by this phase's own pull request. Fixes land as their own pull request; this step decides and records. |
+| 12g | low | management (planned: sonnet) | none | Record the derivation in the master plan so it never has to be done again, in its own commit, subject "Record the push audit's range derivation." The `Merged` column is already complete, so this step adds to the phase 12 section the 16 landings as the audit range, the empty-tree form phase 0 needs and why, and the seven-slice partition with its numbers. Put commits and ranges in that section, not in the `Status` column, which holds one vocabulary term. Do not restate the findings here; they go in step 12h's section. |
+| 12h | medium | management | none | Management step, not a sub-agent step. Three parts. (i) Review 12f's table, decide fix-or-decline for every finding, and record the outcome in the master plan under a new *Items deferred from the push audit* heading, with a reason in writing for each declination. If the audit found nothing, that is one sentence and a real result. (ii) Fill in the master plan's *Bugs fixed during this work* section, which currently names two ryll bugs from phase 2 and nothing since -- twelve phases either fixed things or did not, and both are answers. (iii) Work through the nine success criteria one at a time and record a verdict with evidence for each, per decision 8. Then set the master plan's status and its `docs/plans/index.md` row: `Complete` only if every criterion is met and every finding is resolved or declined; otherwise `In progress` with the reason named in the plan. Note that the consistency criterion now reads "files no issues other than `review-coverage`", and that #85 is closed by this phase's own pull request. Fixes land as their own pull request; this step decides and records. |
 
 ### Execution notes
 
@@ -591,10 +591,54 @@ would have to rediscover the context. So the triage is below rather
 than in a seventh report, and the plan's 12f row is marked as having
 run this way.
 
-**Classification.** All 29 findings are `still-present`. None is
-`already-fixed` or `moved`: nothing has landed on `develop` since
-`76e444c` except this phase's own commits, and the findings were read
-off that tree.
+**Classification.** There are **32** findings, not the 29 first
+recorded here: the earlier count was taken from the grouping below
+rather than from the finding tables, and it dropped T4 and S6. All 32
+are `still-present`. None is `already-fixed` or `moved`: nothing has
+landed on `develop` since `76e444c` except this phase's own commits,
+and the findings were read off that tree.
+
+The per-finding table step 12f's brief asked for, with the current
+location a follow-up fix will need:
+
+| Id | Current location | Tracked in |
+|----|------------------|------------|
+| S1 | `server/mod.rs:77-87`, `admit()`, `accept_loop` `:502-505` | #87 |
+| S2 | `server/link.rs:263-277`, with `:241-259` | #92 |
+| S3 | `server/agent.rs:523-545` into `server/display.rs:645-700` | #88 |
+| S4 | `server/agent.rs:103-110` and `~700-712` | #92 |
+| S5 | `server/keymap.rs:189-196`, reached from `:148` | #92 |
+| S6 | `server/channel.rs:244-259`; `server/inputs.rs:437-447`; `config.rs:209`; `server/link.rs:276-294` | #92, in its informational paragraph |
+| X1 | `platform/x11/clipboard.rs:572-577` and `:713-734`; targets at `:199-205` | #14 |
+| X2 | `config.rs`, by absence (no clipboard option exists) | #91 |
+| X3 | `platform/mod.rs:91-96`, used at `x11/clipboard.rs:683` | #91 |
+| X4 | `platform/x11/randr.rs:355` | #88 |
+| X5 | `platform/x11/randr.rs:512-540` | #92 |
+| X6 | `install.rs:330-350`, then `:355` | #92 |
+| Q1 | `server/main_channel.rs:362-373` and `:426-437`; `server/inputs.rs:~522-537`; `server/channel.rs:603` | #93 |
+| Q2 | `server/stats.rs:189`, `:341`, `:391`, `:502`, `:515` | #93 |
+| Q3 | `server/cursor.rs:83-88`; `server/playback.rs:488-493`; `server/inputs.rs:126-129` | #93 |
+| Q4 | `server/display.rs`, `frame()` and `refresh()` | #93 |
+| P1 | `platform/synthetic/mod.rs:249-252`, against `platform/mod.rs:564`, `:666` | #89 |
+| P2 | `platform/synthetic/mod.rs:504`, against `platform/x11/input.rs:30-90` | #89 |
+| P3 | `platform/synthetic/mod.rs:569`, against `platform/x11/clipboard.rs:373` | #89 |
+| P4 | `platform/synthetic/mod.rs:541-558`, against `platform/x11/randr.rs:87-93` | #89 |
+| P5 | `platform/x11/input.rs:30-90`, `platform/x11/mod.rs:129-137` | #89 |
+| P6 | `platform/x11/cursor.rs:62-110`; `damage.rs:165-215`; `clipboard.rs:572-632` | #93 |
+| P7 | `lib.rs:59-77` with `platform/synthetic/mod.rs:234-244` | #93 |
+| T1 | `server/agent.rs:774`; absent from `andris/tests/` | #13 |
+| T2 | `andris/tests/agent.rs`, by absence | #13 |
+| T3 | `andris/tests/inputs.rs` and `cursor.rs`, by absence | #13 |
+| T4 | `andris/tests/main_channel.rs:242-253`, `:285-319`; `stream.rs:667-671`, `:825`, `:932-961` | #90 |
+| T5 | `andris/tests/x11.rs`, `andris/tests/pulse.rs` | #90 |
+| T6 | `platform/x11/input.rs`, `platform/x11/cursor.rs`, by absence | #90 |
+| D1 | `AGENTS.md:39`; `docs/index.md:42`; `ARCHITECTURE.md:174` | #94 |
+| D2 | `ARCHITECTURE.md`, the component table | #94 |
+| D3 | `ARCHITECTURE.md:23`; `docs/running.md:346`, `:350`; `docs/reading-guide.md:194` | #94 |
+
+T4 and S6 were the two the first count missed. S6 was in fact already
+carried in #92's informational paragraph; T4 was tracked nowhere and
+is added to #90, which is the test issue it belongs with.
 
 **Against the open issues.** Five issues already exist that findings
 touch, and the audit refines rather than duplicates them:
@@ -615,11 +659,60 @@ per finding, because several share a cause:
 | A. Handshake permits can be starved | S1 | On its own: it is the only finding with an unauthenticated remote denial of service, and its fix changes a documented invariant in four files |
 | B. Client-driven resize is unbounded | S3, X4 | One defect, seen from both halves. One debounce fixes both |
 | C. The synthetic backend has drifted | P1, P2, P3, P4, P5 | One cause -- the real backends grew and the stand-in did not -- and P5's shared `InputQueue` is part of the fix for P2 |
-| D. Real-X paths are untested and skips are silent | T5, T6 | Both are "CI reports green for code it never ran" |
+| D. Real-X paths are untested, skips are silent, and some tests assert on log text | T5, T6, T4 | The first two are both "CI reports green for code it never ran". T4 rides along because it is the same files and the same reviewer's pass |
 | E. Clipboard exposure controls | X2, X3 | Both are operator-facing choices about clipboard sharing, decided together |
-| F. Smaller server hardening | S2, S4, S5, X5, X6 | Five independent low-severity items, cheap together, none worth its own pull request |
+| F. Smaller server hardening | S2, S4, S5, S6, X5, X6 | Independent low-severity items, cheap together, none worth its own pull request. S6's four informational items ride in the issue's closing paragraph |
 | G. Accretion tidy-ups | Q1, Q2, Q3, Q4, P6, P7 | Pure code quality, no behaviour change |
 | H. Documentation consolidation | D1, D2, D3 | One pass over `ARCHITECTURE.md` and the duplicated numbers |
+
+**The file-size dimension, which is why the runbook was brought
+current.** Decision 2 fixed `source-file-size` to v2 before the audit
+ran because v2 tells the auditor to read whole files rather than only
+the diff, and to apply the 1,500-line ratchet by hand where a
+repository has no ratchet, as andris does not. That dimension produced
+a verdict for every file, and the verdicts belong here rather than
+only in the issue they were summarised into:
+
+| File | Lines | Seam | Verdict |
+|------|-------|------|---------|
+| `server/updates/stream.rs` | 1,681 | `RateControl`, `RateEvent`, `RateReason`, `RateChange` and the rate constants to `updates/rate.rs`, with their tests following | **Over 1,500, so it wants a stated reason to stay whole.** It is also the most-edited file in the plan. Split it when it is next touched |
+| `platform/x11/clipboard.rs` | 1,362 | follow/serve, as the module doc's own headings: `follow.rs` and `serve.rs` | Split advisable. This is #15, confirmed and refined with the file list |
+| `platform/synthetic/mod.rs` | 1,309 | pixel rendering (`Fill`, `Scene`, `render`, `photo_pixel`, `animated_pixel`) to `render.rs` | Optional. About 715 lines are non-test |
+| `platform/damage.rs` | 1,296 | `Rectangle`/`Region` geometry against `Hub`/`DamageSubscription` | Justified. The two halves are independent, so a split is optional |
+| `scripts/e2e-drive.py` | 1,241 | not assessed | **No verdict: see below** |
+| `server/display.rs` | 1,189 | the stream lifecycle (`start_stream` through `disable_streams`, about 260 lines) to `display/streaming.rs` | The clearest split on the list |
+| `andris/tests/stream.rs` | 1,110 | the `Viewer` harness to `tests/support/stream.rs`, as `support/display.rs` already does | Justified; split advisable |
+| `config.rs` | 1,097 | weak: the private-file and ticket helpers | Justified. The length is mostly tests |
+| `platform/x11/randr.rs` | 1,061 | the pure planning half (clamp, plan, verdict) against the X-calling half | Optional `randr/plan.rs`; one concept, so justified as is |
+| `scripts/e2e-xrdp-drive.py` | 1,044 | not assessed | **No verdict: see below** |
+| `server/agent.rs` | 1,023 | the flow-control types, and the clipboard handling to `agent/clipboard.rs` | Marginal, low priority. Length partly justified by protocol comments that should stay |
+| `platform/mod.rs` | 989 | possible: `Frame`, `Patch`, `Capture` | Justified. It is the contract module |
+| `andris/tests/x11.rs` | 950 | damage/capture/RandR against clipboard | Justified. Only six tests, so it is helper-heavy |
+| `install.rs` | 949 | none natural | Justified |
+| `server/channel.rs` | 920 | one cohesive transport | Justified |
+| `platform/x11/mod.rs` | 919 | the shared thread plumbing to `x11/thread.rs`, leaving about 480 lines | Split advisable |
+| `andris/tests/agent.rs` | 911 | `agent_clipboard.rs` if #13 adds ten more cases | Justified; leave |
+| `andris/tests/display.rs` | 887 | shared parts are already in `support/display.rs` | Justified; leave |
+| `server/stats.rs` | 845 | only `Reporter` and `summary`, not worth a file | Justified. See Q2 for the real problem in it |
+
+Two notes on that table. The agents reported their line counts split
+into non-test and test, and used the non-test figure to call
+`channel.rs` and `stats.rs` justified. The shared block exempts
+generated files, vendored trees and data tables -- not tests -- so the
+`Lines` column above is the whole file, which is what the rule
+measures; the non-test split is useful for deciding whether a split is
+worth doing, not for deciding whether the rule applies.
+
+**And a gap this phase should own rather than bury: the two Python
+end-to-end drivers got no size verdict.** `scripts/e2e-drive.py`
+(1,241 lines) and `scripts/e2e-xrdp-drive.py` (1,044) are both over
+the advisory line, and both fell in the `harness` slice, which
+decision 3 gave only to the documentation agent -- for checking
+documented build and CI facts -- and to no code-quality agent. So the
+split by area left 12,039 insertions of scripts, CI and packaging
+without a code-quality or size review. That is a real hole in
+decision 3, it is recorded in #93, and a future audit of this
+repository should give the harness slice a code-quality reviewer.
 
 **Out of range, so an issue rather than a finding.**
 `ARCHITECTURE.md`'s "Platform seams" commitment names two backends
@@ -664,7 +757,7 @@ is what every remote-desktop server does, and it should be stated in
   the brief says to change nothing else, and the step is its own
   commit so the diff is reviewable at a glance.
 - **The phase quietly closes a plan that is not closed.** Six of
-  eight success criteria carry no evidence either way.
+  nine success criteria carry no evidence either way.
   *Mitigation:* decision 8 and step 12h(iii), and a definition-of-done
   item that asserts each criterion has a verdict with evidence
   rather than a tick.
@@ -752,19 +845,26 @@ starts.
 
 **Gate before step 12h sets the status.** Whether this plan is
 `Complete` is the operator's call, not an audit's. Bring them the
-eight criteria with verdicts and let them decide.
+nine criteria with verdicts and let them decide.
 
 ## Result
 
 **Complete, 2026-11-18.** Wave 1 passed and there was no blocking
-finding. Twenty-nine findings, all still present on `develop`, all
-tracked: eight new issues (#87 to #94) grouped by cause, and three
-existing issues sharpened (#13, #14, #15). Nothing was declined.
+finding. **32 findings**, all still present on `develop`, all tracked:
+eight new issues (#87 to #94) grouped by cause, and three existing
+issues sharpened (#13, #14, #15). Nothing was declined. The first
+version of this Result said 29, counted from the grouping rather than
+the finding tables, and so dropped T4 and S6; the per-finding table in
+the triage section is now the authority and reconciles to 32.
 
 The assembled patch matched the plan's four gate numbers exactly --
 365 diff rows, 63,239 insertions, 2,560 deletions, 149 distinct paths
--- verified twice, and the seven slices partition it with every sum
-balancing. The derivation is recorded in the master plan so it never
+-- verified twice, once by `--numstat` over the 16 landings and again
+by `git apply --stat` on each written patch file. The seven slices
+partition it with rows, insertions and deletions each summing to those
+totals: server 46/13,012/720, platform 47/12,120/318, core
+15/2,382/95, tests 30/8,361/529, harness 119/12,039/371, docs
+61/4,889/310, plans 47/10,436/217. The derivation is recorded in the master plan so it never
 has to be done again, including the empty-tree form phase 0 needs
 because its range starts at the repository's root commit.
 
@@ -789,6 +889,12 @@ The three findings worth a reader's attention, in order:
 3. **#14 as sharpened.** Andris copies the operator's clipboard into
    its own memory at thread start and on every ownership change, with
    no client connected and before any ticket is presented.
+
+One thing the split got wrong, recorded in the triage section: the
+`harness` slice -- 12,039 insertions of scripts, CI and packaging --
+went to the documentation agent and to no code-quality agent, so two
+Python end-to-end drivers over 1,000 lines each got no size verdict.
+That is a hole in decision 3, not in an agent's work.
 
 The clean areas are recorded in full above, because an audit that
 lists only problems cannot be checked. The ones worth repeating: no

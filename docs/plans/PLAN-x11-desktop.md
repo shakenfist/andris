@@ -170,8 +170,8 @@ Each has the default this plan takes if nobody answers.
 
 ## Execution
 
-Phases 2 and 3 land entirely in ryll; phases 7, 8 and 9 land work
-in both repositories; the rest land here. A phase that lands in ryll
+Phases 2, 3, 7, 8 and 9 each land work in ryll as well as here; the
+rest land here only. A phase that lands in ryll
 records `ryll <sha> (#pr)` in `Merged` and is audited in ryll as
 part of the pull request that lands it, so phase 12 cites that audit
 rather than repeating it. Phase plans are written with `/next-phase`
@@ -730,7 +730,7 @@ because the following statements will be true:
 Phase 12 ran `PUSH-AUDIT.md` over this plan's accumulated diff --
 63,239 insertions across 149 files in 16 landings -- in two mechanical
 waves and six judgment reviews. **Wave 1 passed and there was no
-blocking finding.** Twenty-nine findings were recorded, all still
+blocking finding.** Thirty-two findings were recorded, all still
 present on `develop`, and every one is tracked. None is declined:
 each became a GitHub issue, or sharpened one that already existed.
 The finding detail and the clean areas are in
@@ -744,9 +744,9 @@ Grouped by cause, because several findings share one:
 | #87 | Two source addresses can hold every handshake permit and lock all other clients out, unauthenticated and indefinitely. The per-peer cap's stated guarantee does not survive a second address, and four documents repeat the reasoning | S1 |
 | #88 | Client-driven resize is unthrottled: a client can thrash the operator's real screen while making the server reallocate and re-encode the whole desktop each time. Found independently by both security reviewers | S3, X4 |
 | #89 | The synthetic platform backend has drifted from the X11 one on `Gone`, the input-queue bound, the clipboard cap and resize clamping, so tests using the stand-in are weaker than they look | P1-P5 |
-| #90 | CI reports green for the X11 and audio paths it never runs: those tests skip silently, and the real XTEST input sink and XFixes cursor source have no test at all though Xvfb could run them | T5, T6 |
+| #90 | CI reports green for the X11 and audio paths it never runs: those tests skip silently, and the real XTEST input sink and XFixes cursor source have no test at all though Xvfb could run them. Also the tests that assert on log text and formatting | T4, T5, T6 |
 | #91 | The desktop clipboard cannot be turned off, and a crackable 32-bit hash of its text reaches debug logs | X2, X3 |
-| #92 | Five small server hardening items: a pre-authentication session-id oracle, a 48 MiB transient on the lossy UTF-8 path, log amplification in the key decoder, a failed resize leaving a changed DPI, and the ticket created in a directory known to be open to others | S2, S4, S5, X5, X6 |
+| #92 | Small server hardening items: a pre-authentication session-id oracle, a 48 MiB transient on the lossy UTF-8 path, log amplification in the key decoder, a failed resize leaving a changed DPI, the ticket created in a directory known to be open to others, and four informational items in its closing paragraph | S2, S4, S5, S6, X5, X6 |
 | #93 | Scaffolding duplicated across the phases -- the `Stats` field list written five times above all -- and the oversize files, each with a seam named | Q1-Q4, P6, P7 |
 | #94 | Documentation facts stated in two places that will drift, and `ARCHITECTURE.md`'s stale backend count | D1-D3 |
 
@@ -768,7 +768,13 @@ is ryll's to resolve and is filed there as ryll#738.
 
 Why this plan is not `Complete`: two of its nine success criteria --
 the 2% idle CPU figure and the 30 fps scrolling figure -- were never
-measured, as noted against them above. They are the plan's only
+measured, as noted against them above. #87 is a third reason to
+hesitate, and a better-evidenced one: an unauthenticated client can
+deny the service to every other client, which bears on "replace RDP
+for dogfooding" more directly than either unmeasured figure. It is
+filed rather than fixed here because the shared block puts findings in
+their own pull request, but a reader deciding whether this plan is
+finished should weigh it alongside the two criteria. They are the plan's only
 quantitative claims about whether andris is good enough to replace
 RDP for daily use, and the week's soak demonstrated the thing in
 practice without ever producing either number. The status stays `In

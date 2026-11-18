@@ -25,15 +25,24 @@
 //! # Limits on unauthenticated peers
 //!
 //! From accept until its handshake ends, a connection holds a slot for
-//! its source address, of which there are [`MAX_HANDSHAKES_PER_PEER`],
-//! and a permit: one of [`MAX_HANDSHAKES`] shared by the serving
-//! listeners, or on a plain listener that only redirects to TLS, one of
-//! its own [`MAX_REDIRECTS`]. With none free, a new connection is closed
-//! at once. So one peer cannot take every permit, and a flood of the
-//! redirect port cannot starve the TLS listener. The first stage of a
-//! handshake, which a peer can stall having proved nothing, has a shorter
-//! time limit than the rest; see [`HandshakeTimeouts`]. At most
-//! [`MAX_KEY_GENERATIONS`] RSA keys are generated at once.
+//! its source address and a permit: one of [`MAX_HANDSHAKES`] shared by
+//! the serving listeners, or on a plain listener that only redirects to
+//! TLS, one of its own [`MAX_REDIRECTS`]. With none free, a new
+//! connection is closed at once, and a flood of the redirect port cannot
+//! starve the TLS listener.
+//!
+//! How many slots one source address may hold is not fixed. While the
+//! pool it draws on is quiet it may hold [`MAX_HANDSHAKES_PER_PEER`];
+//! as the pool fills, its allowance shrinks to a single slot. See
+//! [`peer_allowance`], which explains why a fixed cap bounded nothing:
+//! an attacker chooses how many addresses to use, so a cap of four
+//! against a pool of eight meant two addresses could hold every permit
+//! and keep every other client out, having authenticated nothing.
+//!
+//! The first stage of a handshake, which a peer can stall having proved
+//! nothing, has a shorter time limit than the rest; see
+//! [`HandshakeTimeouts`]. At most [`MAX_KEY_GENERATIONS`] RSA keys are
+//! generated at once.
 
 pub mod agent;
 pub mod channel;
@@ -73,22 +82,27 @@ use opcodes::{CursorOpcode, DisplayOpcode, InputsOpcode, MainOpcode, PlaybackOpc
 use session::{Cancel, Session, SessionRegistry};
 
 /// How many connections may be in their handshake at once, across the
-/// listeners that serve SPICE.
-pub const MAX_HANDSHAKES: usize = 8;
+/// listeners that serve SPICE. A handshake is short-lived and costs a
+/// socket and a task, so this is set well above
+/// [`MAX_HANDSHAKES_PER_PEER`] rather than at the smallest workable
+/// number: [`peer_allowance`] can only make slots expensive if one
+/// address's share of the pool is small.
+pub const MAX_HANDSHAKES: usize = 64;
 
-/// How many connections from one source address may be in their
-/// handshake at once, across every listener. Four lets a client link its
-/// main channel and then display, cursor and inputs in parallel, as
-/// spice-gtk does, including through a kerbside on the same host whose
-/// every link comes from one address; it still keeps one address from
-/// holding all [`MAX_HANDSHAKES`]. IPv6 addresses count by their /64,
-/// which is what one host usually has to pick from.
+/// The most handshakes one source address may have in progress at once,
+/// across every listener, which is what it is allowed while the pool is
+/// quiet. Four lets a client link its main channel and then display,
+/// cursor and inputs in parallel, as spice-gtk does, including through a
+/// kerbside on the same host whose every link comes from one address.
+/// [`peer_allowance`] lowers it as the pool fills. IPv6 addresses count
+/// by their /64, which is what one host usually has to pick from.
 pub const MAX_HANDSHAKES_PER_PEER: usize = 4;
 
 /// How many connections a plain listener that only redirects to TLS may
 /// be answering at once. Apart from [`MAX_HANDSHAKES`], so that a flood
-/// of the redirect port cannot starve the TLS listener.
-pub const MAX_REDIRECTS: usize = 4;
+/// of the redirect port cannot starve the TLS listener, and above
+/// [`MAX_HANDSHAKES_PER_PEER`] for the same reason that pool is.
+pub const MAX_REDIRECTS: usize = 16;
 
 /// How many RSA ticket keys may be generated at once.
 pub const MAX_KEY_GENERATIONS: usize = 2;
@@ -174,6 +188,30 @@ fn peer_key(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// How many handshakes one source address may have in progress, given
+/// that `free` of a pool's `limit` permits are unused.
+///
+/// While at least half the pool is free -- the ordinary case, since a
+/// handshake lasts milliseconds -- this is [`MAX_HANDSHAKES_PER_PEER`],
+/// so a client linking its channels in parallel is unaffected. Past that
+/// it falls with the free permits and reaches one when the pool is nearly
+/// full.
+///
+/// The point is what it costs an attacker. A fixed cap per address
+/// bounds one address and nothing else, because the attacker decides how
+/// many addresses to use; it is the ratio of the cap to the pool that
+/// decides how many it needs. Shrinking the allowance as the pool fills
+/// means the last permits cost one address each, so holding the pool
+/// closed takes tens of addresses instead of two. A flood from many
+/// addresses still succeeds, and `docs/running.md` says so.
+fn peer_allowance(free: usize, limit: usize) -> usize {
+    let limit = limit.max(1);
+    if free * 2 >= limit {
+        return MAX_HANDSHAKES_PER_PEER;
+    }
+    (free * 2 * MAX_HANDSHAKES_PER_PEER / limit).clamp(1, MAX_HANDSHAKES_PER_PEER)
+}
+
 /// How many handshakes each source address has in progress.
 #[derive(Debug, Default)]
 struct PeerSlots {
@@ -181,16 +219,17 @@ struct PeerSlots {
 }
 
 impl PeerSlots {
-    /// Take one of `ip`'s [`MAX_HANDSHAKES_PER_PEER`] slots, if one is
-    /// free.
-    fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Option<PeerSlot> {
+    /// Take a slot for `ip`, unless it already holds `allowance` of
+    /// them. The allowance comes from [`peer_allowance`] and so varies
+    /// with how full the pool is.
+    fn try_acquire(self: &Arc<Self>, ip: IpAddr, allowance: usize) -> Option<PeerSlot> {
         let key = peer_key(ip);
         let mut counts = self
             .counts
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let count = counts.entry(key).or_insert(0);
-        if *count >= MAX_HANDSHAKES_PER_PEER {
+        if *count >= allowance {
             return None;
         }
         *count += 1;
@@ -444,21 +483,24 @@ impl Drop for ServerHandle {
 /// Take what a new connection from `peer` on a `kind` listener must hold
 /// for its handshake, or say why it cannot have it.
 fn admit(shared: &Shared, kind: &ListenerKind, peer: SocketAddr) -> Option<HandshakeSlot> {
-    let Some(peer_slot) = shared.peers.try_acquire(peer.ip()) else {
+    let (permits, limit) = match kind {
+        ListenerKind::Redirect => (&shared.redirects, MAX_REDIRECTS),
+        ListenerKind::Plain | ListenerKind::Tls(_) => (&shared.handshakes, MAX_HANDSHAKES),
+    };
+    let allowance = peer_allowance(permits.available_permits(), limit);
+    let Some(peer_slot) = shared.peers.try_acquire(peer.ip(), allowance) else {
         if let Some(refused) = shared.peer_refusals.should_log() {
             warn!(
                 %peer,
                 refused,
-                "a source address already has {MAX_HANDSHAKES_PER_PEER} handshakes in progress, \
-                 so its new connections are being closed (logged at most every {}s)",
+                allowance,
+                "a source address already has as many handshakes in progress as it is \
+                 allowed while the pool is this full, so its new connections are being \
+                 closed (logged at most every {}s)",
                 LogThrottle::INTERVAL.as_secs()
             );
         }
         return None;
-    };
-    let (permits, limit) = match kind {
-        ListenerKind::Redirect => (&shared.redirects, MAX_REDIRECTS),
-        ListenerKind::Plain | ListenerKind::Tls(_) => (&shared.handshakes, MAX_HANDSHAKES),
     };
     let Ok(permit) = permits.clone().try_acquire_owned() else {
         if let Some(refused) = shared.busy_refusals.should_log() {
@@ -695,18 +737,81 @@ mod tests {
         let one: IpAddr = "192.0.2.1".parse().unwrap();
         let two: IpAddr = "192.0.2.2".parse().unwrap();
         let held: Vec<PeerSlot> = (0..MAX_HANDSHAKES_PER_PEER)
-            .map(|_| slots.try_acquire(one).unwrap())
+            .map(|_| {
+                slots
+                    .try_acquire(one, MAX_HANDSHAKES_PER_PEER)
+                    .expect("a slot within the allowance")
+            })
             .collect();
-        assert!(slots.try_acquire(one).is_none());
+        assert!(slots.try_acquire(one, MAX_HANDSHAKES_PER_PEER).is_none());
         assert_eq!(slots.in_progress(one), MAX_HANDSHAKES_PER_PEER);
-        let other = slots.try_acquire(two).unwrap();
+        let other = slots
+            .try_acquire(two, MAX_HANDSHAKES_PER_PEER)
+            .expect("another address is unaffected");
         assert_eq!(slots.in_progress(two), 1);
 
         drop(held);
         assert_eq!(slots.in_progress(one), 0);
-        assert!(slots.try_acquire(one).is_some());
+        assert!(slots.try_acquire(one, MAX_HANDSHAKES_PER_PEER).is_some());
         drop(other);
         assert!(slots.counts.lock().unwrap().is_empty(), "idle entries go");
+    }
+
+    #[test]
+    fn a_quiet_pool_allows_a_client_every_parallel_link() {
+        assert_eq!(
+            peer_allowance(MAX_HANDSHAKES, MAX_HANDSHAKES),
+            MAX_HANDSHAKES_PER_PEER
+        );
+        // And still does while that client's own links are in progress,
+        // which is the case that must not regress.
+        assert_eq!(
+            peer_allowance(MAX_HANDSHAKES - MAX_HANDSHAKES_PER_PEER, MAX_HANDSHAKES),
+            MAX_HANDSHAKES_PER_PEER
+        );
+    }
+
+    #[test]
+    fn the_allowance_falls_to_one_slot_as_the_pool_fills() {
+        assert_eq!(
+            peer_allowance(MAX_HANDSHAKES / 2, MAX_HANDSHAKES),
+            MAX_HANDSHAKES_PER_PEER,
+            "half free is still the ordinary case"
+        );
+        assert!(peer_allowance(MAX_HANDSHAKES / 4, MAX_HANDSHAKES) < MAX_HANDSHAKES_PER_PEER);
+        assert_eq!(peer_allowance(1, MAX_HANDSHAKES), 1);
+        assert_eq!(peer_allowance(0, MAX_HANDSHAKES), 1, "never zero");
+    }
+
+    /// The property the allowance exists for, stated as what it costs an
+    /// attacker: how many source addresses are needed to hold every
+    /// permit, when each address takes everything it is allowed before
+    /// the next one starts. A flat cap would need only
+    /// `MAX_HANDSHAKES / MAX_HANDSHAKES_PER_PEER` of them -- two, with
+    /// the pool of eight and cap of four this replaced.
+    #[test]
+    fn holding_the_whole_pool_costs_more_addresses_than_a_flat_cap() {
+        let mut held = [0usize; 256];
+        for used in 0..MAX_HANDSHAKES {
+            let allowance = peer_allowance(MAX_HANDSHAKES - used, MAX_HANDSHAKES);
+            let next = held
+                .iter()
+                .position(|&n| n < allowance)
+                .expect("an address with room left");
+            held[next] += 1;
+        }
+        assert_eq!(
+            held.iter().sum::<usize>(),
+            MAX_HANDSHAKES,
+            "the pool was filled"
+        );
+        let addresses = held.iter().filter(|&&n| n > 0).count();
+        let flat_cap = MAX_HANDSHAKES / MAX_HANDSHAKES_PER_PEER;
+        assert!(
+            addresses > flat_cap,
+            "{addresses} addresses filled the pool, no better than the {flat_cap} \
+             a flat cap of {MAX_HANDSHAKES_PER_PEER} would have cost"
+        );
     }
 
     #[test]

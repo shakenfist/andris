@@ -272,28 +272,34 @@ async fn stop_waits_for_a_connection_still_in_its_handshake() {
 }
 
 #[tokio::test]
-async fn ninth_concurrent_handshake_is_refused() {
-    let server = TestServer::start().await;
+async fn a_handshake_past_the_pool_is_refused() {
+    // A long first stage, because the connections below never send a
+    // byte: the default three seconds would start expiring the earliest
+    // of them before the pool was full.
+    let server = TestServer::start_with_timeouts(HandshakeTimeouts {
+        first_stage: Duration::from_secs(30),
+        ..HandshakeTimeouts::default()
+    })
+    .await;
 
-    // Eight clients, from eight addresses so the per-address cap does not
-    // apply, link and then hold their handshakes open, never sending a
-    // ticket.
+    // One connection per address, so that each stays within its allowance
+    // however full the pool becomes. None of them sends anything, which
+    // is the case that matters: a permit is held from accept onwards, so a
+    // peer that has proved nothing holds one.
     let mut held = Vec::new();
     for n in 0..MAX_HANDSHAKES as u8 {
-        let mut client = TestClient::connect_from(server.addr(), loopback(10 + n)).await;
-        assert_eq!(
-            client.link(0, ChannelType::Main).await.error,
-            SpiceError::Ok
-        );
-        held.push(client);
+        held.push(tcp_from(server.addr(), loopback(64 + n)).await);
     }
-    assert_eq!(server.handle.handshakes_available(), 0);
+    wait_until("the handshake pool is full", || {
+        server.handle.handshakes_available() == 0
+    })
+    .await;
 
-    // A ninth is closed at once, before it sends anything.
-    let mut ninth = tcp_from(server.addr(), loopback(30)).await;
+    // One more is closed at once, before it sends anything.
+    let mut extra = tcp_from(server.addr(), loopback(200)).await;
     assert!(
-        closed_within(&mut ninth, PROMPTLY).await,
-        "the ninth connection was not closed promptly"
+        closed_within(&mut extra, PROMPTLY).await,
+        "the connection past the pool was not closed promptly"
     );
 
     // Releasing one handshake frees its permit for a new client.
@@ -302,7 +308,7 @@ async fn ninth_concurrent_handshake_is_refused() {
         server.handle.handshakes_available() == 1
     })
     .await;
-    let mut client = TestClient::connect_from(server.addr(), loopback(31)).await;
+    let mut client = TestClient::connect_from(server.addr(), loopback(201)).await;
     assert_eq!(
         client.link(0, ChannelType::Main).await.error,
         SpiceError::Ok

@@ -340,26 +340,33 @@ before it authenticates. A `.vv` file therefore needs `tls-port`,
 with or without `port`, and a client with one port field wants the
 TLS port in it.
 
-Unauthenticated connections are limited, so that a single peer
-cannot occupy every handshake slot. **These limits do not stop a
-determined client from locking others out:** with 8 slots overall and
-4 per address, two source addresses -- or two IPv6 /64s from one host
--- can hold every slot by connecting and sending nothing, after which
-other clients are refused. That is issue #87, and it is unfixed.
-Expose andris only where you would accept that.
+Unauthenticated connections are limited, so that a few peers cannot
+occupy every handshake slot. **The limits do not make andris proof
+against a distributed flood:** they raise the number of source
+addresses needed to hold every slot from two to about thirty, and an
+attacker with that many can still keep other clients out by
+connecting and sending nothing. Expose andris only where you would
+accept that.
 
 The limits themselves:
 
-- at most 8 connections may be in their handshake at once on the
+- at most 64 connections may be in their handshake at once on the
   listeners that serve SPICE;
 - with TLS configured, the plain listener's redirects have their own
-  limit of 4, so a flood of the plain port cannot starve the TLS one;
-- at most 4 connections from one address may be in their handshake
-  at once, on any listener. Four lets a client link its main channel
-  and then its display, cursor and inputs channels in parallel, as
-  spice-gtk does. It also means two addresses reach the overall limit
-  of 8, which is #87 above. An IPv6 address counts by its /64;
+  limit of 16, so a flood of the plain port cannot starve the TLS one;
+- at most 4 connections from one address may be in their handshake at
+  once, on any listener, and fewer as the pool fills: the allowance
+  falls with the free permits, reaching one when the pool is nearly
+  full. Four while the pool is quiet lets a client link its main
+  channel and then its display, cursor and inputs channels in
+  parallel, as spice-gtk does. An IPv6 address counts by its /64, so
+  one host with a routed /64 counts once;
 - at most 2 RSA keys for ticket encryption are generated at once.
+
+A fixed cap per address would bound one address and nothing else,
+since an attacker chooses how many addresses to use. Letting the
+allowance fall as the pool fills makes the last permits cost one
+address each, which is where the thirty above comes from.
 
 Connections past a limit are closed immediately, and the refusals
 are logged at most every 10 seconds. The first step of a handshake,
@@ -876,9 +883,12 @@ production use:
 Andris sends only message types that kerbside's allowlist accepts,
 so a session through kerbside needs no special configuration.
 Every connection through kerbside comes from kerbside's address, so
-the limit of 4 handshakes in progress per address applies to all of
-kerbside's clients together; that is enough for one client linking
-its channels in parallel.
+one address's allowance of handshakes in progress applies to all of
+kerbside's clients together: 4 while andris's handshake pool is
+quiet, which is enough for one client linking its channels in
+parallel, and fewer as the pool fills. A connection past the
+allowance is closed rather than queued, so several clients linking
+through one kerbside at the same moment may have to reconnect.
 
 ### Trying it with kerbside's demo stack
 

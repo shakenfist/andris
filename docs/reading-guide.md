@@ -192,9 +192,12 @@ The listeners and the task model. `Server::bind()` and `spawn()` start
 one accept task per listener; each connection gets one task that links
 it and then serves its channel. Look at the limits on unauthenticated
 peers in `admit()`: a connection holds one of `MAX_HANDSHAKES` permits
-and one of `MAX_HANDSHAKES_PER_PEER` slots for its source address (IPv6
-counted by /64) until its handshake ends, and a plain listener that only
-redirects to TLS has permits of its own. `LogThrottle` keeps a peer from
+and a slot for its source address (IPv6 counted by /64) until its
+handshake ends, and a plain listener that only redirects to TLS has
+permits of its own. `peer_allowance()` decides how many slots one
+address may hold -- `MAX_HANDSHAKES_PER_PEER` while the pool is quiet,
+falling to one as it fills -- and the comment there says why a fixed cap
+bounded nothing. `LogThrottle` keeps a peer from
 flooding the log. Look at `ServerHandle::stop()`: it waits for every
 task's `mpsc` sender to drop, then reads the lock state on the blocking
 pool purely as a barrier, because that read runs after every queued

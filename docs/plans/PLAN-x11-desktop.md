@@ -170,10 +170,12 @@ Each has the default this plan takes if nobody answers.
 
 ## Execution
 
-Phases 2 and 3 land in ryll; the rest land here. A phase that
-lands in ryll records `ryll <sha> (#pr)` in `Merged` and is audited
-in ryll as part of the pull request that lands it. Phase plans are
-written with `/next-phase` as each phase comes up.
+Phases 2 and 3 land entirely in ryll; phases 7, 8 and 9 land work
+in both repositories; the rest land here. A phase that lands in ryll
+records `ryll <sha> (#pr)` in `Merged` and is audited in ryll as
+part of the pull request that lands it, so phase 12 cites that audit
+rather than repeating it. Phase plans are written with `/next-phase`
+as each phase comes up.
 
 | Phase | Plan | Status | Merged |
 |-------|------|--------|--------|
@@ -189,7 +191,7 @@ written with `/next-phase` as each phase comes up.
 | 9. Audio | PLAN-x11-desktop-phase-09-audio.md | Complete | ryll `38c51ef` (#578); andris `d8f316a` (#27) |
 | 10. Packaging and dogfood soak | PLAN-x11-desktop-phase-10-packaging.md | Complete | andris `553ecfb` (#28), `c0617e9` (#29), `c36e87a` (#49) |
 | 11. Human review | PLAN-x11-desktop-phase-11-review.md | Complete | andris `568a43b` (#51); development `810ce4d` (#335) |
-| 12. Push audit | This file, below | Not started | |
+| 12. Push audit | PLAN-x11-desktop-phase-12-push-audit.md | Not started | |
 
 Rough sizing, as judgement rather than measurement: phases 0–5
 reach a usable LAN desktop in about three to four weeks; phases 6–9
@@ -556,9 +558,22 @@ work records it.
 
 ### Phase 12: Push audit
 
-Run `PUSH-AUDIT.md` over the merge commits recorded in the
-`Merged` column for the andris phases. For phases 2 and 3, cite the
-audits run in ryll's pull requests rather than repeating them.
+Detail is in
+[PLAN-x11-desktop-phase-12-push-audit.md](PLAN-x11-desktop-phase-12-push-audit.md).
+
+Run `PUSH-AUDIT.md` over the commits recorded in the `Merged` column
+for the andris phases -- 63,239 insertions across 149 files in 16
+landings, so the patch is split by area rather than handed to one
+agent whole. Phases 2, 3, 7, 8 and 9 each landed work in ryll as
+well; cite the audits run in ryll's pull requests for those rather
+than repeating them under andris's runbook.
+
+Two things the phase has to fix before it can run correctly, both
+found by its survey: `PUSH-AUDIT.md`'s `source-file-size` shared
+block is a version behind, and v2 changes what the auditor does
+(issue #85); and phase 0's recorded range starts at the repository's
+root commit, which has no parent, so the runbook's `git diff first^
+last` recipe cannot express it.
 
 ## Agent guidance
 
@@ -575,7 +590,11 @@ and 8 turn on protocol semantics, concurrency or heuristics and
 should be planned at high effort; phase 3 joined them when its
 survey found the LZ4 decoder had to be rewritten first. Phases 0, 1,
 6, 9, 10 and 11 follow established patterns and can be planned at
-medium effort.
+medium effort. Phase 12 should be planned at high effort: it was
+first written here as a wrapper around a runbook, but the
+accumulated diff is 63,239 insertions, nearly four times the largest
+closing audit this fleet has run, and splitting it so that no agent
+gets a skimmable patch is the work.
 
 ### Management session review checklist
 
@@ -649,6 +668,14 @@ file) and keep its status in step with the Execution table.
   deliberately not a phase: it is open-ended work with no end date,
   and the only thing a plan could add is a deadline that would be
   missed.
+- Templatising ryll's `tools/audit/` harness in
+  shakenfist/development, so that running a push audit is scripted
+  rather than a runbook followed by hand. Ryll has 1,546 lines of it
+  with its own tests, and the three central scripts carry no
+  reference to ryll or its crates, so they would port. Phase 12
+  declined to copy them into andris: importing a harness into the
+  repository whose runbook the audit is running is the wrong moment,
+  and a per-repository copy is how template drift starts.
 - A Wayland backend: PipeWire screen capture via
   xdg-desktop-portal, and libei for input.
 - Splitting ryll's shared crates (protocol, compression, usbredir)

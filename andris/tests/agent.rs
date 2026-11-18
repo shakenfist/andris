@@ -556,8 +556,18 @@ async fn clipboard_data_over_the_limit_is_dropped_and_the_channel_stays_open() {
 /// the length is checked before the conversion as well as after. It used
 /// to be checked only after, which meant an all-invalid 16 MiB body
 /// allocated about 48 MiB before being dropped for being too long.
-#[tokio::test]
+/// The server's tasks run on this test's one thread, so a subscriber set
+/// for the thread sees which of the two checks dropped each body.
+#[tokio::test(flavor = "current_thread")]
 async fn invalid_clipboard_text_is_dropped_by_whichever_check_catches_it() {
+    let logs = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
     let server = TestServer::start().await;
     let mut agent = AgentClient::ready(&server).await;
     let invalid = |len: usize| Clipboard {
@@ -572,6 +582,15 @@ async fn invalid_clipboard_text_is_dropped_by_whichever_check_catches_it() {
         .await;
     agent.sync(&server).await;
     assert_eq!(server.platform.clipboard_sets().unwrap(), 0);
+    let text = logs.text();
+    assert!(
+        text.contains("it is over the"),
+        "dropped before converting: {text}"
+    );
+    assert!(
+        !text.contains("replacing its invalid UTF-8"),
+        "it was converted first: {text}"
+    );
 
     // Under the limit, but a three-byte U+FFFD for each byte takes it over.
     agent
@@ -579,6 +598,11 @@ async fn invalid_clipboard_text_is_dropped_by_whichever_check_catches_it() {
         .await;
     agent.sync(&server).await;
     assert_eq!(server.platform.clipboard_sets().unwrap(), 0);
+    let text = logs.text();
+    assert!(
+        text.contains("replacing its invalid UTF-8"),
+        "the check after the conversion caught this one: {text}"
+    );
 
     // Short invalid text still crosses, with its bytes replaced.
     agent

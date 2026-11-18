@@ -812,6 +812,18 @@ mod tests {
             "{addresses} addresses filled the pool, no better than the {flat_cap} \
              a flat cap of {MAX_HANDSHAKES_PER_PEER} would have cost"
         );
+        // The comparison above holds at any pool size -- the allowance
+        // beats a flat cap even with the pool of eight this replaced,
+        // which cost four addresses instead of two. So the absolute cost
+        // is asserted too, because that is the number `docs/running.md`
+        // quotes to an operator deciding where to expose andris: about
+        // thirty addresses. Shrinking MAX_HANDSHAKES makes that false,
+        // and should fail here.
+        assert!(
+            addresses >= 24,
+            "{addresses} addresses filled the pool of {MAX_HANDSHAKES}; \
+             docs/running.md says about thirty"
+        );
     }
 
     #[test]

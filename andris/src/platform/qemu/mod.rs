@@ -199,7 +199,7 @@ impl QemuPlatform {
             input: self.clone(),
             cursor: self.clone(),
             display_control: self.clone(),
-            clipboard: self.clone(),
+            clipboard: Some(self.clone()),
             audio: None,
             gone: self.gone_signal.clone(),
         }

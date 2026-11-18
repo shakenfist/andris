@@ -109,23 +109,31 @@ pub const MAX_AGENT_MESSAGE: usize = MAX_CLIPBOARD_TEXT + 4096;
 pub const MAX_QUEUED: usize = 2 * (MAX_AGENT_MESSAGE + VdAgentMessageHeader::SIZE);
 
 /// The capabilities andris announces as the agent: `request` non-zero
-/// asks the client for its own.
-fn capabilities(request: u32) -> AnnounceCapabilities {
+/// asks the client for its own, and `clipboard` is whether a clipboard is
+/// shared at all.
+///
+/// With no clipboard, none of the clipboard capabilities is announced, so
+/// a client's "share clipboard" has nothing to act on rather than
+/// appearing to work and dropping the text.
+fn capabilities(request: u32, clipboard: bool) -> AnnounceCapabilities {
     let mut caps = AnnounceCapabilities {
         request,
         caps: Vec::new(),
     };
-    // Never VD_AGENT_CAP_CLIPBOARD_GRAB_SERIAL: it adds a serial to every
-    // grab, which ryll's ClipboardGrab does not model, so andris could
-    // neither read the client's grabs nor write its own.
-    for cap in [
-        VD_AGENT_CAP_MONITORS_CONFIG,
-        VD_AGENT_CAP_REPLY,
-        VD_AGENT_CAP_CLIPBOARD_BY_DEMAND,
-        VD_AGENT_CAP_CLIPBOARD_SELECTION,
-        VD_AGENT_CAP_GUEST_LINEEND_LF,
-    ] {
+    for cap in [VD_AGENT_CAP_MONITORS_CONFIG, VD_AGENT_CAP_REPLY] {
         caps.set_capability(cap);
+    }
+    if clipboard {
+        // Never VD_AGENT_CAP_CLIPBOARD_GRAB_SERIAL: it adds a serial to
+        // every grab, which ryll's ClipboardGrab does not model, so andris
+        // could neither read the client's grabs nor write its own.
+        for cap in [
+            VD_AGENT_CAP_CLIPBOARD_BY_DEMAND,
+            VD_AGENT_CAP_CLIPBOARD_SELECTION,
+            VD_AGENT_CAP_GUEST_LINEEND_LF,
+        ] {
+            caps.set_capability(cap);
+        }
     }
     caps
 }
@@ -312,9 +320,10 @@ impl Outgoing {
 pub struct Agent {
     session: u32,
     display_control: Arc<dyn DisplayControl>,
-    clipboard: Arc<dyn Clipboard>,
-    /// The desktop's clipboard text.
-    desktop: ClipboardReceiver,
+    /// The desktop's clipboard, or `None` with `--no-clipboard`.
+    clipboard: Option<Arc<dyn Clipboard>>,
+    /// The desktop's clipboard text, absent with `--no-clipboard`.
+    desktop: Option<ClipboardReceiver>,
     window: ClientWindow,
     outgoing: Outgoing,
     reassembler: AgentReassembler,
@@ -346,7 +355,7 @@ impl Agent {
             session,
             display_control: platform.display_control.clone(),
             clipboard: platform.clipboard.clone(),
-            desktop: platform.clipboard.changes(),
+            desktop: platform.clipboard.as_ref().map(|c| c.changes()),
             window: ClientWindow::new(),
             outgoing: Outgoing::default(),
             reassembler: AgentReassembler::new(MAX_AGENT_MESSAGE),
@@ -383,7 +392,10 @@ impl Agent {
             "the client started the agent"
         );
         self.outgoing.credit = tokens.num_tokens;
-        self.queue(VD_AGENT_ANNOUNCE_CAPABILITIES, &capabilities(1))?;
+        self.queue(
+            VD_AGENT_ANNOUNCE_CAPABILITIES,
+            &capabilities(1, self.clipboard.is_some()),
+        )?;
         self.flush(conn).await
     }
 
@@ -444,14 +456,22 @@ impl Agent {
     /// Wait until the desktop's clipboard changes. Cancel-safe. Never
     /// returns if the platform can no longer report changes.
     pub async fn desktop_clipboard_changed(&mut self) {
-        if self.desktop.changed().await.is_err() {
+        let Some(desktop) = self.desktop.as_mut() else {
+            return std::future::pending().await;
+        };
+        if desktop.changed().await.is_err() {
             std::future::pending::<()>().await;
         }
     }
 
     /// Offer the client the desktop's clipboard as it is now.
     pub async fn desktop_clipboard(&mut self, conn: &mut ChannelConn<MainOpcode>) -> Result<()> {
-        let text = self.desktop.borrow_and_update().clone();
+        // Only reached when desktop_clipboard_changed() woke, which with
+        // no clipboard it never does.
+        let Some(desktop) = self.desktop.as_mut() else {
+            return Ok(());
+        };
+        let text = desktop.borrow_and_update().clone();
         debug!(
             session = self.session,
             bytes = text.as_ref().map_or(0, |text| text.len()),
@@ -539,6 +559,14 @@ impl Agent {
             | VD_AGENT_CLIPBOARD
             | VD_AGENT_CLIPBOARD_REQUEST
             | VD_AGENT_CLIPBOARD_RELEASE => {
+                if self.clipboard.is_none() {
+                    debug!(
+                        session = self.session,
+                        message_type = header.message_type,
+                        "ignoring a clipboard message: andris shares no clipboard"
+                    );
+                    return Ok(());
+                }
                 let Some(has_selection) = self.has_selection() else {
                     debug!(
                         session = self.session,
@@ -573,10 +601,16 @@ impl Agent {
         let request = caps.request;
         self.client_caps = Some(caps);
         if request != 0 {
-            self.queue(VD_AGENT_ANNOUNCE_CAPABILITIES, &capabilities(0))?;
+            self.queue(
+                VD_AGENT_ANNOUNCE_CAPABILITIES,
+                &capabilities(0, self.clipboard.is_some()),
+            )?;
         }
         // Clipboard messages can flow now; offer what the desktop holds.
-        let text = self.desktop.borrow().clone();
+        let Some(desktop) = self.desktop.as_ref() else {
+            return Ok(());
+        };
+        let text = desktop.borrow().clone();
         self.offer(text)
     }
 
@@ -835,7 +869,10 @@ impl Agent {
             "the client's text, as put and as compared, and the text that last crossed"
         );
         self.last_crossed = Some(crossing);
-        if let Err(error) = self.clipboard.set(text) {
+        let Some(clipboard) = self.clipboard.as_ref() else {
+            return;
+        };
+        if let Err(error) = clipboard.set(text) {
             warn!(
                 session = self.session,
                 error = format!("{error:#}"),
@@ -1122,7 +1159,7 @@ mod tests {
 
     #[test]
     fn andris_announces_what_it_does() {
-        let caps = capabilities(1);
+        let caps = capabilities(1, true);
         assert_eq!(caps.request, 1);
         for cap in [
             VD_AGENT_CAP_MONITORS_CONFIG,
@@ -1135,5 +1172,23 @@ mod tests {
         }
         let set: u32 = caps.caps.iter().map(|word| word.count_ones()).sum();
         assert_eq!(set, 5, "nothing else");
+    }
+
+    #[test]
+    fn no_clipboard_announces_no_clipboard_capability() {
+        let caps = capabilities(1, false);
+        assert_eq!(caps.request, 1, "the request is unaffected");
+        for cap in [VD_AGENT_CAP_MONITORS_CONFIG, VD_AGENT_CAP_REPLY] {
+            assert!(caps.has_capability(cap), "capability {cap} is kept");
+        }
+        for cap in [
+            VD_AGENT_CAP_CLIPBOARD_BY_DEMAND,
+            VD_AGENT_CAP_CLIPBOARD_SELECTION,
+            VD_AGENT_CAP_GUEST_LINEEND_LF,
+        ] {
+            assert!(!caps.has_capability(cap), "capability {cap} is withheld");
+        }
+        let set: u32 = caps.caps.iter().map(|word| word.count_ones()).sum();
+        assert_eq!(set, 2, "resizing and replies, and nothing else");
     }
 }

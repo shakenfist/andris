@@ -169,6 +169,23 @@ impl TestServer {
         .await
     }
 
+    /// A server whose platform shares no clipboard, as `--no-clipboard`
+    /// leaves it.
+    pub async fn start_without_clipboard() -> Self {
+        let size = Size {
+            width: 256,
+            height: 192,
+        };
+        Self::start_custom(
+            false,
+            size,
+            display_options(),
+            HandshakeTimeouts::default(),
+            |platform| platform.clipboard = None,
+        )
+        .await
+    }
+
     async fn start_on(
         tls: bool,
         size: Size,

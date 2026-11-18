@@ -74,6 +74,10 @@ pub fn run(config: Config) -> Result<()> {
         }
     };
     platform.audio = audio;
+    if !config.clipboard {
+        info!("the clipboard is off");
+        platform.clipboard = None;
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

@@ -297,6 +297,67 @@ async fn agent_start_brings_an_announce_that_asks_for_the_clients() {
     assert!(!caps.has_capability(VD_AGENT_CAP_MOUSE_STATE));
 }
 
+/// With no clipboard, the clipboard capabilities are withheld, so a
+/// client's "share clipboard" has nothing to act on rather than appearing
+/// to work while the text goes nowhere. The rest of the agent, which is
+/// resizing, still works.
+#[tokio::test]
+async fn no_clipboard_withholds_the_clipboard_capabilities() {
+    let server = TestServer::start_without_clipboard().await;
+    let mut agent = AgentClient::start(&server, u32::MAX).await;
+    let caps =
+        AnnounceCapabilities::decode(&agent.expect(VD_AGENT_ANNOUNCE_CAPABILITIES).await).unwrap();
+    assert_eq!(caps.request, 1, "the client is still asked for its own");
+    for cap in [VD_AGENT_CAP_MONITORS_CONFIG, VD_AGENT_CAP_REPLY] {
+        assert!(caps.has_capability(cap), "capability {cap} is kept");
+    }
+    for cap in [
+        VD_AGENT_CAP_CLIPBOARD_BY_DEMAND,
+        VD_AGENT_CAP_CLIPBOARD_SELECTION,
+        VD_AGENT_CAP_GUEST_LINEEND_LF,
+    ] {
+        assert!(!caps.has_capability(cap), "capability {cap} is withheld");
+    }
+
+    // A client that announces anyway is answered, still without them, and
+    // nothing is offered to it.
+    agent
+        .send_agent(VD_AGENT_ANNOUNCE_CAPABILITIES, &body(&ryll_caps(1)))
+        .await;
+    let answer =
+        AnnounceCapabilities::decode(&agent.expect(VD_AGENT_ANNOUNCE_CAPABILITIES).await).unwrap();
+    assert!(!answer.has_capability(VD_AGENT_CAP_CLIPBOARD_BY_DEMAND));
+    agent.expect_quiet().await;
+
+    // Resizing is unaffected.
+    assert!(agent.resize(320, 200).await);
+    assert_eq!(server.platform.size().unwrap().width, 320);
+}
+
+/// A clipboard message from a client that was told there is no clipboard
+/// is ignored, rather than closing the connection or reaching the desktop.
+#[tokio::test]
+async fn no_clipboard_ignores_a_clipboard_message() {
+    let server = TestServer::start_without_clipboard().await;
+    let mut agent = AgentClient::start(&server, u32::MAX).await;
+    agent.expect(VD_AGENT_ANNOUNCE_CAPABILITIES).await;
+    agent
+        .send_agent(VD_AGENT_ANNOUNCE_CAPABILITIES, &body(&ryll_caps(0)))
+        .await;
+
+    let grab = ClipboardGrab {
+        selection: VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD,
+        types: vec![VD_AGENT_CLIPBOARD_UTF8_TEXT],
+    };
+    agent
+        .send_agent(VD_AGENT_CLIPBOARD_GRAB, &clip(&grab))
+        .await;
+    agent.expect_quiet().await;
+
+    // The connection still works afterwards.
+    assert!(agent.resize(400, 200).await);
+}
+
 #[tokio::test]
 async fn a_client_announce_is_answered_only_when_it_asks() {
     let server = TestServer::start().await;

@@ -66,6 +66,7 @@ andris --ticket-file PATH [options]
 | `--jpeg-quality QUALITY` | `85` | The JPEG quality, 1 to 100, for areas that look photographic; `0` never sends JPEG (see [What a client gets](#what-a-client-gets)) |
 | `--no-audio` | off | Capture no sound, and offer clients no playback channel (see [Audio](#audio)) |
 | `--audio-source NAME` | `@DEFAULT_MONITOR@` | The PulseAudio source to capture the desktop's sound from; used by `--platform x11`, and refused with `--no-audio` and with `--platform synthetic` |
+| `--no-clipboard` | off | Share no clipboard in either direction, and announce no clipboard capability (see [Clipboard](#clipboard)) |
 
 `andris --help` prints the same list. Logs go to stderr at `info`
 level; set `RUST_LOG` (for example `RUST_LOG=andris=debug`) to
@@ -518,6 +519,20 @@ password manager that clears the clipboard later withdraws the offer,
 but the client already has the text. Connect only clients you would
 trust with the session's clipboard. Andris offers nothing to a client
 that does not announce clipboard sharing.
+
+`--no-clipboard` shares none, in either direction. Andris then
+announces no clipboard capability, so a client's "share clipboard"
+has nothing to act on rather than appearing to work while the text
+goes nowhere, and a clipboard message from a client that sends one
+anyway is ignored. Use it where the desktop is a real session whose
+clipboard is not the client's business; sharing is on by default,
+which is what every client expects.
+
+Debug logs carry a fingerprint of clipboard text, never the text, so
+that one text can be followed from the desktop to the client. The
+fingerprint is computed under a key andris picks at start-up, so it
+means nothing outside the run that produced it and a short text
+cannot be recovered from a log by trying candidates.
 
 **Resizing.** When the client asks for a desktop size, as ryll does
 when its window is resized, andris changes the X server's size through

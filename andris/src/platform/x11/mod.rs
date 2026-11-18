@@ -371,7 +371,7 @@ impl X11Platform {
             input: self.clone(),
             cursor: self.clone(),
             display_control: self.clone(),
-            clipboard: self.clone(),
+            clipboard: Some(self.clone()),
             // Sound comes from the session's sound server, not the X
             // display: `andris` adds a PulseAudio source alongside.
             audio: None,

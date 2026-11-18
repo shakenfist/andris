@@ -340,18 +340,25 @@ before it authenticates. A `.vv` file therefore needs `tls-port`,
 with or without `port`, and a client with one port field wants the
 TLS port in it.
 
-Unauthenticated connections are limited, so that no one peer can
-lock others out:
+Unauthenticated connections are limited, so that a single peer
+cannot occupy every handshake slot. **These limits do not stop a
+determined client from locking others out:** with 8 slots overall and
+4 per address, two source addresses -- or two IPv6 /64s from one host
+-- can hold every slot by connecting and sending nothing, after which
+other clients are refused. That is issue #87, and it is unfixed.
+Expose andris only where you would accept that.
+
+The limits themselves:
 
 - at most 8 connections may be in their handshake at once on the
   listeners that serve SPICE;
 - with TLS configured, the plain listener's redirects have their own
   limit of 4, so a flood of the plain port cannot starve the TLS one;
 - at most 4 connections from one address may be in their handshake
-  at once, on any listener, so that no one address can hold all 8;
-  four lets a client link its main channel and then its display,
-  cursor and inputs channels in parallel, as spice-gtk does. An IPv6
-  address counts by its /64;
+  at once, on any listener. Four lets a client link its main channel
+  and then its display, cursor and inputs channels in parallel, as
+  spice-gtk does. It also means two addresses reach the overall limit
+  of 8, which is #87 above. An IPv6 address counts by its /64;
 - at most 2 RSA keys for ticket encryption are generated at once.
 
 Connections past a limit are closed immediately, and the refusals

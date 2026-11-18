@@ -170,10 +170,12 @@ Each has the default this plan takes if nobody answers.
 
 ## Execution
 
-Phases 2 and 3 land in ryll; the rest land here. A phase that
-lands in ryll records `ryll <sha> (#pr)` in `Merged` and is audited
-in ryll as part of the pull request that lands it. Phase plans are
-written with `/next-phase` as each phase comes up.
+Phases 2, 3, 7, 8 and 9 each land work in ryll as well as here; the
+rest land here only. A phase that lands in ryll
+records `ryll <sha> (#pr)` in `Merged` and is audited in ryll as
+part of the pull request that lands it, so phase 12 cites that audit
+rather than repeating it. Phase plans are written with `/next-phase`
+as each phase comes up.
 
 | Phase | Plan | Status | Merged |
 |-------|------|--------|--------|
@@ -188,8 +190,8 @@ written with `/next-phase` as each phase comes up.
 | 8. Video streams | PLAN-x11-desktop-phase-08-video.md | Complete | ryll `a157ced` (#552), `601b9dc` (#554), `49072fc` (#557); andris `c2fe8a7` (#21), `1ecafa5` (#23) |
 | 9. Audio | PLAN-x11-desktop-phase-09-audio.md | Complete | ryll `38c51ef` (#578); andris `d8f316a` (#27) |
 | 10. Packaging and dogfood soak | PLAN-x11-desktop-phase-10-packaging.md | Complete | andris `553ecfb` (#28), `c0617e9` (#29), `c36e87a` (#49) |
-| 11. Human review | PLAN-x11-desktop-phase-11-review.md | In progress | |
-| 12. Push audit | This file, below | Not started | |
+| 11. Human review | PLAN-x11-desktop-phase-11-review.md | Complete | andris `568a43b` (#51); development `810ce4d` (#335) |
+| 12. Push audit | PLAN-x11-desktop-phase-12-push-audit.md | Complete | |
 
 Rough sizing, as judgement rather than measurement: phases 0–5
 reach a usable LAN desktop in about three to four weeks; phases 6–9
@@ -541,16 +543,89 @@ review-tracking tooling, as ryll is, by the steps of development's
 The phase also writes a reading guide in `docs/`: an order to read the
 code in, from the binary's entry point through the server, the
 channels and the platform backends, saying for each part what it does
-and what to look at. The operator then reviews the files in review
-sessions, each landing as a pull request. Findings land as their own
-pull requests. The phase is done when every in-scope file is reviewed
-on one commit of `develop`.
+and what to look at.
+
+The phase is done when that tooling is installed and working. **The
+reading itself is not part of this plan.** As planned, the phase ran
+until every in-scope file was reviewed on one commit of `develop`;
+the operator moved the reading out on 2026-11-18, because 127 files
+is open ended, prunes take marks back as other work lands, and a
+phase held open against that does not close -- it stops being looked
+at, which is what happened for three weeks. The operator reads andris
+as time allows, in sessions that each land as their own pull request,
+and the `review-coverage` audit issue is that work's queue. Future
+work records it.
 
 ### Phase 12: Push audit
 
-Run `PUSH-AUDIT.md` over the merge commits recorded in the
-`Merged` column for the andris phases. For phases 2 and 3, cite the
-audits run in ryll's pull requests rather than repeating them.
+Detail is in
+[PLAN-x11-desktop-phase-12-push-audit.md](PLAN-x11-desktop-phase-12-push-audit.md).
+
+Run `PUSH-AUDIT.md` over the commits recorded in the `Merged` column
+for the andris phases -- 63,239 insertions across 149 files in 16
+landings, so the patch is split by area rather than handed to one
+agent whole. Phases 2, 3, 7, 8 and 9 each landed work in ryll as
+well; cite the audits run in ryll's pull requests for those rather
+than repeating them under andris's runbook.
+
+Two things the phase has to fix before it can run correctly, both
+found by its survey: `PUSH-AUDIT.md`'s `source-file-size` shared
+block is a version behind, and v2 changes what the auditor does
+(issue #85); and phase 0's recorded range starts at the repository's
+root commit, which has no parent, so the runbook's `git diff first^
+last` recipe cannot express it.
+
+#### The audit range, as derived
+
+Recorded here so it never has to be derived again. The range is the
+16 landings in the `Merged` column above that landed in andris.
+Fifteen are merge commits, each contributing `git diff <m>^1 <m>`:
+
+```
+cf34d91 a9e79cf 591e062 1950cdb 68b1058 43bfe88 498a72c b7ba2dd
+c2fe8a7 1ecafa5 d8f316a 553ecfb c0617e9 c36e87a 568a43b
+```
+
+The sixteenth is phase 0, recorded as `60c0c4d..e89539f`. `60c0c4d`
+is the repository's root commit and has no parent, so `60c0c4d^` is
+not a revision and the runbook's range recipe fails on it. The diff
+is taken against the empty tree instead, which is right because
+phase 0 *is* the start of the repository:
+
+```
+git diff "$(git hash-object -t tree /dev/null)" e89539f
+```
+
+Together those 16 are **365 diff rows, 63,239 insertions and 2,560
+deletions over 149 distinct paths**. Four numbers a later auditor can
+check the assembly against before trusting anything downstream.
+
+The patch was split seven ways for the judgment agents, and the
+slices partition it exactly -- rows, insertions and deletions each
+sum to the totals:
+
+| Slice | Pathspec | Rows | + | - |
+|-------|----------|------|---|---|
+| server | `andris/src/server` | 46 | 13,012 | 720 |
+| platform | `andris/src/platform` | 47 | 12,120 | 318 |
+| core | `andris/src` less the two above | 15 | 2,382 | 95 |
+| tests | `andris/tests` | 30 | 8,361 | 529 |
+| harness | build, CI, scripts, packaging, manifests | 119 | 12,039 | 371 |
+| docs | `*.md` outside `docs/plans/` | 61 | 4,889 | 310 |
+| plans | `docs/plans` | 47 | 10,436 | 217 |
+
+The `plans` slice was measured for the coverage proof and
+deliberately not given to any agent: it is this plan describing
+itself.
+
+Exactly 22 tracked files outside `.vscode/` are absent from that
+patch, and each belongs to work that is not this plan's -- the qemu
+D-Bus backend (#56, which landed the day after the last phase), the
+release scripts (#34, development's release-gating plan), the issue
+#26 fix (#47), one later documentation page (#83), a Renovate
+addition, the generated configuration exports, and phase 12's own
+plan file. So the audit saw the whole of the plan, and the `Merged`
+column is not missing a landing.
 
 ## Agent guidance
 
@@ -567,7 +642,11 @@ and 8 turn on protocol semantics, concurrency or heuristics and
 should be planned at high effort; phase 3 joined them when its
 survey found the LZ4 decoder had to be rewritten first. Phases 0, 1,
 6, 9, 10 and 11 follow established patterns and can be planned at
-medium effort.
+medium effort. Phase 12 should be planned at high effort: it was
+first written here as a wrapper around a runbook, but the
+accumulated diff is 63,239 insertions, nearly four times the largest
+closing audit this fleet has run, and splitting it so that no agent
+gets a skimmable patch is the work.
 
 ### Management session review checklist
 
@@ -591,29 +670,139 @@ because the following statements will be true:
   available against the same session. *Partly met in phase 10:* the
   week's soak (2026-10-19 to 10-27) used ryll → andris through an
   SSH tunnel, with RDP available and never needed. Kerbside is
-  exercised only by the `Through kerbside` merge-tier lane.
+  exercised only by the `Through kerbside` merge-tier lane. Partly met
+  is not met: this is one of the three criteria counted as short in
+  *Items deferred from the push audit*, because the chain the criterion
+  names -- ryll through kerbside -- has never carried a day's work.
 * With a static screen, andris uses under 2% of one core on
-  the development host.
+  the development host. **Not measured.** The phase 10 soak recorded
+  2.5% of one core averaged over 165 hours of use *and* idle, and said
+  itself that this "is not the success criterion's static-screen
+  figure, which the soak did not measure". Nothing since measured it.
+  What this means for the plan's status is in *Items deferred from the
+  push audit*, which is the single authority on that.
 * Scrolling a full-screen terminal at the session's native size
   sustains at least 30 frames per second on the LAN, as ryll's GUI
-  reports it: its FPS is the rate of `MARK` messages.
+  reports it: its FPS is the rate of `MARK` messages. **Not
+  measured.** The soak's figures are whole-session averages of 2.4 to
+  3.9 fps over seven days, which is what an idle desktop looks like
+  and says nothing about a scrolling peak.
 * Copy and paste of text work in both directions, with RDP
   connected to the same session. Resizing the ryll window resizes
   the desktop on an X server that allows it; on xrdp the desktop
-  follows the RDP client's size, and andris says so.
-* Every file in andris's review scope carries a current human
-  review mark.
+  follows the RDP client's size, and andris says so. *Met in phase
+  7:* the end-to-end clipboard check crossed both ways at 133 B,
+  6,196 B and 1.5 MB (the last through INCR, in two pieces) in 0.1 to
+  0.3 s each way, two lines set in ryll pasted onto FreeRDP's display
+  in 0.16 to 0.48 s, and the soak saw xorgxrdp refuse the resize with
+  andris reporting it, which is the documented behaviour.
+* Andris is adopted into development's review tracking, with a
+  reading guide, so that whole-file human review of it is possible
+  and measurable. *Met in phase 11.* Whole-file coverage itself is
+  not a criterion of this plan: at the close of phase 11, 9 of 136
+  in-scope files carried a mark and all 9 were imported from
+  development. The reading continues outside the plan; see Future
+  work.
 * A video played on the desktop arrives as an H.264 stream with
   audio. *Met in phase 10:* step 7's check, and 33 streams with sound
   during the soak.
 * CI exercises andris end to end against Xvfb with ryll headless,
-  and through kerbside.
+  and through kerbside. *Met in phase 10:* `ci.yml` carries both the
+  Xvfb lane driven by `ryll --headless` and the `e2e-kerbside` job
+  ("Through kerbside"), and both are required by `can_merge`. Phase
+  12 noted the limit of that coverage: the real X11 input and cursor
+  paths have no test in either lane (#90).
 * `docs/` describes running andris alongside xrdp, without
-  reference to plan phases.
+  reference to plan phases. *Met:* `docs/xrdp.md` covers it, and
+  phase 12's documentation review found no plan-phase reference in
+  any document outside `docs/plans/`, nor in any code file. The two
+  apparent hits cite shakenfist/development's "Adopting a repository"
+  procedure rather than this plan.
 * The daily consistency audit runs against andris and files no
-  issues. Until phase 11's review is done, review-coverage keeps one
-  open; the audit has no exemption mechanism, and that issue is the
-  review's work queue.
+  issues, other than `review-coverage`. That one stays open while
+  whole-file review is outstanding, which will be for as long as the
+  reading takes: the audit has no exemption mechanism, and the issue
+  is the reading's work queue rather than a defect in this plan's
+  work. *Met once phase 12 merges:* the only other audit issue open
+  during this plan, #85 on the push-audit file's stale shared block,
+  is closed by phase 12's own pull request, which is what brought
+  that block current.
+
+### Items deferred from the push audit
+
+Phase 12 ran `PUSH-AUDIT.md` over this plan's accumulated diff --
+63,239 insertions across 149 files in 16 landings -- in two mechanical
+waves and six judgment reviews. **Wave 1 passed and there was no
+blocking finding.** Thirty-two findings were recorded, all still
+present on `develop`, and every one is tracked. None is declined:
+each became a GitHub issue, or sharpened one that already existed.
+The finding detail and the clean areas are in
+[PLAN-x11-desktop-phase-12-push-audit.md](PLAN-x11-desktop-phase-12-push-audit.md);
+this is the disposition.
+
+Grouped by cause, because several findings share one:
+
+| Issue | What | From |
+|-------|------|------|
+| #87 | Two source addresses can hold every handshake permit and lock all other clients out, unauthenticated and indefinitely. The per-peer cap's stated guarantee does not survive a second address, and the reasoning is repeated in five locations across three documents plus the code comment that asserts it -- `docs/running.md:343-344` ("so that no one peer can lock others out") being the sentence a reader checking whether andris is safe to expose would stop at | S1 |
+| #88 | Client-driven resize is unthrottled: a client can thrash the operator's real screen while making the server reallocate and re-encode the whole desktop each time. Found independently by both security reviewers | S3, X4 |
+| #89 | The synthetic platform backend has drifted from the X11 one on `Gone`, the input-queue bound, the clipboard cap and resize clamping, so tests using the stand-in are weaker than they look | P1-P5 |
+| #90 | CI reports green for the X11 and audio paths it never runs: those tests skip silently, and the real XTEST input sink and XFixes cursor source have no test at all though Xvfb could run them. Also the tests that assert on log text and formatting | T4, T5, T6 |
+| #91 | The desktop clipboard cannot be turned off, and a crackable 32-bit hash of its text reaches debug logs | X2, X3 |
+| #92 | Small server hardening items: a pre-authentication session-id oracle, a 48 MiB transient on the lossy UTF-8 path, log amplification in the key decoder, a failed resize leaving a changed DPI, the ticket created in a directory known to be open to others, and four informational items in its closing paragraph | S2, S4, S5, S6, X5, X6 |
+| #93 | Scaffolding duplicated across the phases -- the `Stats` field list written five times above all -- and the oversize files, each with a seam named | Q1-Q4, P6, P7 |
+| #94 | Documentation facts stated in two places that will drift, and `ARCHITECTURE.md`'s stale backend count | D1-D3 |
+
+Three existing issues were sharpened rather than duplicated: **#14**
+gains the finding that the clipboard fetch is eager, client-independent
+and happens before any ticket is presented, which is a stronger claim
+than the issue made; **#13** gains three adversarial cases, the
+priority being the inputs pointer messages, which drive XTEST;
+**#15** gains the named follow/serve seam and its file list.
+
+One thing the audit could not do, recorded rather than glossed:
+phases 2, 3, 7, 8 and 9 each landed work in ryll, and this plan cites
+the audit run in ryll's own pull request rather than re-auditing that
+code under andris's runbook. Phases 2, 3 and 7 have an audit to cite
+(ryll #477, #487 and #534, each recording wave 1 and its wave 2
+findings). **Phases 8 and 9 do not**: ryll #552, #554, #557 and #578
+carry no audit record in any pull request body or commit message. That
+is ryll's to resolve and is filed there as ryll#738.
+
+Why this plan is not `Complete`. Three conditions are outstanding,
+and the first is a rule rather than a judgement.
+
+1. **The findings are unresolved.** `PLAN-TEMPLATE.md`'s
+   `plan-push-audit-phase` block and `PUSH-AUDIT.md` both say the plan
+   is not complete until every finding is resolved or explicitly
+   declined. All 32 are open and none is declined -- they are filed,
+   which is tracking, not resolution. This alone settles the status;
+   the two below are why it would not be `Complete` even if they were
+   fixed tomorrow. The first version of this paragraph named only the
+   unmeasured criteria and called #87 "a third reason to hesitate",
+   which read as optional weighing of something that is actually the
+   governing condition.
+2. **Three success criteria are short, not two.** The 2% idle CPU
+   figure and the 30 fps scrolling figure were never measured. The
+   first criterion -- ryll through kerbside as the daily connection
+   for a week -- is *partly* met: the soak ran ryll to andris over an
+   SSH tunnel, and kerbside is exercised only by a CI lane, so the
+   chain the criterion names has never carried a day's work.
+3. **Phase 12 owes a `Merged` cell.** The `plan-phase-landing` block
+   lets the push-audit phase omit it only where the audit found
+   nothing -- "it is the only row permitted to omit one" -- and where
+   there are findings, their pull request is the carrier and records
+   the audit phase's merge commit, which is known by then. This audit
+   raised 32, so the cell is owed, and the pull request that resolves
+   them fills it and sets this plan's status. Recorded here because an
+   empty cell in a `Complete` row is exactly what never gets filled
+   later; whichever of #87 to #94's fixes lands first is the carrier,
+   and #87 carries a note saying so.
+
+The two unmeasured figures in condition 2 are this plan's only
+quantitative claims about whether andris is good enough to replace
+RDP for daily use, and the week's soak demonstrated the thing in
+practice without ever producing either number.
 
 ### Documentation index maintenance
 
@@ -622,6 +811,32 @@ file) and keep its status in step with the Execution table.
 
 ### Future work
 
+- **The ryll audit gap (ryll#738).** Phases 8 and 9 landed work in
+  ryll that this plan cites as audited there, and four of those
+  merges carry no audit record. It is filed as ryll#738 and is ryll's
+  to resolve, but it is tracked here too: if that issue is never
+  actioned, this plan's citation quietly stays empty, and nothing in
+  ryll will remind andris of it.
+- **Reading andris.** Phase 11 installed the review tracking, the
+  reading guide and the prune bot, and then handed over: 127 of 136
+  in-scope files have never been read, and the nine that carry marks
+  carry them because they were imported from shakenfist/development.
+  The operator reads andris as time allows, one session at a time,
+  each landing as its own pull request, with findings filed as
+  issues and fixed in pull requests of their own. The work queue is
+  the `review-coverage` audit issue, and
+  `./tools/review-tracking.sh next` says what to read next. This is
+  deliberately not a phase: it is open-ended work with no end date,
+  and the only thing a plan could add is a deadline that would be
+  missed.
+- Templatising ryll's `tools/audit/` harness in
+  shakenfist/development, so that running a push audit is scripted
+  rather than a runbook followed by hand. Ryll has 1,546 lines of it
+  with its own tests, and the three central scripts carry no
+  reference to ryll or its crates, so they would port. Phase 12
+  declined to copy them into andris: importing a harness into the
+  repository whose runbook the audit is running is the wrong moment,
+  and a per-repository copy is how template drift starts.
 - A Wayland backend: PipeWire screen capture via
   xdg-desktop-portal, and libei for input.
 - Splitting ryll's shared crates (protocol, compression, usbredir)
@@ -697,6 +912,27 @@ file) and keep its status in step with the Execution table.
 - In phase 2 ryll also learned to read a pixmap with
   `PAL_FROM_CACHE` after its 8-byte palette id, as spice.proto lays
   it out.
+- ryll#475: ryll's LZ4 decoder did not match spice-server -- it read
+  no `data_size` prefix, decoded independent per-row blocks rather
+  than one stream over multi-line chunks, and mapped bitmap format
+  bytes differently from `enums.h`. Phase 3's survey found it, and the
+  decoder was fixed against a capture from spice-server before the
+  encoder was written, because a round trip against the old decoder
+  would have proved nothing.
+- #36, found during the phase 10 soak on 2026-10-20 and fixed by #41
+  on 10-25: a replaced client was dropped silently, so
+  auto-reconnecting clients fought over the session.
+- #22, fixed 2026-10-26: the inputs channel closed after Enter, and
+  the cause was logged only at debug.
+- #26, fixed by #47 on 2026-10-27: a stalled X request served a
+  silent session -- on 2026-10-17 a session got no picture and no
+  input for its whole 37.5 s life, because the first capture took
+  37,496 ms. Every call into the X11 capture and input threads now
+  warns when the X server stops answering.
+- The closing push audit found no bug that was already broken in a
+  way a user would meet: no blocking finding, and nothing that
+  corrupts or crashes on well-formed input. What it did find is in
+  *Items deferred from the push audit* below.
 
 ### Back brief
 

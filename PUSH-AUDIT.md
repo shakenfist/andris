@@ -58,10 +58,13 @@ done > /tmp/plan-audit.patch
 ```
 
 For a phase recorded as a `first..last` range, append
-`git diff first^ last` instead. In the briefs below,
-`git diff develop...HEAD` means "the audit range", which in this
-mode is that patch. Wave 1 runs against the tip of `develop`, which
-holds every phase.
+`git diff first^ last` instead. Where `first` is the repository's
+root commit it has no parent, so `first^` is not a revision, and
+the diff is taken against the empty tree instead:
+`git diff "$(git hash-object -t tree /dev/null)" last`.
+In the briefs below, `git diff develop...HEAD` means "the audit
+range", which in this mode is that patch. Wave 1 runs against the
+tip of `develop`, which holds every phase.
 
 If the phase table records no commits, reconstruct what you can
 from `gh pr list --state merged`, `git rev-list --first-parent` and

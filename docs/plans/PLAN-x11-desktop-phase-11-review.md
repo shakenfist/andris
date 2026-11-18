@@ -28,13 +28,20 @@ In scope:
   the file does and what to look at.
 - **Adding andris to development's table of adopters**, as one small
   pull request in shakenfist/development.
-- **The operator's review sessions**, until every in-scope file
-  carries a current review mark. Each session lands as its own pull
-  request. Findings become issues, and their fixes are their own pull
-  requests.
 
 Out of scope:
 
+- **The whole-file review sessions themselves.** Adopting the tooling
+  is a bounded piece of work and it is finished; reading 127 files is
+  not, and it does not finish on a schedule a plan can hold. The
+  operator reads andris as time allows, outside this master plan, in
+  sessions that each land as their own pull request, using the
+  tooling and the reading guide this phase installed. The master
+  plan's Future work section records that as ongoing, and the
+  `review-coverage` audit issue is its work queue -- which is what
+  that issue is for. This phase was planned with the sessions in
+  scope; the operator moved them out on 2026-11-18, and the
+  paragraphs below are written as they now stand.
 - **Fixing what the review finds, inside this phase's pull requests.**
   A finding is filed as an issue and fixed in a pull request of its
   own, so that review-state commits stay review state.
@@ -294,15 +301,19 @@ plan.
    - A finding goes in a weAudit note and an issue. The fix, if any,
      is its own pull request.
 
-8. **Done means every in-scope file is reviewed on one commit of
-   `develop`, measured once.** The review takes weeks, and Renovate
-   and other work will change reviewed files meanwhile, so prunes will
-   take marks back. The phase is done when
-   `./tools/review-tracking.sh status` on a `develop` commit reports
-   no file needing review. The Result records that commit, the date,
-   the in-scope count, the number of sessions and the issues filed.
-   Coverage after that is the steady state that `prune-reviews` and
-   the `review-coverage` audit maintain.
+8. **Done means the tooling is installed and working, not that the
+   reading is finished.** As planned, this decision read the other
+   way: the phase would end when `./tools/review-tracking.sh status`
+   on a `develop` commit reported no file needing review. Three weeks
+   of practice said that is not a phase. Reading 127 files is open
+   ended, the prunes take marks back as Renovate and other work land,
+   and a plan phase held open against that never closes -- it just
+   stops being looked at, which is what happened. So the phase ends
+   where the installable work ends, and the reading continues outside
+   the plan (see Scope). The `review-coverage` audit issue is the
+   work queue, which is what that issue is designed to be, and
+   `prune-reviews` maintains the steady state either way. The
+   operator made this call on 2026-11-18.
 
 ## Execution
 
@@ -332,11 +343,11 @@ management session reviews each diff and makes each commit.
 | 2 | medium | sonnet | none | Complete | The adoption files, the scope config and `REVIEWS.md`. See brief 2. |
 | 3 | medium | opus | none | Complete | CI skips review-only changes in both tiers. See brief 3. |
 | 4 | low | sonnet | none | Complete | Add andris to development's adopters table, in a development worktree. See brief 4. |
-| 5 | low | operator | none | In progress | Add `DEPENDENCIES_TOKEN` to andris, and ready the review account's clone. See brief 5. |
-| 6 | medium | management | none | Not started | Push audit, then both pull requests. See brief 6. |
-| 7 | low | management | none | Not started | After the merge, check that the prune bot and the audits work. See brief 7. |
-| 8 | high | operator | none | Not started | The review sessions. See brief 8. |
-| 9 | low | management | none | Not started | Record the Result in the last session's pull request. See brief 9. |
+| 5 | low | operator | none | Complete | Add `DEPENDENCIES_TOKEN` to andris, and ready the review account's clone. See brief 5. |
+| 6 | medium | management | none | Complete | Push audit, then both pull requests. See brief 6. |
+| 7 | low | management | none | Complete | After the merge, check that the prune bot and the audits work. See brief 7. |
+| 8 | high | operator | none | Abandoned | The review sessions. Not done as a step of this phase: moved out of the plan on 2026-11-18 and continuing outside it, so the step is abandoned rather than pending. See Scope and brief 8. |
+| 9 | low | management | none | Complete | Record the Result. See brief 9. |
 
 Step 1 comes first, because step 2's `include` order mirrors the
 guide's. Step 3 may run beside steps 1 and 2. Step 4 and step 5 may
@@ -578,7 +589,11 @@ Once the andris pull request has merged and brief 5's secret exists:
 
 ### Brief 8: the review sessions (operator)
 
-Use decision 7's discipline, at whatever pace suits. Each session:
+This is no longer a step of this phase -- the sessions were moved out
+of the master plan on 2026-11-18 -- but the procedure is the one the
+tooling this phase installed expects, so it is kept here as the
+standing recipe. Use decision 7's discipline, at whatever pace suits.
+Each session:
 
 1. `git pull` on a clean `develop`, `git switch -c reviews` (or
    reset an existing one), `./tools/review-tracking.sh prune`.
@@ -596,19 +611,13 @@ need review again, which is expected.
 
 ### Brief 9: the Result
 
-When `./tools/review-tracking.sh status` on `develop` reports nothing
-to review, record these in this plan's Result section, in the last
-session's pull request or a small one after it:
-
-- the commit and date;
-- the in-scope count, and how many files were imported rather than
-  read;
-- the number of sessions and their pull requests;
-- the issues filed from findings, and which are fixed;
-- the `review-coverage` issue's closure.
-
-Mark the master plan's success criterion about review marks as met,
-and the phase's last step Complete.
+Record in the Result section below what the adoption actually
+installed, with the evidence for each piece, and the review state on
+the day the phase closed. The brief originally waited for
+`./tools/review-tracking.sh status` to report nothing to review; with
+the sessions out of scope that gate belongs to no phase, so the
+Result records the starting state instead and the master plan's
+Future work section carries the rest.
 
 ## Risks and mitigations
 
@@ -680,12 +689,17 @@ and the phase's last step Complete.
   secret was added succeeded, and is linked in the Result.
 - **Development lists andris.** Its adopters table has the row, and
   `review-tracking-templates` reads compliant for andris.
-- **Every in-scope file was reviewed** (decision 8). The Result names
-  a `develop` commit on which `./tools/review-tracking.sh status`
-  reported nothing needing review, and the `review-coverage` issue is
-  closed.
-- **Findings are tracked.** Every finding that needs a change has an
-  issue, linked from the Result.
+- **The tooling answers** (decision 8). `./tools/review-tracking.sh
+  status` runs on `develop` and prints an in-scope count, a reviewed
+  count and a list of files needing review; `./tools/review-tracking.sh
+  next` names a file from that list. The Result records the counts on
+  the day the phase closed. The `review-coverage` issue stays open as
+  the reading's work queue, and its closure is not a criterion of
+  this phase.
+- **Findings are tracked.** Every finding this phase's own work
+  turned up has an issue, linked from the Result. Findings from the
+  reading sessions are tracked as those sessions happen, outside this
+  phase.
 
 ## Back brief
 
@@ -700,4 +714,35 @@ before step 2 starts, and change it if they ask.
 
 ## Result
 
-Not started.
+**Closed 2026-11-18, with the whole-file reading moved out of the
+master plan.** The adoption is installed and working; the reading it
+enables is ongoing work outside the plan, recorded under Future work
+in the master plan.
+
+What landed, and the evidence for each piece:
+
+| Piece | Evidence |
+|---|---|
+| Adoption, reading guide and CI | andris PR #51, merged `568a43b` on 2026-10-28 |
+| Development's adopters table | development PR #335, merged `810ce4d` on 2026-10-28 |
+| CI skips review-only changes | #51's own `merge_group` run 40648597139 ran `check_paths` on `merge_group` with a checkout and a `base_sha` diff, all four merge-tier jobs ran, and `Can merge` was green |
+| The prune bot | Run 40650167261 on 2026-10-29 imported 9 files from development with verified signatures, then failed at the push as expected: no `DEPENDENCIES_TOKEN`, and the ruleset refused `github.token`. The token arrived on 2026-10-29 at 18:39 UTC; the dispatched run 40933039272 on 2026-10-30 succeeded and pushed `dadd878` as `shakenfist-bot`, importing 8 files -- one fewer because `tools/sign-release-tag.sh` had changed on `develop` and no longer matched development's copy. The workflow has since moved to the `shakenfist-review-marks` GitHub App, per the 2026-10-31 execution note |
+| The audits | `audit-check.py` from development `d2044c3`, run locally against andris `7da13c2`: `review-tracking-templates`, `review-scope-completeness`, `review-marks-pre-commit` and `review-scope-ci` all pass. `review-coverage` fails, as designed, and is issue #58 |
+
+The review state on the day this phase closed, at `develop`
+`76e444c`: **136 files in scope, 9 reviewed, 127 needing review.**
+All 9 of those marks were imported from shakenfist/development --
+they are the shared template files, reviewed there -- so no
+andris-authored file has yet been read. That is the starting line for
+the reading, not a result of it. No human review session has run.
+The eight `Prune and import review marks` commits on `develop`
+between `dadd878` and `76e444c` are all the bot's.
+
+Issues filed from this phase's own work: none. The phase found no
+defect in andris; what it found about development's tooling is in the
+execution notes and was fixed in development (the review-marks App,
+development PRs #356, #357 and #368).
+
+The master plan's success criterion about review marks has been
+rephrased to match this: the tooling is in place, and whole-file
+coverage is named as ongoing rather than claimed.

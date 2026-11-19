@@ -59,6 +59,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use shakenfist_spice_protocol::constants::vd_agent::{
@@ -108,23 +109,31 @@ pub const MAX_AGENT_MESSAGE: usize = MAX_CLIPBOARD_TEXT + 4096;
 pub const MAX_QUEUED: usize = 2 * (MAX_AGENT_MESSAGE + VdAgentMessageHeader::SIZE);
 
 /// The capabilities andris announces as the agent: `request` non-zero
-/// asks the client for its own.
-fn capabilities(request: u32) -> AnnounceCapabilities {
+/// asks the client for its own, and `clipboard` is whether a clipboard is
+/// shared at all.
+///
+/// With no clipboard, none of the clipboard capabilities is announced, so
+/// a client's "share clipboard" has nothing to act on rather than
+/// appearing to work and dropping the text.
+fn capabilities(request: u32, clipboard: bool) -> AnnounceCapabilities {
     let mut caps = AnnounceCapabilities {
         request,
         caps: Vec::new(),
     };
-    // Never VD_AGENT_CAP_CLIPBOARD_GRAB_SERIAL: it adds a serial to every
-    // grab, which ryll's ClipboardGrab does not model, so andris could
-    // neither read the client's grabs nor write its own.
-    for cap in [
-        VD_AGENT_CAP_MONITORS_CONFIG,
-        VD_AGENT_CAP_REPLY,
-        VD_AGENT_CAP_CLIPBOARD_BY_DEMAND,
-        VD_AGENT_CAP_CLIPBOARD_SELECTION,
-        VD_AGENT_CAP_GUEST_LINEEND_LF,
-    ] {
+    for cap in [VD_AGENT_CAP_MONITORS_CONFIG, VD_AGENT_CAP_REPLY] {
         caps.set_capability(cap);
+    }
+    if clipboard {
+        // Never VD_AGENT_CAP_CLIPBOARD_GRAB_SERIAL: it adds a serial to
+        // every grab, which ryll's ClipboardGrab does not model, so andris
+        // could neither read the client's grabs nor write its own.
+        for cap in [
+            VD_AGENT_CAP_CLIPBOARD_BY_DEMAND,
+            VD_AGENT_CAP_CLIPBOARD_SELECTION,
+            VD_AGENT_CAP_GUEST_LINEEND_LF,
+        ] {
+            caps.set_capability(cap);
+        }
     }
     caps
 }
@@ -162,6 +171,89 @@ fn requested_size(config: &MonitorsConfig) -> Result<Size> {
     );
     size.check()?;
     Ok(size)
+}
+
+/// How many resizes a client may ask for in a burst, before
+/// [`RESIZE_REFILL`] starts to apply. Three covers a client that sends a
+/// configuration more than once as its window settles.
+pub const RESIZE_BURST: u32 = 3;
+
+/// How long one resize of the burst takes to come back. A resize
+/// reconfigures the operator's real screen and makes the server
+/// re-encode the whole desktop, so a client that wants to keep resizing
+/// is held to one every couple of seconds. Only a resize that changes
+/// the desktop costs a token; see [`ResizeBudget::refund`].
+const RESIZE_REFILL: Duration = Duration::from_secs(2);
+
+/// A token bucket over how often a client may resize the desktop:
+/// [`RESIZE_BURST`] at once, and one more each [`RESIZE_REFILL`].
+///
+/// `take` is given the time rather than reading the clock, so that tests
+/// can drive it without waiting.
+#[derive(Debug)]
+struct ResizeBudget {
+    /// Resizes available now.
+    tokens: u32,
+    /// When the last token was added, or the bucket was created.
+    refilled: Instant,
+}
+
+impl ResizeBudget {
+    fn new(now: Instant) -> Self {
+        Self {
+            tokens: RESIZE_BURST,
+            refilled: now,
+        }
+    }
+
+    /// Spend one resize, if there is one to spend at `now`.
+    fn take(&mut self, now: Instant) -> bool {
+        let earned =
+            now.saturating_duration_since(self.refilled).as_nanos() / RESIZE_REFILL.as_nanos();
+        if earned >= u128::from(RESIZE_BURST) {
+            self.tokens = RESIZE_BURST;
+            self.refilled = now;
+        } else if earned > 0 {
+            // Below RESIZE_BURST, so both of these are in range.
+            let earned = u32::try_from(earned).unwrap_or(RESIZE_BURST);
+            self.tokens = self.tokens.saturating_add(earned).min(RESIZE_BURST);
+            self.refilled += RESIZE_REFILL * earned;
+        }
+        if self.tokens == 0 {
+            return false;
+        }
+        self.tokens -= 1;
+        true
+    }
+
+    /// Give back a resize that turned out to cost nothing, because the
+    /// desktop was already the size the client asked for: nothing was
+    /// reconfigured and nothing re-encoded, so it is not what this
+    /// budget is here to limit.
+    ///
+    /// The cap cannot bind as this is called today, since every refund
+    /// follows a [`take`](Self::take) that succeeded in the same
+    /// request, so the count is at most back where it started. It is
+    /// here so that the bucket still holds to [`RESIZE_BURST`] if a
+    /// later caller refunds without having taken; a mutation test
+    /// removing it survives, which is why it is said here rather than
+    /// asserted in a test.
+    fn refund(&mut self) {
+        self.tokens = self.tokens.saturating_add(1).min(RESIZE_BURST);
+    }
+}
+
+/// What came of a resize the client asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resized {
+    /// The desktop is now the size asked for, or the nearest it allows.
+    Applied,
+    /// The desktop was already that size. The client is told it
+    /// succeeded, as it has what it asked for, but it is charged no
+    /// resize budget.
+    Unchanged,
+    /// The desktop would not, or could not, and the client is told so.
+    Failed,
 }
 
 /// The client's agent window, as andris counts it.
@@ -258,9 +350,10 @@ impl Outgoing {
 pub struct Agent {
     session: u32,
     display_control: Arc<dyn DisplayControl>,
-    clipboard: Arc<dyn Clipboard>,
-    /// The desktop's clipboard text.
-    desktop: ClipboardReceiver,
+    /// The desktop's clipboard, or `None` with `--no-clipboard`.
+    clipboard: Option<Arc<dyn Clipboard>>,
+    /// The desktop's clipboard text, absent with `--no-clipboard`.
+    desktop: Option<ClipboardReceiver>,
     window: ClientWindow,
     outgoing: Outgoing,
     reassembler: AgentReassembler,
@@ -270,6 +363,11 @@ pub struct Agent {
     client_caps: Option<AnnounceCapabilities>,
     /// Whether a refused resize has been logged on this connection.
     refusal_logged: bool,
+    /// How many more resizes the client may ask for.
+    resizes: ResizeBudget,
+    /// Whether a resize refused for being too frequent has been logged at
+    /// warning level on this connection.
+    throttle_logged: bool,
     /// Whether a message dropped from a full queue has been logged at
     /// warning level on this connection.
     drop_logged: bool,
@@ -287,13 +385,15 @@ impl Agent {
             session,
             display_control: platform.display_control.clone(),
             clipboard: platform.clipboard.clone(),
-            desktop: platform.clipboard.changes(),
+            desktop: platform.clipboard.as_ref().map(|c| c.changes()),
             window: ClientWindow::new(),
             outgoing: Outgoing::default(),
             reassembler: AgentReassembler::new(MAX_AGENT_MESSAGE),
             started: false,
             client_caps: None,
             refusal_logged: false,
+            resizes: ResizeBudget::new(Instant::now()),
+            throttle_logged: false,
             drop_logged: false,
             last_crossed: None,
             offered: None,
@@ -322,7 +422,10 @@ impl Agent {
             "the client started the agent"
         );
         self.outgoing.credit = tokens.num_tokens;
-        self.queue(VD_AGENT_ANNOUNCE_CAPABILITIES, &capabilities(1))?;
+        self.queue(
+            VD_AGENT_ANNOUNCE_CAPABILITIES,
+            &capabilities(1, self.clipboard.is_some()),
+        )?;
         self.flush(conn).await
     }
 
@@ -383,14 +486,22 @@ impl Agent {
     /// Wait until the desktop's clipboard changes. Cancel-safe. Never
     /// returns if the platform can no longer report changes.
     pub async fn desktop_clipboard_changed(&mut self) {
-        if self.desktop.changed().await.is_err() {
+        let Some(desktop) = self.desktop.as_mut() else {
+            return std::future::pending().await;
+        };
+        if desktop.changed().await.is_err() {
             std::future::pending::<()>().await;
         }
     }
 
     /// Offer the client the desktop's clipboard as it is now.
     pub async fn desktop_clipboard(&mut self, conn: &mut ChannelConn<MainOpcode>) -> Result<()> {
-        let text = self.desktop.borrow_and_update().clone();
+        // Only reached when desktop_clipboard_changed() woke, which with
+        // no clipboard it never does.
+        let Some(desktop) = self.desktop.as_mut() else {
+            return Ok(());
+        };
+        let text = desktop.borrow_and_update().clone();
         debug!(
             session = self.session,
             bytes = text.as_ref().map_or(0, |text| text.len()),
@@ -478,6 +589,14 @@ impl Agent {
             | VD_AGENT_CLIPBOARD
             | VD_AGENT_CLIPBOARD_REQUEST
             | VD_AGENT_CLIPBOARD_RELEASE => {
+                if self.clipboard.is_none() {
+                    debug!(
+                        session = self.session,
+                        message_type = header.message_type,
+                        "ignoring a clipboard message: andris shares no clipboard"
+                    );
+                    return Ok(());
+                }
                 let Some(has_selection) = self.has_selection() else {
                     debug!(
                         session = self.session,
@@ -512,10 +631,16 @@ impl Agent {
         let request = caps.request;
         self.client_caps = Some(caps);
         if request != 0 {
-            self.queue(VD_AGENT_ANNOUNCE_CAPABILITIES, &capabilities(0))?;
+            self.queue(
+                VD_AGENT_ANNOUNCE_CAPABILITIES,
+                &capabilities(0, self.clipboard.is_some()),
+            )?;
         }
         // Clipboard messages can flow now; offer what the desktop holds.
-        let text = self.desktop.borrow().clone();
+        let Some(desktop) = self.desktop.as_ref() else {
+            return Ok(());
+        };
+        let text = desktop.borrow().clone();
         self.offer(text)
     }
 
@@ -523,7 +648,27 @@ impl Agent {
     async fn monitors_config(&mut self, body: &[u8]) -> Result<()> {
         let config = MonitorsConfig::decode(body).context("a malformed agent MONITORS_CONFIG")?;
         let applied = match requested_size(&config) {
-            Ok(size) => self.resize(size).await,
+            // The budget is spent here, in the arm, rather than in a
+            // guard: a guard with a side effect charges any request that
+            // reaches it, which a later arm or pattern could change.
+            Ok(size) => {
+                if self.resizes.take(Instant::now()) {
+                    let outcome = self.resize(size).await;
+                    if outcome == Resized::Unchanged {
+                        // Several clients re-send their whole
+                        // configuration on every window event and on
+                        // reconnect. Asking for the size the desktop
+                        // already has is a RandR query and nothing else,
+                        // so charging for it would refuse such a client
+                        // its fourth identical request.
+                        self.resizes.refund();
+                    }
+                    outcome != Resized::Failed
+                } else {
+                    self.refuse_frequent_resize(size);
+                    false
+                }
+            }
             Err(error) => {
                 debug!(
                     session = self.session,
@@ -545,8 +690,29 @@ impl Agent {
         Ok(())
     }
 
-    /// Ask the desktop to be `size`; true if it now is.
-    async fn resize(&mut self, size: Size) -> bool {
+    /// Say that a resize was refused for arriving too soon after others.
+    /// Nothing is asked of the desktop, so the operator's screen is left
+    /// alone and nothing is re-encoded.
+    fn refuse_frequent_resize(&mut self, size: Size) {
+        if self.throttle_logged {
+            debug!(
+                session = self.session,
+                "refusing a resize to {size}: the client is asking too often"
+            );
+        } else {
+            self.throttle_logged = true;
+            warn!(
+                session = self.session,
+                "refusing the client's resize to {size}: it has asked for more than \
+                 {RESIZE_BURST} resizes faster than one every {}s, so the desktop keeps \
+                 its size and the client is sent an error (logged once per connection)",
+                RESIZE_REFILL.as_secs()
+            );
+        }
+    }
+
+    /// Ask the desktop to be `size`, and say what came of it.
+    async fn resize(&mut self, size: Size) -> Resized {
         let control = self.display_control.clone();
         let outcome = tokio::task::spawn_blocking(move || control.set_size(size)).await;
         match outcome {
@@ -555,14 +721,14 @@ impl Agent {
                     session = self.session,
                     "resized the desktop to {size}, as the client asked"
                 );
-                true
+                Resized::Applied
             }
             Ok(Ok(Resize::Unchanged)) => {
                 debug!(
                     session = self.session,
                     "the desktop is already {size}, as the client asked"
                 );
-                true
+                Resized::Unchanged
             }
             Ok(Ok(Resize::Refused(why))) => {
                 if self.refusal_logged {
@@ -578,7 +744,7 @@ impl Agent {
                          it keeps its size (logged once per connection)"
                     );
                 }
-                false
+                Resized::Failed
             }
             Ok(Err(error)) => {
                 warn!(
@@ -586,7 +752,7 @@ impl Agent {
                     error = format!("{error:#}"),
                     "resizing the desktop to {size} failed"
                 );
-                false
+                Resized::Failed
             }
             Err(error) => {
                 warn!(
@@ -594,7 +760,7 @@ impl Agent {
                     error = %error,
                     "resizing the desktop to {size} failed"
                 );
-                false
+                Resized::Failed
             }
         }
     }
@@ -706,21 +872,42 @@ impl Agent {
         if data.is_empty() {
             return;
         }
-        // Checked after the conversion, since replacing invalid UTF-8 can
-        // make the text up to three times longer.
-        let text: Arc<str> = match String::from_utf8(data) {
-            Ok(text) => Arc::from(text),
-            Err(error) => Arc::from(String::from_utf8_lossy(error.as_bytes())),
-        };
-        if text.len() > MAX_CLIPBOARD_TEXT {
+        // Both length checks happen before anything is allocated. The
+        // order used to be conversion first, which meant an all-invalid
+        // 16 MiB body built about 48 MiB of U+FFFD before anything looked
+        // at how long it was.
+        if data.len() > MAX_CLIPBOARD_TEXT {
             warn!(
                 session = self.session,
-                bytes = text.len(),
+                bytes = data.len(),
                 "dropping the client's clipboard text: it is over the \
                  {MAX_CLIPBOARD_TEXT}-byte limit"
             );
             return;
         }
+        let text: Arc<str> = match String::from_utf8(data) {
+            // Valid UTF-8 keeps the bytes it arrived in; no copy.
+            Ok(text) => Arc::from(text),
+            Err(error) => {
+                let bytes = error.as_bytes();
+                // Measured rather than converted-then-measured: the
+                // conversion is the allocation, so a body that is within
+                // the limit as bytes but over it as text has to be caught
+                // without building it. A body of nothing but invalid
+                // bytes triples.
+                let lossy = lossy_len(bytes);
+                if lossy > MAX_CLIPBOARD_TEXT {
+                    warn!(
+                        session = self.session,
+                        bytes = lossy,
+                        "dropping the client's clipboard text: replacing its invalid UTF-8 \
+                         would take it over the {MAX_CLIPBOARD_TEXT}-byte limit"
+                    );
+                    return;
+                }
+                Arc::from(String::from_utf8_lossy(bytes))
+            }
+        };
         // The client converts its text to the desktop's LF line ends, as
         // GUEST_LINEEND_LF asks, so the text goes on the desktop as it
         // came. But it is compared, and remembered, with LF line ends, as
@@ -749,7 +936,10 @@ impl Agent {
             "the client's text, as put and as compared, and the text that last crossed"
         );
         self.last_crossed = Some(crossing);
-        if let Err(error) = self.clipboard.set(text) {
+        let Some(clipboard) = self.clipboard.as_ref() else {
+            return;
+        };
+        if let Err(error) = clipboard.set(text) {
             warn!(
                 session = self.session,
                 error = format!("{error:#}"),
@@ -837,6 +1027,34 @@ impl Agent {
 
 /// `text` with each CRLF made LF.
 ///
+/// How long [`String::from_utf8_lossy`] would make `bytes`, without
+/// building it, so that a conversion too long to keep can be refused
+/// before it is allocated.
+///
+/// The conversion replaces each maximal invalid sequence with one
+/// U+FFFD, three bytes, and that is what is counted here: a trailing
+/// incomplete sequence is one replacement, however many bytes it has, so
+/// the count matches the conversion rather than bounding it.
+fn lossy_len(bytes: &[u8]) -> usize {
+    const REPLACEMENT: usize = char::REPLACEMENT_CHARACTER.len_utf8();
+    let mut len = 0;
+    let mut rest = bytes;
+    loop {
+        let error = match std::str::from_utf8(rest) {
+            Ok(text) => return len + text.len(),
+            Err(error) => error,
+        };
+        len += error.valid_up_to() + REPLACEMENT;
+        // `None` is a sequence cut short by the end of the input, which
+        // the one replacement just counted stands for; there is no more
+        // to walk.
+        let Some(bad) = error.error_len() else {
+            return len;
+        };
+        rest = &rest[error.valid_up_to() + bad..];
+    }
+}
+
 /// Andris announces `GUEST_LINEEND_LF`, which tells the client that the
 /// desktop's text ends its lines in LF, and the client converts to and
 /// from its own line ends on that understanding. The desktop's text need
@@ -857,6 +1075,36 @@ mod tests {
     use shakenfist_spice_protocol::messages::vd_agent::MonConfig;
 
     use super::*;
+
+    #[test]
+    fn a_resize_burst_is_allowed_and_then_throttled() {
+        let start = Instant::now();
+        let mut budget = ResizeBudget::new(start);
+        for n in 0..RESIZE_BURST {
+            assert!(budget.take(start), "resize {n} of the burst");
+        }
+        assert!(!budget.take(start), "one resize past the burst");
+    }
+
+    #[test]
+    fn a_spent_resize_budget_refills_one_at_a_time() {
+        let start = Instant::now();
+        let mut budget = ResizeBudget::new(start);
+        for _ in 0..RESIZE_BURST {
+            assert!(budget.take(start));
+        }
+        // Just short of a refill buys nothing.
+        assert!(!budget.take(start + RESIZE_REFILL - Duration::from_millis(1)));
+        // One refill is one resize, and not two.
+        assert!(budget.take(start + RESIZE_REFILL));
+        assert!(!budget.take(start + RESIZE_REFILL));
+        // Idling refills the bucket, and never past the burst.
+        let later = start + RESIZE_REFILL * 100;
+        for _ in 0..RESIZE_BURST {
+            assert!(budget.take(later), "the bucket refilled while idle");
+        }
+        assert!(!budget.take(later), "and no further than the burst");
+    }
 
     fn header(chunk: &[u8]) -> VdAgentMessageHeader {
         VdAgentMessageHeader::decode(chunk).unwrap()
@@ -1006,7 +1254,7 @@ mod tests {
 
     #[test]
     fn andris_announces_what_it_does() {
-        let caps = capabilities(1);
+        let caps = capabilities(1, true);
         assert_eq!(caps.request, 1);
         for cap in [
             VD_AGENT_CAP_MONITORS_CONFIG,
@@ -1019,5 +1267,60 @@ mod tests {
         }
         let set: u32 = caps.caps.iter().map(|word| word.count_ones()).sum();
         assert_eq!(set, 5, "nothing else");
+    }
+
+    #[test]
+    fn no_clipboard_announces_no_clipboard_capability() {
+        let caps = capabilities(1, false);
+        assert_eq!(caps.request, 1, "the request is unaffected");
+        for cap in [VD_AGENT_CAP_MONITORS_CONFIG, VD_AGENT_CAP_REPLY] {
+            assert!(caps.has_capability(cap), "capability {cap} is kept");
+        }
+        for cap in [
+            VD_AGENT_CAP_CLIPBOARD_BY_DEMAND,
+            VD_AGENT_CAP_CLIPBOARD_SELECTION,
+            VD_AGENT_CAP_GUEST_LINEEND_LF,
+        ] {
+            assert!(!caps.has_capability(cap), "capability {cap} is withheld");
+        }
+        let set: u32 = caps.caps.iter().map(|word| word.count_ones()).sum();
+        assert_eq!(set, 2, "resizing and replies, and nothing else");
+    }
+
+    /// `lossy_len` has to agree with the conversion it stands in for,
+    /// exactly: it is what decides whether that conversion is built at
+    /// all, so a count that is too low would let an over-long text
+    /// through, and one too high would drop a text that fits.
+    #[test]
+    fn lossy_len_counts_what_the_conversion_would_build() {
+        for bytes in [
+            b"".to_vec(),
+            b"plain".to_vec(),
+            // One invalid byte, alone and between valid text.
+            vec![0xff],
+            b"a\xffb".to_vec(),
+            // A run of invalid bytes is one replacement each.
+            vec![0xff; 32],
+            // 0xc3 opens a two-byte sequence. Cut short by the end of the
+            // input it is one replacement for the whole tail, which is
+            // the case `error_len()` reports as `None`.
+            vec![0xc3],
+            b"a\xc3".to_vec(),
+            // And cut short by the start of the next sequence.
+            b"a\xc3\xc3\xa9".to_vec(),
+            // Valid multi-byte sequences count as their own bytes.
+            "h\u{e9}llo".as_bytes().to_vec(),
+            "h\u{e9}llo\u{fffd}".as_bytes().to_vec(),
+            // An over-long encoding of NUL, which UTF-8 forbids.
+            vec![0xc0, 0x80],
+            // A lone surrogate's encoding, likewise.
+            vec![0xed, 0xa0, 0x80],
+        ] {
+            assert_eq!(
+                lossy_len(&bytes),
+                String::from_utf8_lossy(&bytes).len(),
+                "{bytes:02x?}"
+            );
+        }
     }
 }

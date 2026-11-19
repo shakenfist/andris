@@ -973,6 +973,13 @@ version of this Result said 29, counted from the grouping rather than
 the finding tables, and so dropped T4 and S6; the per-finding table in
 the triage section is now the authority and reconciles to 32.
 
+"All still present" was true on the day. Eleven of the thirty-two --
+#87, #88, #91 and #92, the security ones -- were fixed after this
+phase merged, in the follow-up that filled its `Merged` cell. The
+master plan's deferred-items section tracks what is left and is the
+place to read for the current state; this Result is left as the
+record of what the audit found.
+
 The assembled patch matched the plan's four gate numbers exactly --
 365 diff rows, 63,239 insertions, 2,560 deletions, 149 distinct paths
 -- verified twice, once by `--numstat` over the 16 landings and again

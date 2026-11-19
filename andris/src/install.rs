@@ -206,6 +206,10 @@ pub enum TicketState {
     /// There was one, and it was left alone, but andris would refuse it,
     /// for this reason.
     Refused(String),
+    /// There was none, and none was written, because the directory it
+    /// would go in is open to group or other: these are its permission
+    /// bits.
+    NotCreated { mode: u32 },
 }
 
 /// What [`install`] did.
@@ -258,7 +262,7 @@ pub fn install(config_home: &Path, exe: &Path) -> Result<Report> {
     let config_dir_state = make_config_dir(&config_dir)?;
 
     let ticket_path = config_dir.join("ticket");
-    let ticket = make_ticket(&ticket_path)?;
+    let ticket = make_ticket(&ticket_path, config_dir_state)?;
 
     Ok(Report {
         unit_path,
@@ -352,7 +356,21 @@ fn make_config_dir(path: &Path) -> Result<ConfigDirState> {
 
 /// Write a new ticket to `path` if there is no ticket there, or check the
 /// one that is.
-fn make_ticket(path: &Path) -> Result<TicketState> {
+///
+/// No new ticket is written into a directory `dir` says is open to group
+/// or other. The file itself would be created `O_EXCL` and mode 0600, so
+/// nobody else could read it, but anyone who can write the directory can
+/// unlink it and put their own ticket there -- and a ticket andris wrote
+/// is one the operator is about to trust. A ticket already in such a
+/// directory is still reported as it was: it is the operator's, it may
+/// predate the loose permissions, and refusing to look at it would help
+/// nobody.
+fn make_ticket(path: &Path, dir: ConfigDirState) -> Result<TicketState> {
+    if let ConfigDirState::OpenToOthers { mode } = dir
+        && !path.try_exists().unwrap_or(false)
+    {
+        return Ok(TicketState::NotCreated { mode });
+    }
     let created = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -429,6 +447,12 @@ impl fmt::Display for Report {
                 f,
                 "{ticket} already exists, and is unchanged, but andris would refuse it: \
                  {reason}"
+            ),
+            TicketState::NotCreated { mode } => writeln!(
+                f,
+                "No ticket was written to {ticket}: the directory above is open to group \
+                 or other (mode {mode:04o}), where another user could replace a ticket \
+                 andris wrote."
             ),
         }
     }
@@ -548,8 +572,34 @@ pub fn run() -> Result<()> {
     )?;
     let report = install(&config_home, &exe)?;
     let display = std::env::var("DISPLAY").ok();
-    print!("{report}\n{}", next_steps(display.as_deref()));
+    let Some(steps) = steps_after(&report, display.as_deref()) else {
+        print!("{report}");
+        // The report has just given the remedy, with the directory's
+        // name, so this only says what it is for.
+        bail!(
+            "no ticket was written, so andris would refuse to start: fix the directory as \
+             above, then run andris install-unit again"
+        );
+    };
+    print!("{report}\n{steps}");
     Ok(())
+}
+
+/// The steps to print after `report`, or `None` when there is nothing to
+/// start.
+///
+/// Without a ticket andris refuses to start -- it reads `--ticket-file`
+/// before it serves anything, and the unit names a file that is not
+/// there -- so telling the operator to enable and start the unit would
+/// be telling them to start something that cannot come up. `run` fails
+/// instead, so that a script installing andris stops on it.
+fn steps_after(report: &Report, display: Option<&str>) -> Option<String> {
+    match report.ticket {
+        TicketState::NotCreated { .. } => None,
+        TicketState::Created | TicketState::Existing | TicketState::Refused(_) => {
+            Some(next_steps(display))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -818,7 +868,75 @@ mod tests {
         assert_eq!(mode(&config_dir), 0o755);
         let shown = report.to_string();
         assert!(shown.contains("mode 0755"), "{shown}");
-        assert!(shown.contains("chmod 700"), "{shown}");
+        // The remedy is given once, by the line about the directory, and
+        // not again by the line about the ticket.
+        assert_eq!(shown.matches("chmod 700").count(), 1, "{shown}");
+
+        // And no ticket is written into it: the file would be 0600, but
+        // anyone who can write the directory can replace it.
+        assert_eq!(report.ticket, TicketState::NotCreated { mode: 0o755 });
+        assert!(
+            !report.ticket_path.try_exists().unwrap(),
+            "no ticket was left behind"
+        );
+        assert!(shown.contains("No ticket was written"), "{shown}");
+
+        // Without a ticket the unit cannot start, so the operator is not
+        // told to start it. `run` fails instead of printing these.
+        assert_eq!(steps_after(&report, Some(":10")), None);
+    }
+
+    /// The counterpart: an install that did leave a usable ticket says
+    /// how to start the unit.
+    #[test]
+    fn an_install_with_a_ticket_says_how_to_start_it() {
+        let (dir, exe) = home();
+        let report = install(dir.path(), &exe).unwrap();
+        assert_eq!(report.ticket, TicketState::Created);
+        let steps = steps_after(&report, Some(":10")).unwrap();
+        assert!(
+            steps.contains("systemctl --user enable andris@10"),
+            "{steps}"
+        );
+
+        // A ticket andris would refuse is still a ticket: the operator is
+        // told what is wrong with it and how to start the unit, because
+        // replacing the file is all that is left to do.
+        let refused = Report {
+            ticket: TicketState::Refused("too short".to_string()),
+            ..report.clone()
+        };
+        assert!(steps_after(&refused, Some(":10")).is_some());
+        let existing = Report {
+            ticket: TicketState::Existing,
+            ..report
+        };
+        assert!(steps_after(&existing, Some(":10")).is_some());
+    }
+
+    /// A ticket already in a loose directory is the operator's, and may
+    /// predate the permissions, so it is reported as it would be anywhere.
+    #[test]
+    fn an_existing_ticket_in_an_open_directory_is_still_read() {
+        let (dir, exe) = home();
+        let config_dir = dir.path().join("andris");
+        fs::create_dir(&config_dir).unwrap();
+        let ticket = config_dir.join("ticket");
+        fs::write(&ticket, "theirs, all theirs\n").unwrap();
+        fs::set_permissions(&ticket, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let report = install(dir.path(), &exe).unwrap();
+        assert_eq!(
+            report.config_dir_state,
+            ConfigDirState::OpenToOthers { mode: 0o755 }
+        );
+        assert_eq!(report.ticket, TicketState::Existing);
+        assert_eq!(
+            fs::read_to_string(&ticket).unwrap(),
+            "theirs, all theirs\n",
+            "it is unchanged"
+        );
     }
 
     #[test]

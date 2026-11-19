@@ -20,12 +20,13 @@
 //! spice-gtk, can send them. They are dropped without a warning, since
 //! the shift keys themselves arrive unprefixed.
 //!
-//! Any other code with no mapping is dropped, with a warning logged once
-//! per code for each decoder.
+//! Any other code with no mapping is dropped, and logged once per code
+//! for each decoder: at warning level for the first
+//! [`UNMAPPED_WARNINGS`] of them, and at debug level after that.
 
 use std::collections::HashSet;
 
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::platform::EvdevCode;
 
@@ -91,12 +92,25 @@ enum Prefix {
     E1(Option<u8>),
 }
 
+/// How many distinct unmapped codes one decoder reports at warning level
+/// before the rest go to debug.
+///
+/// The client chooses which codes it sends and there are 65,536 of them,
+/// so without a bound one inputs channel could write that many warnings,
+/// and relinking the channel starts a fresh decoder. A handful names the
+/// keyboard andris is failing to understand, which is what the warning
+/// is for; the rest is noise a client can produce at will.
+const UNMAPPED_WARNINGS: usize = 8;
+
 /// Decodes set-1 bytes into key strokes, keeping prefixes across calls.
 #[derive(Debug)]
 pub struct KeyDecoder {
     prefix: Prefix,
     /// The unmapped codes already logged, as the prefix byte (or 0) in
-    /// the high byte and the code in the low.
+    /// the high byte and the code in the low. A client can fill it with
+    /// all 65,536, a few hundred KiB for the life of the inputs channel;
+    /// that is bounded by `u16` and small, so it is not capped, and it is
+    /// what keeps each code to one line at debug level too.
     logged: HashSet<u16>,
 }
 
@@ -195,12 +209,27 @@ impl KeyDecoder {
         }
     }
 
-    /// Log `code` the first time it is seen.
+    /// Log `code` the first time this decoder sees it.
     fn unmapped(&mut self, code: u16, what: &str) {
-        if self.logged.insert(code) {
-            warn!(
-                code = format!("{code:#06x}"),
+        if !self.logged.insert(code) {
+            return;
+        }
+        let shown = format!("{code:#06x}");
+        if self.logged.len() > UNMAPPED_WARNINGS {
+            debug!(
+                code = shown,
                 "an unmapped set-1 {what} was dropped (logged once per code)"
+            );
+            return;
+        }
+        warn!(
+            code = shown,
+            "an unmapped set-1 {what} was dropped (logged once per code)"
+        );
+        if self.logged.len() == UNMAPPED_WARNINGS {
+            warn!(
+                "{UNMAPPED_WARNINGS} unmapped codes have been reported for this inputs \
+                 channel; any others are logged at debug level"
             );
         }
     }
@@ -208,6 +237,8 @@ impl KeyDecoder {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
 
     fn press(code: u16) -> KeyStroke {
@@ -345,6 +376,76 @@ mod tests {
         assert_eq!(decoder.bytes(&[0xE0, 0x10, 0x1E]), vec![press(30)]);
         assert_eq!(decoder.logged.len(), 2);
         assert!(decoder.logged.contains(&0xE010));
+    }
+
+    /// A writer for this test's own subscriber, keeping what it is given.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl Captured {
+        fn text(&self) -> String {
+            let held = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            String::from_utf8_lossy(&held).into_owned()
+        }
+    }
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// The client picks which codes it sends, so what it can write to the
+    /// log at warning level has to be bounded. A subscriber set for this
+    /// thread sees what the decoder logs on it.
+    #[test]
+    fn unmapped_codes_stop_warning_after_a_handful() {
+        let logs = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let mut decoder = KeyDecoder::new();
+        let sent = 1000;
+        for code in 0..sent {
+            decoder.unmapped(code, "key");
+        }
+
+        let text = logs.text();
+        assert_eq!(
+            text.matches("was dropped").count(),
+            UNMAPPED_WARNINGS,
+            "{text}"
+        );
+        assert_eq!(
+            text.matches("logged at debug level").count(),
+            1,
+            "the bound is announced once: {text}"
+        );
+        assert_eq!(
+            decoder.logged.len(),
+            usize::from(sent),
+            "every code is still reported at most once"
+        );
     }
 
     #[test]

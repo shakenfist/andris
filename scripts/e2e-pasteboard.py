@@ -37,18 +37,15 @@ from Xlib.ext import xfixes
 from Xlib.protocol import event as xevent
 
 
-def text_hash(data):
-    """The 32-bit FNV-1a hash of bytes `data`, as eight hex digits: andris's debug logs carry the same, so a text
-    can be followed through both without logging it."""
-    value = 0x811c9dc5
-    for byte in data:
-        value = ((value ^ byte) * 0x01000193) & 0xffffffff
-    return f'{value:08x}'
-
-
 def describe(data):
-    """`data`'s length and hash, for a log line."""
-    return f'{len(data)} bytes, hash {text_hash(data)}'
+    """`data`'s length, for a log line.
+
+    This used to carry an unkeyed FNV-1a hash of the text as well, matching the one in andris's debug logs, so that
+    one text could be followed through both. Andris now keys that hash per process, because an unkeyed 32-bit hash of
+    a short text can be inverted by hashing candidates, so there is nothing left to match and a hash here would only
+    be a fingerprint of clipboard text in another log. Length and ordering identify a text within one run.
+    """
+    return f'{len(data)} bytes'
 
 
 class Pasteboard:

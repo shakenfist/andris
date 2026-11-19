@@ -328,7 +328,14 @@ async fn damage_and_both_capture_paths_see_a_drawing() {
         ]
     );
 
-    let get_image = X11Platform::connect_with(&display, X11Options { shm: false }).unwrap();
+    let get_image = X11Platform::connect_with(
+        &display,
+        X11Options {
+            shm: false,
+            ..X11Options::default()
+        },
+    )
+    .unwrap();
     assert_eq!(get_image.capture_method(), CaptureMethod::GetImage);
     let (get_image_rects, get_image_all) = captures(&get_image, &rects);
     assert_eq!(summary(&shm_rects), summary(&get_image_rects));
@@ -897,6 +904,60 @@ async fn another_owner_takes_the_clipboard_from_andris() {
     assert_eq!(reported(&mut changes).await, None);
     assert_eq!(paste(&display, "UTF8_STRING"), None);
     eprintln!("andris gave X display {display}'s clipboard up to another program");
+}
+
+/// Whether `owner`, which owns a selection, is asked for it within
+/// `bound`.
+fn asked_within(owner: &RustConnection, bound: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < bound {
+        while let Some(event) = owner.poll_for_event().unwrap() {
+            if let Event::SelectionRequest(_) = event {
+                return true;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+#[tokio::test]
+async fn with_the_clipboard_off_andris_never_reads_it() {
+    let Some(display) = display() else {
+        return;
+    };
+    let _turn = DISPLAY_TURN.lock().await;
+    // An owner that answers nothing, but notices being asked.
+    let (owner, window, clipboard) = client(&display, "CLIPBOARD");
+    owner
+        .set_selection_owner(window, clipboard, x11rb::CURRENT_TIME)
+        .unwrap();
+    owner.flush().unwrap();
+
+    let off = X11Platform::connect_with(
+        &display,
+        X11Options {
+            clipboard: false,
+            ..X11Options::default()
+        },
+    )
+    .unwrap();
+    assert!(off.platform().clipboard.is_none());
+    assert!(off.set(Arc::from("not shared")).is_err());
+    assert!(
+        !asked_within(&owner, Duration::from_secs(1)),
+        "andris asked for the clipboard with the clipboard off"
+    );
+
+    // The same owner is asked as soon as a platform with the clipboard on
+    // starts, so the silence above was andris's, not the test's.
+    let on = X11Platform::connect(&display).unwrap();
+    assert!(on.platform().clipboard.is_some());
+    assert!(
+        asked_within(&owner, CLIPBOARD_BOUND),
+        "andris did not ask for the clipboard with the clipboard on"
+    );
+    eprintln!("with the clipboard off, andris left X display {display}'s alone");
 }
 
 #[tokio::test]

@@ -63,7 +63,9 @@ pub mod qemu;
 pub mod synthetic;
 pub mod x11;
 
-use std::sync::Arc;
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, bail, ensure};
 // Plain constants, so that a frame andris captures is never larger than
@@ -83,16 +85,41 @@ pub use damage::{DamageHub, DamageSubscription, Rectangle, Region, TILE};
 /// Larger text is dropped, with a warning, rather than copied.
 pub const MAX_CLIPBOARD_TEXT: usize = 16 * 1024 * 1024;
 
-/// A short fingerprint of clipboard `text` for debug logs, so that one text
-/// can be followed across andris, its clients and other programs without
-/// logging the text: the 32-bit FNV-1a hash of its UTF-8 bytes, as eight
-/// hex digits. It is not a secret: a short text can be found from it by
-/// trying candidates, which is why only debug logs carry it.
+/// The key [`text_hash`] is computed under, chosen once per process.
+static HASH_KEY: OnceLock<RandomState> = OnceLock::new();
+
+/// A short fingerprint of clipboard `text` for debug logs, so that one
+/// text can be followed through andris's log lines without logging the
+/// text: a hash of its UTF-8 bytes under a key this process picked at
+/// start-up, as sixteen hex digits.
+///
+/// The key is the point, and it is why a hash means nothing outside the
+/// run that produced it. This was an unkeyed FNV-1a hash, which a short
+/// text can be recovered from by hashing candidates until one matches --
+/// and a password, a card number or a six-digit code is short enough for
+/// that to cost nothing. "Only debug logs carry it" was the mitigation,
+/// and it is thin, because enabling debug logging is exactly what an
+/// operator does when the clipboard is misbehaving, which is to say
+/// while real things are being copied. Under a key the log is still
+/// enough to follow a text from the desktop to the client, and no use to
+/// anyone who reads the log afterwards.
+///
+/// The key guards against inverting a hash from the log. It does not
+/// guard against a client that can both set the clipboard and read the
+/// log, which can put a candidate on the clipboard and compare: andris
+/// cannot defend that, since such a client could read the clipboard
+/// directly.
+///
+/// What this asks of the hasher is that it be keyed from a secret this
+/// process picks, and not invertible without that key; nothing needs it
+/// stable beyond one process. [`RandomState`] meets that today, as
+/// SipHash-1-3 keyed from the operating system's randomness, but std
+/// promises only "keyed and random", not the algorithm. Were that ever
+/// weakened, this is the function to give an explicit keyed hash.
 pub fn text_hash(text: &str) -> String {
-    let hash = text.bytes().fold(0x811c_9dc5_u32, |hash, byte| {
-        (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
-    });
-    format!("{hash:08x}")
+    let mut hasher = HASH_KEY.get_or_init(RandomState::new).build_hasher();
+    hasher.write(text.as_bytes());
+    format!("{:016x}", hasher.finish())
 }
 
 /// The size of a desktop or frame, in pixels.
@@ -727,7 +754,9 @@ pub struct Platform {
     pub input: Arc<dyn InputSink>,
     pub cursor: Arc<dyn CursorSource>,
     pub display_control: Arc<dyn DisplayControl>,
-    pub clipboard: Arc<dyn Clipboard>,
+    /// The desktop's clipboard, or `None` when andris shares none
+    /// (`--no-clipboard`).
+    pub clipboard: Option<Arc<dyn Clipboard>>,
     /// The desktop's sound, or `None` when andris captures none
     /// (`--no-audio`).
     pub audio: Option<Arc<dyn AudioSource>>,
@@ -740,12 +769,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn text_hash_is_fnv1a_32() {
-        // The published FNV-1a test vectors, which the e2e pasteboard's
-        // hash must match too.
-        assert_eq!(text_hash(""), "811c9dc5");
-        assert_eq!(text_hash("a"), "e40c292c");
-        assert_eq!(text_hash("foobar"), "bf9cf968");
+    fn text_hash_follows_one_text_within_a_run() {
+        // Stable within the process, which is what following a text
+        // through the log needs, and different for different texts.
+        assert_eq!(text_hash("foobar"), text_hash("foobar"));
+        assert_ne!(text_hash("foobar"), text_hash("foobaz"));
+        assert_ne!(text_hash(""), text_hash("a"));
+        assert_eq!(text_hash("").len(), 16, "sixteen hex digits");
+        // Not the unkeyed FNV-1a hash this replaced, whose published
+        // vectors a reader could have inverted with a word list.
+        assert_ne!(text_hash(""), "811c9dc5");
     }
 
     #[test]

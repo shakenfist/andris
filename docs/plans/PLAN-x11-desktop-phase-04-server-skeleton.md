@@ -1213,7 +1213,9 @@ message says why.
 - **Step 2.**
   - At most eight handshakes run at once, so an unauthenticated flood
     cannot spend unbounded CPU on key generation. This was added at
-    design review.
+    design review. (The figure was eight when this phase landed. The
+    pool is 64 now, with a per-address allowance that falls as it
+    fills; `docs/running.md` carries the current limits.)
   - A main link's session begins after the ticket checks out but before
     `Ok` is sent, so a client that hears `Ok` always finds its session.
 - **Step 4.**

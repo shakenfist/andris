@@ -4,7 +4,8 @@
 //! # Threads
 //!
 //! x11rb's `RustConnection` is synchronous, so the backend opens five
-//! connections to the display, each owned by its own thread:
+//! connections to the display, each owned by its own thread, or four
+//! when [`X11Options::clipboard`] is off:
 //!
 //! - **capture** answers size and capture requests with `GetGeometry` on
 //!   the root window, and one image per rectangle asked for: with
@@ -99,7 +100,7 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 use x11rb::connection::{Connection, RequestConnection};
@@ -143,11 +144,20 @@ pub struct X11Options {
     /// Whether capture may use MIT-SHM. With `false` it always uses
     /// `GetImage`, which tests use to compare the two.
     pub shm: bool,
+    /// Whether to follow the desktop's clipboard. With `false`, as under
+    /// `--no-clipboard`, the clipboard connection, its window and its two
+    /// threads are never started: andris does not watch `CLIPBOARD`,
+    /// fetches no text from it and logs nothing about it, and
+    /// [`X11Platform::platform`] offers no [`Clipboard`].
+    pub clipboard: bool,
 }
 
 impl Default for X11Options {
     fn default() -> Self {
-        Self { shm: true }
+        Self {
+            shm: true,
+            clipboard: true,
+        }
     }
 }
 
@@ -205,8 +215,6 @@ pub struct X11Platform {
     cursor_waker: Waker,
     /// Wakes the damage thread on drop.
     damage_waker: Waker,
-    /// Wakes the clipboard thread on drop.
-    clipboard_waker: Waker,
     /// The desktop's damage, for every subscriber; the damage thread
     /// reports to it.
     damage: Arc<DamageHub>,
@@ -215,9 +223,18 @@ pub struct X11Platform {
     /// Set by whichever backend thread first finds its connection dead;
     /// each holds a sender.
     gone: GoneSignal,
-    /// Queues text for the clipboard thread, and holds the desktop's text
-    /// as it reports it.
-    clipboard: ClipboardHandle,
+    /// The clipboard thread, or `None` when [`X11Options::clipboard`] is
+    /// off and it was never started.
+    clipboard: Option<X11Clipboard>,
+}
+
+/// The platform's side of the clipboard thread.
+struct X11Clipboard {
+    /// Queues text for the thread, and holds the desktop's text as it
+    /// reports it.
+    handle: ClipboardHandle,
+    /// Wakes the thread on drop.
+    waker: Waker,
 }
 
 impl X11Platform {
@@ -291,10 +308,18 @@ impl X11Platform {
         let (shapes, cursor) = watch::channel(first_shape.map(Arc::new));
         let (gone_sender, gone) = GoneSignal::new();
 
-        let (clipboard_conn, _) = open(name, "the clipboard")?;
-        let clipboard_conn = Arc::new(clipboard_conn);
-        let started = start_clipboard(clipboard_conn.clone(), root, gone_sender.clone())
-            .with_context(|| format!("following the clipboard on X display {name}"))?;
+        // Started last, after every check that can fail, and only when
+        // asked for: with the clipboard off andris does not so much as
+        // watch it.
+        let clipboard = if options.clipboard {
+            let (clipboard_conn, _) = open(name, "the clipboard")?;
+            let clipboard_conn = Arc::new(clipboard_conn);
+            let started = start_clipboard(clipboard_conn.clone(), root, gone_sender.clone())
+                .with_context(|| format!("following the clipboard on X display {name}"))?;
+            Some((clipboard_conn, started))
+        } else {
+            None
+        };
 
         let (capture, capture_queue) = mpsc::channel();
         let thread_gone = gone_sender.clone();
@@ -321,12 +346,24 @@ impl X11Platform {
             gone: gone_sender,
         };
         spawn("andris-x11-damage", move || serve_damage(thread))?;
-        let clipboard_thread = started.thread;
-        spawn("andris-x11-clipboard", move || {
-            serve_clipboard(clipboard_thread)
-        })?;
-        let timer = started.timer;
-        spawn("andris-x11-clipboard-timer", move || serve_timer(timer))?;
+        let clipboard = match clipboard {
+            Some((conn, started)) => {
+                let clipboard_thread = started.thread;
+                spawn("andris-x11-clipboard", move || {
+                    serve_clipboard(clipboard_thread)
+                })?;
+                let timer = started.timer;
+                spawn("andris-x11-clipboard-timer", move || serve_timer(timer))?;
+                Some(X11Clipboard {
+                    waker: Waker {
+                        conn,
+                        window: started.handle.window,
+                    },
+                    handle: started.handle,
+                })
+            }
+            None => None,
+        };
 
         Ok(Arc::new(Self {
             capture,
@@ -340,14 +377,10 @@ impl X11Platform {
                 conn: damage_conn,
                 window: damage_window,
             },
-            clipboard_waker: Waker {
-                conn: clipboard_conn,
-                window: started.handle.window,
-            },
             damage,
             using_shm,
             gone,
-            clipboard: started.handle,
+            clipboard,
         }))
     }
 
@@ -363,7 +396,8 @@ impl X11Platform {
     }
 
     /// This platform as the six display seams, with no sound, and its gone
-    /// signal.
+    /// signal. The clipboard is `None` when [`X11Options::clipboard`] is
+    /// off.
     pub fn platform(self: &Arc<Self>) -> Platform {
         Platform {
             geometry: self.clone(),
@@ -371,7 +405,10 @@ impl X11Platform {
             input: self.clone(),
             cursor: self.clone(),
             display_control: self.clone(),
-            clipboard: self.clone(),
+            clipboard: self
+                .clipboard
+                .is_some()
+                .then(|| self.clone() as Arc<dyn Clipboard>),
             // Sound comes from the session's sound server, not the X
             // display: `andris` adds a PulseAudio source alongside.
             audio: None,
@@ -387,7 +424,9 @@ impl Drop for X11Platform {
         // clipboard threads, which are waiting for X events.
         self.cursor_waker.wake();
         self.damage_waker.wake();
-        self.clipboard_waker.wake();
+        if let Some(clipboard) = &self.clipboard {
+            clipboard.waker.wake();
+        }
     }
 }
 
@@ -452,11 +491,17 @@ impl DisplayControl for X11Platform {
     }
 }
 
+/// [`X11Platform::platform`] offers this only while the clipboard thread
+/// runs; called directly on a platform whose clipboard is off, it reports
+/// no text and refuses to set any.
 impl Clipboard for X11Platform {
     /// The text the clipboard thread fetched from the program that last
     /// took `CLIPBOARD`; see [`clipboard`].
     fn changes(&self) -> ClipboardReceiver {
-        self.clipboard.changes()
+        match &self.clipboard {
+            Some(clipboard) => clipboard.handle.changes(),
+            None => watch::channel(None).1,
+        }
     }
 
     /// Queues the text for the clipboard thread, which takes `CLIPBOARD`
@@ -465,7 +510,10 @@ impl Clipboard for X11Platform {
     ///
     /// [`MAX_CLIPBOARD_TEXT`]: super::MAX_CLIPBOARD_TEXT
     fn set(&self, text: Arc<str>) -> Result<()> {
-        self.clipboard.set(text)
+        match &self.clipboard {
+            Some(clipboard) => clipboard.handle.set(text),
+            None => bail!("the clipboard is off"),
+        }
     }
 }
 

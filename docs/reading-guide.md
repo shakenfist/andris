@@ -192,9 +192,12 @@ The listeners and the task model. `Server::bind()` and `spawn()` start
 one accept task per listener; each connection gets one task that links
 it and then serves its channel. Look at the limits on unauthenticated
 peers in `admit()`: a connection holds one of `MAX_HANDSHAKES` permits
-and one of `MAX_HANDSHAKES_PER_PEER` slots for its source address (IPv6
-counted by /64) until its handshake ends, and a plain listener that only
-redirects to TLS has permits of its own. `LogThrottle` keeps a peer from
+and a slot for its source address (IPv6 counted by /64) until its
+handshake ends, and a plain listener that only redirects to TLS has
+permits of its own. `peer_allowance()` decides how many slots one
+address may hold -- `MAX_HANDSHAKES_PER_PEER` while the pool is quiet,
+falling to one as it fills -- and the comment there says why a fixed cap
+bounded nothing. `LogThrottle` keeps a peer from
 flooding the log. Look at `ServerHandle::stop()`: it waits for every
 task's `mpsc` sender to drop, then reads the lock state on the blocking
 pool purely as a barrier, because that read runs after every queued
@@ -207,9 +210,14 @@ read_link_mess, send_need_secured}`.
 
 The link handshake and ticket authentication, in kerbside's order.
 `handshake()` reads the link message, refuses a client without
-`AUTH_SELECTION` and `MINI_HEADER`, a channel andris does not serve, or
-a secondary channel that does not name the current session, then
-generates a fresh RSA key per connection, reads the ticket and answers.
+`AUTH_SELECTION` and `MINI_HEADER` or a channel andris does not serve,
+then generates a fresh RSA key per connection, reads the ticket and
+answers. A secondary channel that does not name the current session is
+refused only after the ticket, as `PermissionDenied`: checked before it,
+as it once was, the refusal told a peer that had authenticated nothing
+whether a guessed 32-bit connection id was the live session. The comment
+there says why the code cannot be the more informative
+`BadConnectionId` by then.
 Look at the link-and-ticket check: every stage is under a time limit
 (`HandshakeTimeouts`), key generation runs on the blocking pool under a
 semaphore whose permit moves into the task, `ticket_matches()` compares
@@ -459,7 +467,10 @@ crossed in either direction to break loops between two clipboard
 bridges, and normalised to LF line ends before comparing because RDP
 carries CRLF. The module comment names the known gap in that comparison.
 A monitors config resizes through `DisplayControl` on the blocking pool,
-and the main channel waits for the answer. Ryll types:
+and the main channel waits for the answer. `ResizeBudget` is consulted
+first, so a client that asks too often is refused before the desktop is
+touched; a resize the desktop refuses spends budget too, since the cost
+being limited is the attempt. Ryll types:
 `messages::agent_stream::{AgentReassembler, AgentMessage,
 AgentStreamItem}`, `messages::vd_agent::*`, `constants::vd_agent::*`,
 `AgentTokens`.

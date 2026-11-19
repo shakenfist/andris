@@ -20,7 +20,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use support::{
-    TestClient, TestServer, WAIT, closed_within, loopback, tcp_from, ticket, wait_until,
+    Captured, TestClient, TestServer, WAIT, closed_within, loopback, tcp_from, ticket, wait_until,
 };
 
 /// The client's `SET_ACK` must be the display and cursor channels' first
@@ -113,6 +113,10 @@ async fn client_without_mini_header_gets_version_mismatch() {
     assert_eq!(reply.error, SpiceError::VersionMismatch);
 }
 
+/// The connection id is checked after the ticket, so that a peer which
+/// has authenticated nothing cannot ask whether a guessed id is the live
+/// session. The link therefore succeeds, and the refusal arrives as the
+/// auth result, saying only that permission was denied.
 #[tokio::test]
 async fn secondary_channel_with_wrong_connection_id_is_refused() {
     let server = TestServer::start().await;
@@ -120,7 +124,12 @@ async fn secondary_channel_with_wrong_connection_id_is_refused() {
     // No session at all.
     let mut client = TestClient::connect(server.addr()).await;
     let reply = client.link(1234, ChannelType::Display).await;
-    assert_eq!(reply.error, SpiceError::BadConnectionId);
+    assert_eq!(reply.error, SpiceError::Ok, "the link itself is answered");
+    let error = client.auth(ticket()).await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("PermissionDenied"),
+        "{error:#}"
+    );
     client.expect_closed().await;
 
     // A session, but not this one.
@@ -128,7 +137,65 @@ async fn secondary_channel_with_wrong_connection_id_is_refused() {
     let wrong = session.wrapping_add(1).max(1);
     let mut client = TestClient::connect(server.addr()).await;
     let reply = client.link(wrong, ChannelType::Inputs).await;
-    assert_eq!(reply.error, SpiceError::BadConnectionId);
+    assert_eq!(reply.error, SpiceError::Ok);
+    let error = client.auth(ticket()).await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("PermissionDenied"),
+        "{error:#}"
+    );
+}
+
+/// A client with the right ticket, refused because its session has gone,
+/// is told what a wrong ticket is told, so the operator is the one who
+/// has to tell the two apart: the log says which, at the level the wrong
+/// ticket's line is, with the id the client asked for.
+#[tokio::test(flavor = "current_thread")]
+async fn a_refused_stale_session_is_logged_at_info() {
+    let (logs, _guard) = Captured::start(tracing::Level::INFO);
+    let server = TestServer::start().await;
+    let (_main, session) = server.open_main().await;
+    let stale = session.wrapping_add(1).max(1);
+
+    let mut client = TestClient::connect(server.addr()).await;
+    assert_eq!(
+        client.link(stale, ChannelType::Display).await.error,
+        SpiceError::Ok
+    );
+    let error = client.auth(ticket()).await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("PermissionDenied"),
+        "{error:#}"
+    );
+    client.expect_closed().await;
+
+    let text = logs.text();
+    let line = text
+        .lines()
+        .find(|line| line.contains("a session that is not current"))
+        .unwrap_or_else(|| panic!("no line for the stale session: {text}"));
+    assert!(line.contains("INFO"), "{line}");
+    assert!(line.contains(&format!("connection_id={stale}")), "{line}");
+    assert!(line.contains(r#"channel="display""#), "{line}");
+    assert!(!text.contains("ticket is wrong"), "{text}");
+}
+
+/// A peer that has not authenticated learns nothing about which ids are
+/// live: a guessed id and the real one are answered identically, and only
+/// the ticket tells them apart.
+#[tokio::test]
+async fn an_unauthenticated_peer_cannot_probe_connection_ids() {
+    let server = TestServer::start().await;
+    let (_main, session) = server.open_main().await;
+
+    let mut guessed = TestClient::connect(server.addr()).await;
+    let for_guess = guessed
+        .link(session.wrapping_add(1).max(1), ChannelType::Display)
+        .await;
+    let mut real = TestClient::connect(server.addr()).await;
+    let for_real = real.link(session, ChannelType::Display).await;
+
+    assert_eq!(for_guess.error, for_real.error, "the same verdict");
+    assert_eq!(for_real.error, SpiceError::Ok);
 }
 
 #[tokio::test]
@@ -167,10 +234,16 @@ async fn second_main_link_closes_first_sessions_channels() {
     display.expect_closed().await;
     inputs.expect_closed().await;
 
-    // The old id no longer links; the new one does.
+    // The old id no longer links; the new one does. The refusal comes
+    // after the ticket, so the link is answered first.
     let mut client = TestClient::connect(server.addr()).await;
     let reply = client.link(first, ChannelType::Cursor).await;
-    assert_eq!(reply.error, SpiceError::BadConnectionId);
+    assert_eq!(reply.error, SpiceError::Ok);
+    let error = client.auth(ticket()).await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("PermissionDenied"),
+        "{error:#}"
+    );
     let mut cursor = server.open(second, ChannelType::Cursor).await;
     expect_set_ack(&mut cursor).await;
 }
@@ -272,28 +345,34 @@ async fn stop_waits_for_a_connection_still_in_its_handshake() {
 }
 
 #[tokio::test]
-async fn ninth_concurrent_handshake_is_refused() {
-    let server = TestServer::start().await;
+async fn a_handshake_past_the_pool_is_refused() {
+    // A long first stage, because the connections below never send a
+    // byte: the default three seconds would start expiring the earliest
+    // of them before the pool was full.
+    let server = TestServer::start_with_timeouts(HandshakeTimeouts {
+        first_stage: Duration::from_secs(30),
+        ..HandshakeTimeouts::default()
+    })
+    .await;
 
-    // Eight clients, from eight addresses so the per-address cap does not
-    // apply, link and then hold their handshakes open, never sending a
-    // ticket.
+    // One connection per address, so that each stays within its allowance
+    // however full the pool becomes. None of them sends anything, which
+    // is the case that matters: a permit is held from accept onwards, so a
+    // peer that has proved nothing holds one.
     let mut held = Vec::new();
     for n in 0..MAX_HANDSHAKES as u8 {
-        let mut client = TestClient::connect_from(server.addr(), loopback(10 + n)).await;
-        assert_eq!(
-            client.link(0, ChannelType::Main).await.error,
-            SpiceError::Ok
-        );
-        held.push(client);
+        held.push(tcp_from(server.addr(), loopback(64 + n)).await);
     }
-    assert_eq!(server.handle.handshakes_available(), 0);
+    wait_until("the handshake pool is full", || {
+        server.handle.handshakes_available() == 0
+    })
+    .await;
 
-    // A ninth is closed at once, before it sends anything.
-    let mut ninth = tcp_from(server.addr(), loopback(30)).await;
+    // One more is closed at once, before it sends anything.
+    let mut extra = tcp_from(server.addr(), loopback(200)).await;
     assert!(
-        closed_within(&mut ninth, PROMPTLY).await,
-        "the ninth connection was not closed promptly"
+        closed_within(&mut extra, PROMPTLY).await,
+        "the connection past the pool was not closed promptly"
     );
 
     // Releasing one handshake frees its permit for a new client.
@@ -302,7 +381,7 @@ async fn ninth_concurrent_handshake_is_refused() {
         server.handle.handshakes_available() == 1
     })
     .await;
-    let mut client = TestClient::connect_from(server.addr(), loopback(31)).await;
+    let mut client = TestClient::connect_from(server.addr(), loopback(201)).await;
     assert_eq!(
         client.link(0, ChannelType::Main).await.error,
         SpiceError::Ok
@@ -352,6 +431,54 @@ async fn one_address_holds_at_most_four_handshakes() {
         client.link(0, ChannelType::Main).await.error,
         SpiceError::Ok
     );
+}
+
+/// An address's allowance shrinks as the pool fills, so that holding the
+/// last permits costs an address each. `peer_allowance` is tested on its
+/// own; this is that the accept path consults it, with the pool it draws
+/// on as full as it really is.
+#[tokio::test]
+async fn a_nearly_full_pool_allows_one_address_fewer_handshakes() {
+    // Long, so the silent connections below hold their permits throughout.
+    let server = TestServer::start_with_timeouts(HandshakeTimeouts {
+        first_stage: Duration::from_secs(30),
+        ..HandshakeTimeouts::default()
+    })
+    .await;
+
+    // Fill all but eight of the pool, one connection per address so that
+    // none of them is near its own allowance.
+    const LEFT: usize = 8;
+    let mut held = Vec::new();
+    for n in 0..(MAX_HANDSHAKES - LEFT) as u8 {
+        held.push(tcp_from(server.addr(), loopback(64 + n)).await);
+    }
+    wait_until("the pool is nearly full", || {
+        server.handle.handshakes_available() == LEFT
+    })
+    .await;
+
+    // Now one address is allowed one handshake, not four...
+    const { assert!(MAX_HANDSHAKES_PER_PEER > 1) };
+    let crowded = loopback(220);
+    let _first = tcp_from(server.addr(), crowded).await;
+    wait_until("the address has its one handshake", || {
+        server.handle.handshakes_from(crowded) == 1
+    })
+    .await;
+    let mut second = tcp_from(server.addr(), crowded).await;
+    assert!(
+        closed_within(&mut second, PROMPTLY).await,
+        "a second connection from one address was served with the pool nearly full"
+    );
+
+    // ...though the pool has room, as another address shows.
+    let other = loopback(221);
+    let _another = tcp_from(server.addr(), other).await;
+    wait_until("another address is served", || {
+        server.handle.handshakes_from(other) == 1
+    })
+    .await;
 }
 
 #[tokio::test]

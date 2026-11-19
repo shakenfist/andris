@@ -14,8 +14,7 @@
 mod support;
 
 use std::collections::HashMap;
-use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use andris::platform::synthetic::{SQUARE_SIZE, SQUARE_TOP};
@@ -33,10 +32,9 @@ use shakenfist_spice_protocol::messages::{
     StreamDestroy, StreamReport, WireType,
 };
 use shakenfist_spice_protocol::{capabilities, display_client, display_server, main_server};
-use tracing_subscriber::fmt::MakeWriter;
 
 use support::display::*;
-use support::{TestClient, TestServer, display_options, wait_until};
+use support::{Captured, TestClient, TestServer, display_options, wait_until};
 
 /// A desktop with room for a video below the square's path, and for a
 /// second beside it.
@@ -416,49 +414,6 @@ fn cannot_decode(stream_id: u32) -> StreamReport {
         num_drops: u32::MAX,
         last_frame_delay: 0,
         audio_delay: 0,
-    }
-}
-
-/// What the server logs, for tests that read it.
-#[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<u8>>>);
-
-impl Captured {
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-    }
-
-    /// Capture what this thread logs at `level` and above, until the
-    /// guard is dropped. The server's tasks run on the thread of a
-    /// `current_thread` test, so this sees what they log.
-    fn start(level: tracing::Level) -> (Self, tracing::subscriber::DefaultGuard) {
-        let logs = Self::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(logs.clone())
-            .with_max_level(level)
-            .with_ansi(false)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        (logs, guard)
-    }
-}
-
-impl Write for Captured {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for Captured {
-    type Writer = Captured;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
     }
 }
 

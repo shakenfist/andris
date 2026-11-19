@@ -66,6 +66,7 @@ andris --ticket-file PATH [options]
 | `--jpeg-quality QUALITY` | `85` | The JPEG quality, 1 to 100, for areas that look photographic; `0` never sends JPEG (see [What a client gets](#what-a-client-gets)) |
 | `--no-audio` | off | Capture no sound, and offer clients no playback channel (see [Audio](#audio)) |
 | `--audio-source NAME` | `@DEFAULT_MONITOR@` | The PulseAudio source to capture the desktop's sound from; used by `--platform x11`, and refused with `--no-audio` and with `--platform synthetic` |
+| `--no-clipboard` | off | Share no clipboard in either direction, and announce no clipboard capability (see [Clipboard](#clipboard)) |
 
 `andris --help` prints the same list. Logs go to stderr at `info`
 level; set `RUST_LOG` (for example `RUST_LOG=andris=debug`) to
@@ -297,6 +298,15 @@ ticket is logged at `info` with the client's address, for tools such
 as fail2ban, at most once every 10 seconds with a count of those
 since the last.
 
+A client told that its ticket was refused, with no such line in the
+log, gave the right ticket for a channel of a session that had
+already ended: one that raced its own reconnect, say, or was replaced
+by another client. Andris refuses that the same way as a wrong
+ticket, so that a client which has not proved it holds the ticket
+learns nothing about which session is current, and logs it at `info`
+with the channel and the session's connection id, throttled as the
+wrong ticket is. Reconnecting fixes it.
+
 The `--tls-key` file is held to the same rules of ownership and mode.
 
 ## Listeners, TLS and the loopback rule
@@ -340,26 +350,45 @@ before it authenticates. A `.vv` file therefore needs `tls-port`,
 with or without `port`, and a client with one port field wants the
 TLS port in it.
 
-Unauthenticated connections are limited, so that a single peer
-cannot occupy every handshake slot. **These limits do not stop a
-determined client from locking others out:** with 8 slots overall and
-4 per address, two source addresses -- or two IPv6 /64s from one host
--- can hold every slot by connecting and sending nothing, after which
-other clients are refused. That is issue #87, and it is unfixed.
-Expose andris only where you would accept that.
+Unauthenticated connections are limited, so that a few peers cannot
+occupy every handshake slot. **The limits do not make andris proof
+against a distributed flood:** they raise the number of source
+addresses needed to hold every slot from two to about thirty, and an
+attacker with that many can still keep other clients out by
+connecting and sending nothing. Expose andris only where you would
+accept that.
 
 The limits themselves:
 
-- at most 8 connections may be in their handshake at once on the
+- at most 64 connections may be in their handshake at once on the
   listeners that serve SPICE;
 - with TLS configured, the plain listener's redirects have their own
-  limit of 4, so a flood of the plain port cannot starve the TLS one;
-- at most 4 connections from one address may be in their handshake
-  at once, on any listener. Four lets a client link its main channel
-  and then its display, cursor and inputs channels in parallel, as
-  spice-gtk does. It also means two addresses reach the overall limit
-  of 8, which is #87 above. An IPv6 address counts by its /64;
-- at most 2 RSA keys for ticket encryption are generated at once.
+  limit of 16, so a flood of the plain port cannot starve the TLS one;
+- at most 4 connections from one address may be in their handshake at
+  once, on any listener, and fewer as the pool fills: the allowance
+  falls with the free permits, reaching one when the pool is nearly
+  full. Four while the pool is quiet lets a client link its main
+  channel and then its display, cursor and inputs channels in
+  parallel, as spice-gtk does. An IPv6 address counts by its /64, so
+  one host with a routed /64 counts once;
+- at most 2 RSA keys for ticket encryption are generated at once. A
+  key takes about 20 ms, so a full handshake pool waits behind about
+  32 of them: of the order of a second, inside the 10 second limit on
+  that step. The limit stays at 2 as the pool grows, because what it
+  bounds is how much of the desktop's CPU a flood can take at once.
+
+A fixed cap per address would bound one address and nothing else,
+since an attacker chooses how many addresses to use. Letting the
+allowance fall as the pool fills makes the last permits cost one
+address each, which is where the thirty above comes from.
+
+A client whose main channel links and whose display, cursor or inputs
+channel is then refused does not come up without that channel: ryll
+fails the whole connection if any channel it planned cannot link, so
+the session ends with an error instead of running with no pointer or
+no keyboard. The connection is closed before any byte of its link
+reply, so the client has nothing from andris to report as the reason;
+andris's own log carries it.
 
 Connections past a limit are closed immediately, and the refusals
 are logged at most every 10 seconds. The first step of a handshake,
@@ -512,6 +541,23 @@ but the client already has the text. Connect only clients you would
 trust with the session's clipboard. Andris offers nothing to a client
 that does not announce clipboard sharing.
 
+`--no-clipboard` shares none, in either direction, and andris does
+not read the desktop's clipboard at all: under `--platform x11` it
+does not watch `CLIPBOARD` or fetch what is copied, so neither its
+memory nor its log ever holds a fingerprint of the text. Andris then
+announces no clipboard capability, so a client's "share clipboard"
+has nothing to act on rather than appearing to work while the text
+goes nowhere, and a clipboard message from a client that sends one
+anyway is ignored. Use it where the desktop is a real session whose
+clipboard is not the client's business; sharing is on by default,
+which is what every client expects.
+
+Debug logs carry a fingerprint of clipboard text, never the text, so
+that one text can be followed from the desktop to the client. The
+fingerprint is computed under a key andris picks at start-up, so it
+means nothing outside the run that produced it and a short text
+cannot be recovered from a log by trying candidates.
+
 **Resizing.** When the client asks for a desktop size, as ryll does
 when its window is resized, andris changes the X server's size through
 RandR, and the display surface follows (see Display above). A size
@@ -522,9 +568,28 @@ server whose RandR allows a client to change the screen size. Xvfb
 does, up to the size it started with. xorgxrdp does not (see
 [xrdp.md](xrdp.md#resizing)). Where it is refused, the client gets an
 error reply, the desktop keeps its size, and andris logs one warning
-for the connection, not one for each request. RandR is optional:
+for the connection, not one for each request. A resize that fails part
+way is undone. Where undoing it also fails, andris logs a warning for
+each step it could not put back, and the refusal's log line says the
+desktop may be left part way rather than that it kept its size. The
+client gets the same error reply either way. RandR is optional:
 without it, or without RandR 1.2, andris still serves the desktop and
 refuses every resize in the same way.
+
+How often a client may resize is limited, because each resize
+reconfigures the operator's real screen and makes andris re-encode
+the whole desktop: three may be asked for at once, and one more
+becomes available every two seconds. A resize past that is refused
+before the X server is asked, so the screen is left alone; the client
+gets the same error reply as any other refusal, and one warning is
+logged for the connection. The allowance belongs to the main channel's
+connection, so a client that relinks its main channel starts with a
+fresh three; a relink costs a full handshake, which is slower than the
+resizes it buys. A client that sends a configuration more
+than once as its window settles is unaffected. One that streams them
+while a window is dragged will have some refused, and the desktop
+then keeps the last size that was accepted rather than the last one
+asked for.
 
 ### Video streams
 
@@ -876,9 +941,12 @@ production use:
 Andris sends only message types that kerbside's allowlist accepts,
 so a session through kerbside needs no special configuration.
 Every connection through kerbside comes from kerbside's address, so
-the limit of 4 handshakes in progress per address applies to all of
-kerbside's clients together; that is enough for one client linking
-its channels in parallel.
+one address's allowance of handshakes in progress applies to all of
+kerbside's clients together: 4 while andris's handshake pool is
+quiet, which is enough for one client linking its channels in
+parallel, and fewer as the pool fills. A connection past the
+allowance is closed rather than queued, so several clients linking
+through one kerbside at the same moment may have to reconnect.
 
 ### Trying it with kerbside's demo stack
 

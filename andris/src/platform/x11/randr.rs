@@ -39,7 +39,7 @@
 
 use anyhow::anyhow;
 use tracing::{debug, warn};
-use x11rb::connection::RequestConnection;
+use x11rb::connection::{Connection, RequestConnection};
 use x11rb::errors::ReplyError;
 use x11rb::protocol::randr::{
     self, ConnectionExt as _, Crtc, GetCrtcInfoReply, Mode, ModeFlag, ModeInfo, Output, Rotation,
@@ -91,10 +91,12 @@ fn clamp(asked: Size, range: SizeRange) -> Size {
     }
 }
 
-/// `pixels` at 96 DPI, in whole millimetres.
+/// `pixels` at 96 DPI, in whole millimetres, and never less than one:
+/// RRSetScreenSize refuses a side of zero millimetres with BadValue, and
+/// a side of one pixel would otherwise round to it.
 fn millimetres(pixels: u32) -> u32 {
     let mm = (u64::from(pixels) * 254 + 480) / 960;
-    u32::try_from(mm).unwrap_or(u32::MAX)
+    u32::try_from(mm).unwrap_or(u32::MAX).max(1)
 }
 
 /// One change to the server's configuration.
@@ -430,7 +432,19 @@ impl Randr {
             }
             Err(Fault::Gone(e)) => Err(Fault::Gone(e)),
             Err(Fault::Failed(e)) => {
-                self.undo(conn, root, chosen.crtc, &old, &attempt)?;
+                let stuck = self.undo(conn, root, chosen.crtc, &old, &attempt)?;
+                if stuck > 0 {
+                    // Reaches the line `Agent::resize` logs for the
+                    // refusal, so that "it keeps its size" is not claimed
+                    // there when it may not have. Each step that failed
+                    // was warned of already, by `carried_on`. The client's
+                    // error reply carries no reason, so it is told nothing
+                    // more.
+                    return Err(Fault::Failed(e.context(format!(
+                        "and {stuck} step(s) of putting the desktop back failed, so it may be \
+                         left part way"
+                    ))));
+                }
                 Err(Fault::Failed(e))
             }
         }
@@ -505,10 +519,17 @@ impl Randr {
     }
 
     /// Undo what `attempt` did, in reverse, and remove the modes it added
-    /// and created. A screen size is restored at 96 DPI, since RandR 1.2
-    /// offers no cheap way to read the physical size it had. Each failure
-    /// is logged and the rest carried on with; only a failed connection
-    /// stops it.
+    /// and created. A screen size goes back at the physical size
+    /// [`restore_millimetres`] chooses. Each failure is logged and the
+    /// rest carried on with; only a failed connection stops it.
+    ///
+    /// Returns how many steps could not be undone, which is how many ways
+    /// the desktop may be left as the attempt left it rather than as it
+    /// was. The caller reports that to the client. A mode andris added to
+    /// an output or created and could not take back counts too: it does
+    /// not change what is on the screen, but it leaves a mode the
+    /// operator did not make in the desktop's mode list, which is the
+    /// same kind of residue as a screen left the wrong size.
     fn undo(
         &self,
         conn: &RustConnection,
@@ -516,29 +537,37 @@ impl Randr {
         crtc: Crtc,
         old: &CrtcConfig,
         attempt: &Attempt,
-    ) -> Result<(), Fault> {
+    ) -> Result<usize, Fault> {
+        let mut stuck = 0usize;
         for undo in attempt.done.iter().rev() {
-            match *undo {
-                Undo::Screen(size) => carry_on(
-                    set_screen_size(conn, root, size),
+            let restored = match *undo {
+                Undo::Screen(size) => carried_on(
+                    set_screen_size_at(conn, root, size, restore_millimetres(conn, root, size)),
                     "restoring the screen size",
                 )?,
-                Undo::Crtc => carry_on(
+                Undo::Crtc => carried_on(
                     self.set_crtc(conn, root, crtc, &old.setting()),
                     "restoring the CRTC",
                 )?,
+            };
+            if !restored {
+                stuck += 1;
             }
         }
         for &(output, mode) in attempt.added.iter().rev() {
-            carry_on(
+            if !carried_on(
                 delete_output_mode(conn, output, mode),
                 "removing a mode andris added",
-            )?;
+            )? {
+                stuck += 1;
+            }
         }
         for &mode in attempt.created.iter().rev() {
-            carry_on(destroy_mode(conn, mode), "destroying a mode andris created")?;
+            if !carried_on(destroy_mode(conn, mode), "destroying a mode andris created")? {
+                stuck += 1;
+            }
         }
-        Ok(())
+        Ok(stuck)
     }
 
     /// The screen's resources, without probing outputs where the server
@@ -786,6 +815,69 @@ fn output_info(
 
 /// Set the screen to `size`, at 96 DPI.
 fn set_screen_size(conn: &RustConnection, root: Window, size: Size) -> Result<(), Fault> {
+    let physical = (millimetres(size.width), millimetres(size.height));
+    set_screen_size_at(conn, root, size, physical)
+}
+
+/// The physical size `root` had when this connection was made, with the
+/// pixel size it had then, or `None` if the connection does not describe
+/// that screen. The setup is from connection time and is never refreshed,
+/// which is exactly what makes it the right record of how andris found
+/// the desktop.
+fn screen_as_found(conn: &RustConnection, root: Window) -> Option<(Size, (u32, u32))> {
+    conn.setup()
+        .roots
+        .iter()
+        .find(|screen| screen.root == root)
+        .map(|screen| {
+            (
+                Size {
+                    width: u32::from(screen.width_in_pixels),
+                    height: u32::from(screen.height_in_pixels),
+                },
+                (
+                    u32::from(screen.width_in_millimeters),
+                    u32::from(screen.height_in_millimeters),
+                ),
+            )
+        })
+}
+
+/// The physical size to put `size` back at while undoing.
+///
+/// Every size andris sets is at 96 DPI, so 96 DPI restores one of those.
+/// The one size in an undo that andris did not set is the size the
+/// desktop had before the attempt, and when that is still the size andris
+/// found at start-up it is restored at the physical size it had then --
+/// which is usually not 96 DPI, and which RandR 1.2 gives no way to read
+/// back later. A desktop resized outside andris since start-up, by
+/// `xrandr` say, is still put back at 96 DPI; its physical size is not
+/// recorded anywhere andris can reach.
+fn restore_millimetres(conn: &RustConnection, root: Window, size: Size) -> (u32, u32) {
+    millimetres_to_restore(screen_as_found(conn, root), size)
+}
+
+/// [`restore_millimetres`] without the connection, so the rule can be
+/// tested: `found` is what [`screen_as_found`] returned. A found side of
+/// zero millimetres, which virtual and headless X servers report, means
+/// the physical size was never known; RRSetScreenSize would refuse it
+/// with BadValue and leave the undo stuck, so 96 DPI stands in for it.
+fn millimetres_to_restore(found: Option<(Size, (u32, u32))>, size: Size) -> (u32, u32) {
+    match found {
+        Some((as_found, physical)) if as_found == size && physical.0 > 0 && physical.1 > 0 => {
+            physical
+        }
+        _ => (millimetres(size.width), millimetres(size.height)),
+    }
+}
+
+/// Set the screen to `size`, `physical` millimetres across and down.
+fn set_screen_size_at(
+    conn: &RustConnection,
+    root: Window,
+    size: Size,
+    physical: (u32, u32),
+) -> Result<(), Fault> {
     let what = || format!("RRSetScreenSize to {size}");
     let side = |pixels: u32| {
         u16::try_from(pixels).map_err(|_| Fault::Failed(anyhow!("{}: too large", what())))
@@ -794,8 +886,8 @@ fn set_screen_size(conn: &RustConnection, root: Window, size: Size) -> Result<()
         root,
         side(size.width)?,
         side(size.height)?,
-        millimetres(size.width),
-        millimetres(size.height),
+        physical.0,
+        physical.1,
     )?
     .check()
     .map_err(Fault::from)
@@ -821,12 +913,18 @@ fn destroy_mode(conn: &RustConnection, mode: Mode) -> Result<(), Fault> {
 /// Log a failed clean-up step, `what`, and carry on; a failed connection
 /// still stops everything.
 fn carry_on(result: Result<(), Fault>, what: &str) -> Result<(), Fault> {
+    carried_on(result, what).map(|_| ())
+}
+
+/// [`carry_on`], saying whether the step succeeded, for a caller that
+/// has to report what it could not put back.
+fn carried_on(result: Result<(), Fault>, what: &str) -> Result<bool, Fault> {
     match result {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(true),
         Err(Fault::Gone(e)) => Err(Fault::Gone(e)),
         Err(Fault::Failed(e)) => {
             warn!(error = format!("{e:#}"), "{what} failed");
-            Ok(())
+            Ok(false)
         }
     }
 }
@@ -900,8 +998,70 @@ mod tests {
         assert_eq!(millimetres(96), 25);
         assert_eq!(millimetres(1024), 271);
         assert_eq!(millimetres(768), 203);
-        assert_eq!(millimetres(0), 0);
+        // RRSetScreenSize refuses zero millimetres, so nothing rounds
+        // down to it.
+        assert_eq!(millimetres(1), 1);
+        assert_eq!(millimetres(0), 1);
         assert_eq!(millimetres(u32::MAX), 1_136_376_763);
+    }
+
+    /// Undoing a resize puts the screen back at the physical size it had,
+    /// where that is known. It used to put every size back at 96 DPI, so
+    /// a failed resize of a desktop that was not at 96 DPI left the
+    /// operator's DPI changed even when the pixels were restored.
+    #[test]
+    fn undoing_restores_the_physical_size_the_desktop_was_found_with() {
+        let found = Size {
+            width: 1024,
+            height: 768,
+        };
+        // A desktop whose 1024x768 was 400x300 mm: not 96 DPI, and that
+        // is what it goes back to.
+        let as_found = Some((found, (400, 300)));
+        assert_eq!(millimetres_to_restore(as_found, found), (400, 300));
+
+        // Any other size is one andris set, which it set at 96 DPI.
+        let andris_set = Size {
+            width: 1280,
+            height: 800,
+        };
+        assert_eq!(
+            millimetres_to_restore(as_found, andris_set),
+            (millimetres(1280), millimetres(800))
+        );
+
+        // And 96 DPI is the fallback when the screen is not described.
+        assert_eq!(
+            millimetres_to_restore(None, found),
+            (millimetres(1024), millimetres(768))
+        );
+
+        // Or when it is described with no physical size, as virtual and
+        // headless servers do: RRSetScreenSize refuses zero millimetres,
+        // so restoring what was found would leave the undo stuck.
+        for zero in [(0, 0), (0, 300), (400, 0)] {
+            assert_eq!(
+                millimetres_to_restore(Some((found, zero)), found),
+                (millimetres(1024), millimetres(768)),
+                "found at {zero:?} mm"
+            );
+        }
+    }
+
+    #[test]
+    fn a_step_that_fails_is_counted_and_a_lost_connection_stops_the_undo() {
+        assert!(matches!(carried_on(Ok(()), "a step"), Ok(true)));
+        // A refused step is reported as not done, for `undo` to count,
+        // and the undo carries on with the rest.
+        let refused = Err(Fault::Failed(anyhow!("refused")));
+        assert!(matches!(carried_on(refused, "a step"), Ok(false)));
+        assert!(matches!(
+            carry_on(Err(Fault::Failed(anyhow!("refused"))), "a step"),
+            Ok(())
+        ));
+        // A lost connection is not a step to count: it ends the undo.
+        let gone = Err(Fault::Gone(anyhow!("gone")));
+        assert!(matches!(carried_on(gone, "a step"), Err(Fault::Gone(_))));
     }
 
     /// Run `steps` from a screen of `screen` whose CRTC reaches `extent`,

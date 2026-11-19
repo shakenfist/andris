@@ -39,6 +39,15 @@ exist, it writes a random ticket there, readable only by the user. It
 never runs systemctl: it prints the commands to run next, which
 [Starting it](#starting-it) explains.
 
+One case where it writes no ticket: a `~/.config/andris/` that already
+exists and is readable or enterable by group or other. The ticket file
+would be mode 0600, but anyone who can write that directory could
+unlink it and leave their own ticket in its place, and the ticket
+andris writes is the one the operator is about to trust. It says so,
+names the mode and the `chmod 700` to run, and writes nothing. A
+ticket already in such a directory is left alone and read as usual:
+it is the operator's, and may well predate the permissions.
+
 The unit is a systemd *user* unit, so it runs as the session's user,
 which is the user the X server accepts. It needs systemd 254 or newer,
 for its `RestartSteps=` and `RestartMaxDelaySec=` settings; Debian 13
@@ -170,11 +179,11 @@ journalctl --user -u andris@10 -f     # follow it
 
 Andris logs to stderr, which the journal captures. Set `RUST_LOG` in
 `andris.env` to change the log level. At `debug` and `trace` andris
-may log details of the client's input, such as the keys it sends, and
-an eight-digit hash of each clipboard text, from which a short text
-such as a password can be found by guessing, to the journal, which
-members of the `adm` and `systemd-journal` groups can read; use those
-levels only while troubleshooting.
+may log details of the client's input, such as the keys it sends, to
+the journal, which members of the `adm` and `systemd-journal` groups
+can read; use those levels only while troubleshooting. Clipboard text
+is never logged: only a fingerprint of it, under a key andris picks at
+start-up, so it means nothing outside the run that produced it.
 
 Andris's exit status says why it stopped:
 

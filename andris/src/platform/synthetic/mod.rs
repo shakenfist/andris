@@ -238,7 +238,7 @@ impl SyntheticPlatform {
             input: self.clone(),
             cursor: self.clone(),
             display_control: self.clone(),
-            clipboard: self.clone(),
+            clipboard: Some(self.clone()),
             audio: Some(Arc::new(ToneSource::default())),
             gone: self.gone_signal.clone(),
         }
@@ -1244,7 +1244,10 @@ mod tests {
     #[test]
     fn the_clipboard_reports_copies_and_keeps_what_is_set() {
         let platform = SyntheticPlatform::new(SIZE).unwrap();
-        let clipboard = platform.platform().clipboard;
+        let clipboard = platform
+            .platform()
+            .clipboard
+            .expect("the synthetic platform shares a clipboard");
         let mut changes = clipboard.changes();
         assert!(changes.borrow_and_update().is_none());
 

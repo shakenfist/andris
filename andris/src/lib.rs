@@ -35,7 +35,7 @@ use tracing::{error, info, warn};
 use config::{AudioConfig, Config, PlatformConfig};
 use platform::pulse::{self, PulseSource};
 use platform::synthetic::{SyntheticPlatform, ToneSource};
-use platform::x11::X11Platform;
+use platform::x11::{X11Options, X11Platform};
 use platform::{AudioSource, GoneSignal, Platform};
 use server::{DisplayOptions, HandshakeTimeouts, STOP_GRACE, Server, ServerHandle, ServerOptions};
 
@@ -58,14 +58,35 @@ pub fn banner() -> String {
 /// libpulse is reported even when opening the desktop then fails.
 pub fn run(config: Config) -> Result<()> {
     let audio = audio_source(&config.audio);
-    let mut platform = match &config.platform {
+    let platform = open_platform(&config.platform, config.clipboard, audio)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("starting the async runtime")?;
+    runtime.block_on(serve(config, platform))
+}
+
+/// Open the desktop `desktop` names, with `audio` as its sound and its
+/// clipboard shared with clients only if `clipboard`: the platform
+/// [`run`] serves. Apart from [`run`] so that `--no-clipboard` can be
+/// tested on the path that applies it.
+fn open_platform(
+    desktop: &PlatformConfig,
+    clipboard: bool,
+    audio: Option<Arc<dyn AudioSource>>,
+) -> Result<Platform> {
+    let mut platform = match desktop {
         PlatformConfig::Synthetic { size } => {
             info!("exporting a synthetic {size} desktop");
             SyntheticPlatform::new(*size)?.platform()
         }
         PlatformConfig::X11 { display: name } => {
             info!("exporting X display {name}");
-            X11Platform::connect(name)?.platform()
+            let options = X11Options {
+                clipboard,
+                ..X11Options::default()
+            };
+            X11Platform::connect_with(name, options)?.platform()
         }
         #[cfg(feature = "qemu")]
         PlatformConfig::Qemu { qmp } => {
@@ -74,11 +95,14 @@ pub fn run(config: Config) -> Result<()> {
         }
     };
     platform.audio = audio;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("starting the async runtime")?;
-    runtime.block_on(serve(config, platform))
+    if !clipboard {
+        // The X11 backend has not started its clipboard at all, so it
+        // offers none already. The others read nothing from a desktop's
+        // clipboard, so withholding theirs from the server is enough.
+        info!("the clipboard is off");
+        platform.clipboard = None;
+    }
+    Ok(platform)
 }
 
 /// The sound source `audio` names, saying which in the log. Nothing is
@@ -211,7 +235,29 @@ pub async fn serve_until(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::Size;
     use crate::test_logs::Logs;
+
+    /// `--no-clipboard` withholds the clipboard on the path [`run`] takes,
+    /// so a client is offered none. The synthetic platform has one to
+    /// withhold, which is what makes it the one to check this on; the
+    /// X11 backend's own handling is tested where it is.
+    #[test]
+    fn no_clipboard_withholds_the_platforms_clipboard() {
+        let desktop = PlatformConfig::Synthetic {
+            size: Size {
+                width: 64,
+                height: 48,
+            },
+        };
+        let shared = open_platform(&desktop, true, None).unwrap();
+        assert!(shared.clipboard.is_some(), "the clipboard is on by default");
+        let withheld = open_platform(&desktop, false, None).unwrap();
+        assert!(
+            withheld.clipboard.is_none(),
+            "--no-clipboard left the clipboard shared"
+        );
+    }
 
     #[test]
     fn the_audio_configuration_picks_the_source() {

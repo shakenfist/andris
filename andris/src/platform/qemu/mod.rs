@@ -62,15 +62,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use qemu_display::{ConsoleProxy, KeyboardProxy, MouseProxy};
-use tokio::sync::watch;
 use tracing::{debug, info};
 use zbus::Fd;
 use zbus::proxy::CacheProperties;
 
 use super::{
-    Capture, Clipboard, ClipboardReceiver, CursorReceiver, CursorSource, DamageHub,
-    DamageSubscription, DisplayControl, DisplayGeometry, GoneSignal, InputEvent, InputSink,
-    LockState, Platform, Rectangle, Resize, ScreenSource, Size,
+    Capture, CursorReceiver, CursorSource, DamageHub, DamageSubscription, DisplayControl,
+    DisplayGeometry, GoneSignal, InputEvent, InputSink, LockState, Platform, Rectangle, Resize,
+    ScreenSource, Size,
 };
 pub use framebuffer::{A8R8G8B8, Framebuffer, PixelFormat, Source, X8R8G8B8};
 use input::{Devices, INPUT_QUEUE_LIMIT, InputQueue, RELEASE_RESERVE};
@@ -97,7 +96,6 @@ pub struct QemuPlatform {
     shared: Arc<Shared>,
     gone_signal: GoneSignal,
     input: InputQueue,
-    clipboard: watch::Sender<Option<Arc<str>>>,
     /// Held open for as long as the platform is.
     _connections: Connections,
     /// Keeps the platform's thread waiting on the display connection;
@@ -185,7 +183,6 @@ impl QemuPlatform {
             shared,
             gone_signal,
             input,
-            clipboard: watch::channel(None).0,
             _connections: connections,
             _keep: keep,
         }))
@@ -199,7 +196,10 @@ impl QemuPlatform {
             input: self.clone(),
             cursor: self.clone(),
             display_control: self.clone(),
-            clipboard: self.clone(),
+            // No clipboard rather than one that takes text and
+            // drops it: a client that is offered the capability would
+            // appear to share its clipboard and never do so.
+            clipboard: None,
             audio: None,
             gone: self.gone_signal.clone(),
         }
@@ -333,17 +333,5 @@ impl DisplayControl for QemuPlatform {
         Ok(Resize::Refused(
             "the qemu platform does not resize the guest's screen".to_string(),
         ))
-    }
-}
-
-impl Clipboard for QemuPlatform {
-    /// Never has text.
-    fn changes(&self) -> ClipboardReceiver {
-        self.clipboard.subscribe()
-    }
-
-    /// Drops the text: this platform has no clipboard.
-    fn set(&self, _text: Arc<str>) -> Result<()> {
-        Ok(())
     }
 }

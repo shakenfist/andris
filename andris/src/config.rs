@@ -172,6 +172,12 @@ pub struct Args {
     #[arg(long)]
     pub no_audio: bool,
 
+    /// Share no clipboard with the client, in either direction. Andris
+    /// then announces no clipboard capability, so a client's "share
+    /// clipboard" has nothing to act on.
+    #[arg(long)]
+    pub no_clipboard: bool,
+
     /// The PulseAudio source to capture the desktop's sound from, for
     /// `--platform x11`. The default, @DEFAULT_MONITOR@, is the monitor of
     /// the session's default sink: whatever the desktop plays. PipeWire's
@@ -249,6 +255,9 @@ pub struct Config {
     /// The quality to send JPEG at, or `None` for `--jpeg-quality 0`.
     pub jpeg_quality: Option<JpegQuality>,
     pub audio: AudioConfig,
+    /// Whether to share the desktop's clipboard with clients. False for
+    /// `--no-clipboard`.
+    pub clipboard: bool,
 }
 
 impl Args {
@@ -352,6 +361,7 @@ impl Args {
             // The parser allows 0 to 100, and 0 means none.
             jpeg_quality: JpegQuality::new(self.jpeg_quality),
             audio,
+            clipboard: !self.no_clipboard,
         })
     }
 }
@@ -1075,6 +1085,22 @@ mod tests {
         assert_eq!(config.audio, AudioConfig::Off);
         let config = parse(&ticket, &["--no-audio"]).validate().unwrap();
         assert_eq!(config.audio, AudioConfig::Off);
+    }
+
+    #[test]
+    fn the_clipboard_is_shared_unless_no_clipboard_says_otherwise() {
+        let ticket = ticket_file(b"secret", 0o600);
+        let config = parse(&ticket, &[]).validate().unwrap();
+        assert!(config.clipboard, "shared by default");
+        let config = parse(&ticket, &["--no-clipboard"]).validate().unwrap();
+        assert!(!config.clipboard);
+        // It stands alone, so it does not disturb sound either way.
+        let config = parse_x11(&ticket, &["--no-clipboard"])
+            .unwrap()
+            .validate()
+            .unwrap();
+        assert!(!config.clipboard);
+        assert_ne!(config.audio, AudioConfig::Off, "sound is untouched");
     }
 
     #[test]

@@ -9,12 +9,10 @@
 mod support;
 
 use std::collections::VecDeque;
-use std::io::Write;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use andris::platform::{DisplayGeometry, Size};
-use andris::server::agent::{MAX_AGENT_MESSAGE, MAX_CHUNK};
+use andris::platform::{DisplayGeometry, MAX_CLIPBOARD_TEXT, Size};
+use andris::server::agent::{MAX_AGENT_MESSAGE, MAX_CHUNK, RESIZE_BURST};
 use shakenfist_spice_protocol::constants::vd_agent::{
     VD_AGENT_ANNOUNCE_CAPABILITIES, VD_AGENT_CAP_CLIPBOARD_BY_DEMAND,
     VD_AGENT_CAP_CLIPBOARD_GRAB_SERIAL, VD_AGENT_CAP_CLIPBOARD_SELECTION,
@@ -34,9 +32,8 @@ use shakenfist_spice_protocol::messages::vd_agent::{
 };
 use shakenfist_spice_protocol::messages::{AgentTokens, MainInit, WireType, make_message};
 use shakenfist_spice_protocol::{main_client, main_server};
-use tracing_subscriber::fmt::MakeWriter;
 
-use support::{TestClient, TestServer, WAIT, wait_until};
+use support::{Captured, TestClient, TestServer, WAIT, wait_until};
 
 /// How long to watch for a message that should not come.
 const QUIET: Duration = Duration::from_millis(300);
@@ -297,6 +294,67 @@ async fn agent_start_brings_an_announce_that_asks_for_the_clients() {
     assert!(!caps.has_capability(VD_AGENT_CAP_MOUSE_STATE));
 }
 
+/// With no clipboard, the clipboard capabilities are withheld, so a
+/// client's "share clipboard" has nothing to act on rather than appearing
+/// to work while the text goes nowhere. The rest of the agent, which is
+/// resizing, still works.
+#[tokio::test]
+async fn no_clipboard_withholds_the_clipboard_capabilities() {
+    let server = TestServer::start_without_clipboard().await;
+    let mut agent = AgentClient::start(&server, u32::MAX).await;
+    let caps =
+        AnnounceCapabilities::decode(&agent.expect(VD_AGENT_ANNOUNCE_CAPABILITIES).await).unwrap();
+    assert_eq!(caps.request, 1, "the client is still asked for its own");
+    for cap in [VD_AGENT_CAP_MONITORS_CONFIG, VD_AGENT_CAP_REPLY] {
+        assert!(caps.has_capability(cap), "capability {cap} is kept");
+    }
+    for cap in [
+        VD_AGENT_CAP_CLIPBOARD_BY_DEMAND,
+        VD_AGENT_CAP_CLIPBOARD_SELECTION,
+        VD_AGENT_CAP_GUEST_LINEEND_LF,
+    ] {
+        assert!(!caps.has_capability(cap), "capability {cap} is withheld");
+    }
+
+    // A client that announces anyway is answered, still without them, and
+    // nothing is offered to it.
+    agent
+        .send_agent(VD_AGENT_ANNOUNCE_CAPABILITIES, &body(&ryll_caps(1)))
+        .await;
+    let answer =
+        AnnounceCapabilities::decode(&agent.expect(VD_AGENT_ANNOUNCE_CAPABILITIES).await).unwrap();
+    assert!(!answer.has_capability(VD_AGENT_CAP_CLIPBOARD_BY_DEMAND));
+    agent.expect_quiet().await;
+
+    // Resizing is unaffected.
+    assert!(agent.resize(320, 200).await);
+    assert_eq!(server.platform.size().unwrap().width, 320);
+}
+
+/// A clipboard message from a client that was told there is no clipboard
+/// is ignored, rather than closing the connection or reaching the desktop.
+#[tokio::test]
+async fn no_clipboard_ignores_a_clipboard_message() {
+    let server = TestServer::start_without_clipboard().await;
+    let mut agent = AgentClient::start(&server, u32::MAX).await;
+    agent.expect(VD_AGENT_ANNOUNCE_CAPABILITIES).await;
+    agent
+        .send_agent(VD_AGENT_ANNOUNCE_CAPABILITIES, &body(&ryll_caps(0)))
+        .await;
+
+    let grab = ClipboardGrab {
+        selection: VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD,
+        types: vec![VD_AGENT_CLIPBOARD_UTF8_TEXT],
+    };
+    agent
+        .send_agent(VD_AGENT_CLIPBOARD_GRAB, &clip(&grab))
+        .await;
+    agent.expect_quiet().await;
+
+    // The connection still works afterwards.
+    assert!(agent.resize(400, 200).await);
+}
+
 #[tokio::test]
 async fn a_client_announce_is_answered_only_when_it_asks() {
     let server = TestServer::start().await;
@@ -491,6 +549,83 @@ async fn clipboard_data_over_the_limit_is_dropped_and_the_channel_stays_open() {
     assert_eq!(server.platform.clipboard_sets().unwrap(), 0);
 }
 
+/// Replacing invalid UTF-8 can make a text up to three times longer, so
+/// the length is checked before the conversion as well as after. It used
+/// to be checked only after, which meant an all-invalid 16 MiB body
+/// allocated about 48 MiB before being dropped for being too long.
+/// The server's tasks run on this test's one thread, so a subscriber set
+/// for the thread sees which of the two checks dropped each body.
+#[tokio::test(flavor = "current_thread")]
+async fn invalid_clipboard_text_is_dropped_by_whichever_check_catches_it() {
+    let (logs, _guard) = Captured::start(tracing::Level::WARN);
+
+    let server = TestServer::start().await;
+    let mut agent = AgentClient::ready(&server).await;
+    let invalid = |len: usize| Clipboard {
+        selection: VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD,
+        clipboard_type: VD_AGENT_CLIPBOARD_UTF8_TEXT,
+        data: vec![0xff; len],
+    };
+
+    // Over the limit as it arrived, so it is never converted.
+    agent
+        .send_agent(VD_AGENT_CLIPBOARD, &clip(&invalid(MAX_CLIPBOARD_TEXT + 1)))
+        .await;
+    agent.sync(&server).await;
+    assert_eq!(server.platform.clipboard_sets().unwrap(), 0);
+    let text = logs.take();
+    assert!(
+        text.contains("it is over the"),
+        "dropped before converting: {text}"
+    );
+    assert!(
+        !text.contains("replacing its invalid UTF-8"),
+        "it was converted first: {text}"
+    );
+
+    // Under the limit, but a three-byte U+FFFD for each byte takes it over.
+    agent
+        .send_agent(VD_AGENT_CLIPBOARD, &clip(&invalid(MAX_CLIPBOARD_TEXT / 2)))
+        .await;
+    agent.sync(&server).await;
+    assert_eq!(server.platform.clipboard_sets().unwrap(), 0);
+    let text = logs.take();
+    assert!(
+        text.contains("replacing its invalid UTF-8"),
+        "the length the conversion would reach caught this one: {text}"
+    );
+
+    // The worst case: within the limit as bytes, so the first check
+    // passes it, and three times the limit once every byte becomes a
+    // U+FFFD. It is measured rather than converted, so the conversion is
+    // never built.
+    agent
+        .send_agent(VD_AGENT_CLIPBOARD, &clip(&invalid(MAX_CLIPBOARD_TEXT)))
+        .await;
+    agent.sync(&server).await;
+    assert_eq!(server.platform.clipboard_sets().unwrap(), 0);
+    let text = logs.take();
+    assert!(
+        text.contains("would take it over"),
+        "measured before converting: {text}"
+    );
+    assert!(
+        !text.contains("it is over the"),
+        "the first check caught it, so the worst case was not reached: {text}"
+    );
+
+    // Short invalid text still crosses, with its bytes replaced.
+    agent
+        .send_agent(VD_AGENT_CLIPBOARD, &clip(&invalid(3)))
+        .await;
+    agent.sync(&server).await;
+    assert_eq!(server.platform.clipboard_sets().unwrap(), 1);
+    assert_eq!(
+        server.platform.clipboard_set().unwrap().as_deref(),
+        Some("\u{fffd}\u{fffd}\u{fffd}")
+    );
+}
+
 #[tokio::test]
 async fn a_truncated_monitors_config_closes_the_channel() {
     let server = TestServer::start().await;
@@ -550,33 +685,77 @@ async fn a_resize_is_applied_or_unchanged() {
     assert_eq!(server.platform.size().unwrap().width, 320);
 }
 
-/// A writer for a test's own log subscriber, that keeps what it is given.
-#[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<u8>>>);
+/// A client may resize a few times in a row and is then held to one every
+/// couple of seconds, because each resize reconfigures the operator's real
+/// screen and re-encodes the whole desktop. The refusal happens before the
+/// desktop is asked, so the screen is left alone.
+#[tokio::test]
+async fn resizes_past_the_burst_are_refused_without_touching_the_desktop() {
+    let server = TestServer::start().await;
+    let mut agent = AgentClient::start(&server, u32::MAX).await;
+    agent.expect(VD_AGENT_ANNOUNCE_CAPABILITIES).await;
 
-impl Captured {
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    // Each is a different size, so each changes the desktop and spends
+    // one of the burst. Repeating a size does not; see
+    // `repeating_a_size_the_desktop_already_has_is_never_refused`.
+    for width in [320, 400, 480] {
+        assert!(
+            agent.resize(width, 200).await,
+            "a {width} wide resize within the burst"
+        );
     }
+    let settled = server.platform.size().unwrap();
+    assert_eq!(settled.width, 480, "the last of the burst was applied");
+
+    // The next is an error reply, and the desktop keeps the size it had.
+    assert!(!agent.resize(560, 200).await, "a resize past the burst");
+    assert_eq!(
+        server.platform.size().unwrap(),
+        settled,
+        "the desktop was not asked for the refused size"
+    );
 }
 
-impl Write for Captured {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
+/// Several SPICE clients re-send their whole monitors configuration on
+/// every window event, and on reconnect. A request for the size the
+/// desktop already has reconfigures nothing and re-encodes nothing, so it
+/// is not what the resize budget is there to limit, and a client must not
+/// be refused its fourth identical request.
+#[tokio::test]
+async fn repeating_a_size_the_desktop_already_has_is_never_refused() {
+    let server = TestServer::start().await;
+    let mut agent = AgentClient::start(&server, u32::MAX).await;
+    agent.expect(VD_AGENT_ANNOUNCE_CAPABILITIES).await;
+
+    let settled = Size {
+        width: 320,
+        height: 200,
+    };
+    // The first one changes the desktop, so it spends a token.
+    assert!(agent.resize(settled.width, settled.height).await);
+
+    // Well past the burst: each of these finds the desktop already that
+    // size, so each is given its token back.
+    for attempt in 0..RESIZE_BURST * 4 {
+        assert!(
+            agent.resize(settled.width, settled.height).await,
+            "identical resize {attempt} was refused"
+        );
+        assert_eq!(server.platform.size().unwrap(), settled);
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+    // And the budget is still there for a resize that does change
+    // something, which the refunds must not have banked beyond the burst.
+    for width in [400, 480] {
+        assert!(
+            agent.resize(width, 200).await,
+            "a {width} wide resize after the repeats"
+        );
     }
-}
-
-impl<'a> MakeWriter<'a> for Captured {
-    type Writer = Captured;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
+    assert!(
+        !agent.resize(560, 200).await,
+        "the burst is spent, so this one is refused"
+    );
 }
 
 /// The server's tasks run on this test's one thread, so a subscriber set
@@ -584,13 +763,7 @@ impl<'a> MakeWriter<'a> for Captured {
 #[tokio::test(flavor = "current_thread")]
 async fn a_refused_resize_is_an_error_reply_logged_once() {
     let server = TestServer::start().await;
-    let logs = Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(logs.clone())
-        .with_max_level(tracing::Level::WARN)
-        .with_ansi(false)
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let (logs, _guard) = Captured::start(tracing::Level::WARN);
 
     server.platform.refuse_resizes(true).unwrap();
     let mut agent = AgentClient::start(&server, u32::MAX).await;

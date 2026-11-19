@@ -239,3 +239,29 @@ fn install_unit_fails_on_an_unusable_config_home() {
         "{stderr}"
     );
 }
+
+/// A configuration directory open to others gets no ticket, so andris
+/// could not start, and install-unit says so by failing: a script that
+/// installs andris stops there rather than starting a unit that cannot
+/// come up. What the operator sees gives the remedy once, in the report,
+/// and the error only points back at it.
+#[test]
+fn install_unit_fails_on_a_config_directory_open_to_others() {
+    let home = tempfile::tempdir().unwrap();
+    let config_dir = home.path().join("andris");
+    std::fs::create_dir(&config_dir).unwrap();
+    std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = install_unit(home.path());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!output.status.success(), "{stdout}{stderr}");
+    assert!(!config_dir.join("ticket").exists());
+    assert!(stderr.contains("no ticket was written"), "{stderr}");
+    let shown = format!("{stdout}{stderr}");
+    assert_eq!(shown.matches("chmod 700").count(), 1, "{shown}");
+    assert!(
+        !stdout.contains("systemctl --user"),
+        "start instructions for a unit that cannot start: {stdout}"
+    );
+}

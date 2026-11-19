@@ -109,6 +109,13 @@ static HASH_KEY: OnceLock<RandomState> = OnceLock::new();
 /// log, which can put a candidate on the clipboard and compare: andris
 /// cannot defend that, since such a client could read the clipboard
 /// directly.
+///
+/// What this asks of the hasher is that it be keyed from a secret this
+/// process picks, and not invertible without that key; nothing needs it
+/// stable beyond one process. [`RandomState`] meets that today, as
+/// SipHash-1-3 keyed from the operating system's randomness, but std
+/// promises only "keyed and random", not the algorithm. Were that ever
+/// weakened, this is the function to give an explicit keyed hash.
 pub fn text_hash(text: &str) -> String {
     let mut hasher = HASH_KEY.get_or_init(RandomState::new).build_hasher();
     hasher.write(text.as_bytes());

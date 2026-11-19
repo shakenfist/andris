@@ -9,8 +9,6 @@
 mod support;
 
 use std::collections::VecDeque;
-use std::io::Write;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use andris::platform::{DisplayGeometry, MAX_CLIPBOARD_TEXT, Size};
@@ -34,9 +32,8 @@ use shakenfist_spice_protocol::messages::vd_agent::{
 };
 use shakenfist_spice_protocol::messages::{AgentTokens, MainInit, WireType, make_message};
 use shakenfist_spice_protocol::{main_client, main_server};
-use tracing_subscriber::fmt::MakeWriter;
 
-use support::{TestClient, TestServer, WAIT, wait_until};
+use support::{Captured, TestClient, TestServer, WAIT, wait_until};
 
 /// How long to watch for a message that should not come.
 const QUIET: Duration = Duration::from_millis(300);
@@ -560,13 +557,7 @@ async fn clipboard_data_over_the_limit_is_dropped_and_the_channel_stays_open() {
 /// for the thread sees which of the two checks dropped each body.
 #[tokio::test(flavor = "current_thread")]
 async fn invalid_clipboard_text_is_dropped_by_whichever_check_catches_it() {
-    let logs = Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(logs.clone())
-        .with_max_level(tracing::Level::WARN)
-        .with_ansi(false)
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let (logs, _guard) = Captured::start(tracing::Level::WARN);
 
     let server = TestServer::start().await;
     let mut agent = AgentClient::ready(&server).await;
@@ -582,7 +573,7 @@ async fn invalid_clipboard_text_is_dropped_by_whichever_check_catches_it() {
         .await;
     agent.sync(&server).await;
     assert_eq!(server.platform.clipboard_sets().unwrap(), 0);
-    let text = logs.text();
+    let text = logs.take();
     assert!(
         text.contains("it is over the"),
         "dropped before converting: {text}"
@@ -598,7 +589,7 @@ async fn invalid_clipboard_text_is_dropped_by_whichever_check_catches_it() {
         .await;
     agent.sync(&server).await;
     assert_eq!(server.platform.clipboard_sets().unwrap(), 0);
-    let text = logs.text();
+    let text = logs.take();
     assert!(
         text.contains("replacing its invalid UTF-8"),
         "the length the conversion would reach caught this one: {text}"
@@ -613,10 +604,14 @@ async fn invalid_clipboard_text_is_dropped_by_whichever_check_catches_it() {
         .await;
     agent.sync(&server).await;
     assert_eq!(server.platform.clipboard_sets().unwrap(), 0);
-    let text = logs.text();
+    let text = logs.take();
     assert!(
         text.contains("would take it over"),
         "measured before converting: {text}"
+    );
+    assert!(
+        !text.contains("it is over the"),
+        "the first check caught it, so the worst case was not reached: {text}"
     );
 
     // Short invalid text still crosses, with its bytes replaced.
@@ -763,47 +758,12 @@ async fn repeating_a_size_the_desktop_already_has_is_never_refused() {
     );
 }
 
-/// A writer for a test's own log subscriber, that keeps what it is given.
-#[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<u8>>>);
-
-impl Captured {
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-    }
-}
-
-impl Write for Captured {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for Captured {
-    type Writer = Captured;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
 /// The server's tasks run on this test's one thread, so a subscriber set
 /// for the thread sees what they log.
 #[tokio::test(flavor = "current_thread")]
 async fn a_refused_resize_is_an_error_reply_logged_once() {
     let server = TestServer::start().await;
-    let logs = Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(logs.clone())
-        .with_max_level(tracing::Level::WARN)
-        .with_ansi(false)
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let (logs, _guard) = Captured::start(tracing::Level::WARN);
 
     server.platform.refuse_resizes(true).unwrap();
     let mut agent = AgentClient::start(&server, u32::MAX).await;

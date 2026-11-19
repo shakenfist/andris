@@ -303,8 +303,9 @@ log, gave the right ticket for a channel of a session that had
 already ended: one that raced its own reconnect, say, or was replaced
 by another client. Andris refuses that the same way as a wrong
 ticket, so that a client which has not proved it holds the ticket
-learns nothing about which session is current, and logs it at
-`debug` with the session's connection id. Reconnecting fixes it.
+learns nothing about which session is current, and logs it at `info`
+with the channel and the session's connection id, throttled as the
+wrong ticket is. Reconnecting fixes it.
 
 The `--tls-key` file is held to the same rules of ownership and mode.
 

@@ -574,10 +574,11 @@ pub fn run() -> Result<()> {
     let display = std::env::var("DISPLAY").ok();
     let Some(steps) = steps_after(&report, display.as_deref()) else {
         print!("{report}");
+        // The report has just given the remedy, with the directory's
+        // name, so this only says what it is for.
         bail!(
-            "no ticket was written, so andris would refuse to start: run chmod 700 {}, \
-             then andris install-unit again",
-            shell_quote(&report.config_dir.display().to_string())
+            "no ticket was written, so andris would refuse to start: fix the directory as \
+             above, then run andris install-unit again"
         );
     };
     print!("{report}\n{steps}");

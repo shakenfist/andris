@@ -14,7 +14,7 @@ pub mod display;
 
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use andris::config::Ticket;
@@ -35,6 +35,7 @@ use tokio::net::{TcpSocket, TcpStream};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+use tracing_subscriber::fmt::MakeWriter;
 
 /// The ticket every test server in this process uses. It is random, so
 /// no test can depend on its value and none is written in the source.
@@ -558,5 +559,55 @@ impl TestClient {
         })
         .await
         .expect("the server did not close the connection");
+    }
+}
+
+/// What the server logs, for tests that read it.
+#[derive(Clone, Default)]
+pub struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl Captured {
+    /// Capture what this thread logs at `level` and above, until the
+    /// guard is dropped. The server's tasks run on the thread of a
+    /// `current_thread` test, so this sees what they log.
+    pub fn start(level: tracing::Level) -> (Self, tracing::subscriber::DefaultGuard) {
+        let logs = Self::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(level)
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (logs, guard)
+    }
+
+    /// Everything logged so far.
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+
+    /// What has been logged since the last take, so that a test making
+    /// several requests can tell which line each one produced.
+    pub fn take(&self) -> String {
+        String::from_utf8_lossy(&std::mem::take(&mut *self.0.lock().unwrap())).into_owned()
+    }
+}
+
+impl Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for Captured {
+    type Writer = Captured;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
     }
 }

@@ -648,21 +648,26 @@ impl Agent {
     async fn monitors_config(&mut self, body: &[u8]) -> Result<()> {
         let config = MonitorsConfig::decode(body).context("a malformed agent MONITORS_CONFIG")?;
         let applied = match requested_size(&config) {
-            Ok(size) if self.resizes.take(Instant::now()) => {
-                let outcome = self.resize(size).await;
-                if outcome == Resized::Unchanged {
-                    // Several clients re-send their whole configuration
-                    // on every window event and on reconnect. Asking for
-                    // the size the desktop already has is a RandR query
-                    // and nothing else, so charging for it would refuse
-                    // such a client its fourth identical request.
-                    self.resizes.refund();
-                }
-                outcome != Resized::Failed
-            }
+            // The budget is spent here, in the arm, rather than in a
+            // guard: a guard with a side effect charges any request that
+            // reaches it, which a later arm or pattern could change.
             Ok(size) => {
-                self.refuse_frequent_resize(size);
-                false
+                if self.resizes.take(Instant::now()) {
+                    let outcome = self.resize(size).await;
+                    if outcome == Resized::Unchanged {
+                        // Several clients re-send their whole
+                        // configuration on every window event and on
+                        // reconnect. Asking for the size the desktop
+                        // already has is a RandR query and nothing else,
+                        // so charging for it would refuse such a client
+                        // its fourth identical request.
+                        self.resizes.refund();
+                    }
+                    outcome != Resized::Failed
+                } else {
+                    self.refuse_frequent_resize(size);
+                    false
+                }
             }
             Err(error) => {
                 debug!(

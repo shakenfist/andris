@@ -67,6 +67,9 @@ pub struct HandshakeContext<'a> {
     pub key_generations: &'a Arc<Semaphore>,
     /// Throttles the log line for a wrong ticket.
     pub wrong_tickets: &'a LogThrottle,
+    /// Throttles the log line for a right ticket on a channel of a session
+    /// that is not current.
+    pub stale_sessions: &'a LogThrottle,
     /// The peer, for the log.
     pub peer: SocketAddr,
     /// Whether the playback channel is served: false when the platform
@@ -332,21 +335,28 @@ where
     // result, and PermissionDenied is the code it expects there. That
     // makes a legitimate client which raced the end of its session see
     // the same thing as a client with the wrong ticket, so the reason is
-    // logged here for the operator who has to tell them apart. There is
-    // no wrong-ticket wait: that wait paces ticket guesses, and a peer
-    // which reaches this line has the ticket already.
+    // logged here, at the level the wrong ticket is, for the operator who
+    // has to tell them apart. There is no wrong-ticket wait: that wait
+    // paces ticket guesses, and a peer which reaches this line has the
+    // ticket already, which is also why logging it tells nobody anything
+    // they could not already find out.
     let existing = match channel {
         ServedChannel::Main => None,
         _ => match registry.lookup(link.connection_id) {
             Some(session) => Some(session),
             None => {
-                debug!(
-                    peer = %ctx.peer,
-                    channel = channel.name(),
-                    connection_id = link.connection_id,
-                    "refusing an authenticated channel for a session that is not current; \
-                     the client is told only that permission was denied"
-                );
+                if let Some(refused) = ctx.stale_sessions.should_log() {
+                    info!(
+                        peer = %ctx.peer,
+                        channel = channel.name(),
+                        connection_id = link.connection_id,
+                        refused,
+                        "refusing an authenticated channel for a session that is not current; \
+                         the client is told only that permission was denied (logged at most \
+                         every {}s)",
+                        LogThrottle::INTERVAL.as_secs()
+                    );
+                }
                 timed(
                     stage,
                     "sending the auth result",

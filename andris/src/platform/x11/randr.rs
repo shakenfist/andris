@@ -91,10 +91,12 @@ fn clamp(asked: Size, range: SizeRange) -> Size {
     }
 }
 
-/// `pixels` at 96 DPI, in whole millimetres.
+/// `pixels` at 96 DPI, in whole millimetres, and never less than one:
+/// RRSetScreenSize refuses a side of zero millimetres with BadValue, and
+/// a side of one pixel would otherwise round to it.
 fn millimetres(pixels: u32) -> u32 {
     let mm = (u64::from(pixels) * 254 + 480) / 960;
-    u32::try_from(mm).unwrap_or(u32::MAX)
+    u32::try_from(mm).unwrap_or(u32::MAX).max(1)
 }
 
 /// One change to the server's configuration.
@@ -856,10 +858,15 @@ fn restore_millimetres(conn: &RustConnection, root: Window, size: Size) -> (u32,
 }
 
 /// [`restore_millimetres`] without the connection, so the rule can be
-/// tested: `found` is what [`screen_as_found`] returned.
+/// tested: `found` is what [`screen_as_found`] returned. A found side of
+/// zero millimetres, which virtual and headless X servers report, means
+/// the physical size was never known; RRSetScreenSize would refuse it
+/// with BadValue and leave the undo stuck, so 96 DPI stands in for it.
 fn millimetres_to_restore(found: Option<(Size, (u32, u32))>, size: Size) -> (u32, u32) {
     match found {
-        Some((as_found, physical)) if as_found == size => physical,
+        Some((as_found, physical)) if as_found == size && physical.0 > 0 && physical.1 > 0 => {
+            physical
+        }
         _ => (millimetres(size.width), millimetres(size.height)),
     }
 }
@@ -991,7 +998,10 @@ mod tests {
         assert_eq!(millimetres(96), 25);
         assert_eq!(millimetres(1024), 271);
         assert_eq!(millimetres(768), 203);
-        assert_eq!(millimetres(0), 0);
+        // RRSetScreenSize refuses zero millimetres, so nothing rounds
+        // down to it.
+        assert_eq!(millimetres(1), 1);
+        assert_eq!(millimetres(0), 1);
         assert_eq!(millimetres(u32::MAX), 1_136_376_763);
     }
 
@@ -1025,6 +1035,17 @@ mod tests {
             millimetres_to_restore(None, found),
             (millimetres(1024), millimetres(768))
         );
+
+        // Or when it is described with no physical size, as virtual and
+        // headless servers do: RRSetScreenSize refuses zero millimetres,
+        // so restoring what was found would leave the undo stuck.
+        for zero in [(0, 0), (0, 300), (400, 0)] {
+            assert_eq!(
+                millimetres_to_restore(Some((found, zero)), found),
+                (millimetres(1024), millimetres(768)),
+                "found at {zero:?} mm"
+            );
+        }
     }
 
     #[test]

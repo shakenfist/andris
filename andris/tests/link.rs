@@ -20,7 +20,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use support::{
-    TestClient, TestServer, WAIT, closed_within, loopback, tcp_from, ticket, wait_until,
+    Captured, TestClient, TestServer, WAIT, closed_within, loopback, tcp_from, ticket, wait_until,
 };
 
 /// The client's `SET_ACK` must be the display and cursor channels' first
@@ -143,6 +143,40 @@ async fn secondary_channel_with_wrong_connection_id_is_refused() {
         format!("{error:#}").contains("PermissionDenied"),
         "{error:#}"
     );
+}
+
+/// A client with the right ticket, refused because its session has gone,
+/// is told what a wrong ticket is told, so the operator is the one who
+/// has to tell the two apart: the log says which, at the level the wrong
+/// ticket's line is, with the id the client asked for.
+#[tokio::test(flavor = "current_thread")]
+async fn a_refused_stale_session_is_logged_at_info() {
+    let (logs, _guard) = Captured::start(tracing::Level::INFO);
+    let server = TestServer::start().await;
+    let (_main, session) = server.open_main().await;
+    let stale = session.wrapping_add(1).max(1);
+
+    let mut client = TestClient::connect(server.addr()).await;
+    assert_eq!(
+        client.link(stale, ChannelType::Display).await.error,
+        SpiceError::Ok
+    );
+    let error = client.auth(ticket()).await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("PermissionDenied"),
+        "{error:#}"
+    );
+    client.expect_closed().await;
+
+    let text = logs.text();
+    let line = text
+        .lines()
+        .find(|line| line.contains("a session that is not current"))
+        .unwrap_or_else(|| panic!("no line for the stale session: {text}"));
+    assert!(line.contains("INFO"), "{line}");
+    assert!(line.contains(&format!("connection_id={stale}")), "{line}");
+    assert!(line.contains(r#"channel="display""#), "{line}");
+    assert!(!text.contains("ticket is wrong"), "{text}");
 }
 
 /// A peer that has not authenticated learns nothing about which ids are
@@ -397,6 +431,54 @@ async fn one_address_holds_at_most_four_handshakes() {
         client.link(0, ChannelType::Main).await.error,
         SpiceError::Ok
     );
+}
+
+/// An address's allowance shrinks as the pool fills, so that holding the
+/// last permits costs an address each. `peer_allowance` is tested on its
+/// own; this is that the accept path consults it, with the pool it draws
+/// on as full as it really is.
+#[tokio::test]
+async fn a_nearly_full_pool_allows_one_address_fewer_handshakes() {
+    // Long, so the silent connections below hold their permits throughout.
+    let server = TestServer::start_with_timeouts(HandshakeTimeouts {
+        first_stage: Duration::from_secs(30),
+        ..HandshakeTimeouts::default()
+    })
+    .await;
+
+    // Fill all but eight of the pool, one connection per address so that
+    // none of them is near its own allowance.
+    const LEFT: usize = 8;
+    let mut held = Vec::new();
+    for n in 0..(MAX_HANDSHAKES - LEFT) as u8 {
+        held.push(tcp_from(server.addr(), loopback(64 + n)).await);
+    }
+    wait_until("the pool is nearly full", || {
+        server.handle.handshakes_available() == LEFT
+    })
+    .await;
+
+    // Now one address is allowed one handshake, not four...
+    const { assert!(MAX_HANDSHAKES_PER_PEER > 1) };
+    let crowded = loopback(220);
+    let _first = tcp_from(server.addr(), crowded).await;
+    wait_until("the address has its one handshake", || {
+        server.handle.handshakes_from(crowded) == 1
+    })
+    .await;
+    let mut second = tcp_from(server.addr(), crowded).await;
+    assert!(
+        closed_within(&mut second, PROMPTLY).await,
+        "a second connection from one address was served with the pool nearly full"
+    );
+
+    // ...though the pool has room, as another address shows.
+    let other = loopback(221);
+    let _another = tcp_from(server.addr(), other).await;
+    wait_until("another address is served", || {
+        server.handle.handshakes_from(other) == 1
+    })
+    .await;
 }
 
 #[tokio::test]

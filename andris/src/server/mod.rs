@@ -96,7 +96,10 @@ use session::{Cancel, Session, SessionRegistry};
 /// 32 generations: of the order of a second, and under two at the
 /// slowest seen. That is inside the ten seconds
 /// [`HandshakeTimeouts::stage`] allows with room for a host several
-/// times busier, which is why the pool could grow without
+/// times busier. That room is an estimate: a busy desktop, whose capture
+/// and encoding share the cores and the blocking pool the key generations
+/// run on, has not been measured, and a prime search has a long tail
+/// that forty samples do not reach. It is why the pool could grow without
 /// [`MAX_KEY_GENERATIONS`] growing with it: raising that would let a
 /// flood spend more of the desktop's CPU at once, which is the thing it
 /// is there to bound.
@@ -307,6 +310,7 @@ struct Shared {
     busy_refusals: LogThrottle,
     peer_refusals: LogThrottle,
     wrong_tickets: LogThrottle,
+    stale_sessions: LogThrottle,
     shutdown: Cancel,
 }
 
@@ -360,6 +364,7 @@ impl Server {
                 busy_refusals: LogThrottle::default(),
                 peer_refusals: LogThrottle::default(),
                 wrong_tickets: LogThrottle::default(),
+                stale_sessions: LogThrottle::default(),
                 shutdown: Cancel::new(),
             }),
         })
@@ -501,12 +506,31 @@ impl Drop for ServerHandle {
 /// costs a slot a SPICE handshake could have used. That is deliberate:
 /// it errs towards giving an address fewer slots, never more, and a
 /// redirect is answered and closed in one write.
+///
+/// The permit is taken before the allowance is worked out, so that the
+/// count the allowance comes from already includes every permit taken
+/// by an accept on another listener, rather than one read before them.
+/// Its own permit is counted back in as free, which is what the pool
+/// had for this connection to take. An address refused its slot gives
+/// the permit back as it returns.
 fn admit(shared: &Shared, kind: &ListenerKind, peer: SocketAddr) -> Option<HandshakeSlot> {
     let (permits, limit) = match kind {
         ListenerKind::Redirect => (&shared.redirects, MAX_REDIRECTS),
         ListenerKind::Plain | ListenerKind::Tls(_) => (&shared.handshakes, MAX_HANDSHAKES),
     };
-    let allowance = peer_allowance(permits.available_permits(), limit);
+    let Ok(permit) = permits.clone().try_acquire_owned() else {
+        if let Some(refused) = shared.busy_refusals.should_log() {
+            warn!(
+                %peer,
+                refused,
+                "{limit} connections are already in their handshake, so new connections are \
+                 being closed (logged at most every {}s)",
+                LogThrottle::INTERVAL.as_secs()
+            );
+        }
+        return None;
+    };
+    let allowance = peer_allowance(permits.available_permits() + 1, limit);
     let Some(peer_slot) = shared.peers.try_acquire(peer.ip(), allowance) else {
         if let Some(refused) = shared.peer_refusals.should_log() {
             warn!(
@@ -516,18 +540,6 @@ fn admit(shared: &Shared, kind: &ListenerKind, peer: SocketAddr) -> Option<Hands
                 "a source address already has as many handshakes in progress as it is \
                  allowed while the pool is this full, so its new connections are being \
                  closed (logged at most every {}s)",
-                LogThrottle::INTERVAL.as_secs()
-            );
-        }
-        return None;
-    };
-    let Ok(permit) = permits.clone().try_acquire_owned() else {
-        if let Some(refused) = shared.busy_refusals.should_log() {
-            warn!(
-                %peer,
-                refused,
-                "{limit} connections are already in their handshake, so new connections are \
-                 being closed (logged at most every {}s)",
                 LogThrottle::INTERVAL.as_secs()
             );
         }
@@ -638,6 +650,7 @@ async fn serve(mut stream: SpiceStream, peer: SocketAddr, shared: &Shared, slot:
         timeouts: shared.timeouts,
         key_generations: &shared.key_generations,
         wrong_tickets: &shared.wrong_tickets,
+        stale_sessions: &shared.stale_sessions,
         peer,
         playback: shared.platform.audio.is_some(),
     };

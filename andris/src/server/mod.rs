@@ -90,8 +90,16 @@ use session::{Cancel, Session, SessionRegistry};
 ///
 /// Every handshake that reaches the link reply waits for one of
 /// [`MAX_KEY_GENERATIONS`] to make its ticket key, so a full pool queues
-/// there: at tens of milliseconds a key, the last of 64 waits a second or
-/// two, well inside the ten seconds [`HandshakeTimeouts::stage`] allows.
+/// there. Measured in the devcontainer on an idle machine, a 1024-bit
+/// key takes about 22 ms (median of 40; 34 ms at the 90th percentile and
+/// 49 ms at the slowest), so the last of a full pool waits behind about
+/// 32 generations: of the order of a second, and under two at the
+/// slowest seen. That is inside the ten seconds
+/// [`HandshakeTimeouts::stage`] allows with room for a host several
+/// times busier, which is why the pool could grow without
+/// [`MAX_KEY_GENERATIONS`] growing with it: raising that would let a
+/// flood spend more of the desktop's CPU at once, which is the thing it
+/// is there to bound.
 pub const MAX_HANDSHAKES: usize = 64;
 
 /// The most handshakes one source address may have in progress at once,
@@ -487,6 +495,12 @@ impl Drop for ServerHandle {
 
 /// Take what a new connection from `peer` on a `kind` listener must hold
 /// for its handshake, or say why it cannot have it.
+///
+/// One address's slots are counted across both pools while its allowance
+/// is worked out from the pool this listener draws on, so a redirect
+/// costs a slot a SPICE handshake could have used. That is deliberate:
+/// it errs towards giving an address fewer slots, never more, and a
+/// redirect is answered and closed in one write.
 fn admit(shared: &Shared, kind: &ListenerKind, peer: SocketAddr) -> Option<HandshakeSlot> {
     let (permits, limit) = match kind {
         ListenerKind::Redirect => (&shared.redirects, MAX_REDIRECTS),

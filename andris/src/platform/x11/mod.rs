@@ -405,10 +405,10 @@ impl X11Platform {
             input: self.clone(),
             cursor: self.clone(),
             display_control: self.clone(),
-            clipboard: match self.clipboard {
-                Some(_) => Some(self.clone()),
-                None => None,
-            },
+            clipboard: self
+                .clipboard
+                .is_some()
+                .then(|| self.clone() as Arc<dyn Clipboard>),
             // Sound comes from the session's sound server, not the X
             // display: `andris` adds a PulseAudio source alongside.
             audio: None,

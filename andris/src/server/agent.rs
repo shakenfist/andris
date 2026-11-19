@@ -176,12 +176,13 @@ fn requested_size(config: &MonitorsConfig) -> Result<Size> {
 /// How many resizes a client may ask for in a burst, before
 /// [`RESIZE_REFILL`] starts to apply. Three covers a client that sends a
 /// configuration more than once as its window settles.
-const RESIZE_BURST: u32 = 3;
+pub const RESIZE_BURST: u32 = 3;
 
 /// How long one resize of the burst takes to come back. A resize
 /// reconfigures the operator's real screen and makes the server
 /// re-encode the whole desktop, so a client that wants to keep resizing
-/// is held to one every couple of seconds.
+/// is held to one every couple of seconds. Only a resize that changes
+/// the desktop costs a token; see [`ResizeBudget::refund`].
 const RESIZE_REFILL: Duration = Duration::from_secs(2);
 
 /// A token bucket over how often a client may resize the desktop:
@@ -224,6 +225,35 @@ impl ResizeBudget {
         self.tokens -= 1;
         true
     }
+
+    /// Give back a resize that turned out to cost nothing, because the
+    /// desktop was already the size the client asked for: nothing was
+    /// reconfigured and nothing re-encoded, so it is not what this
+    /// budget is here to limit.
+    ///
+    /// The cap cannot bind as this is called today, since every refund
+    /// follows a [`take`](Self::take) that succeeded in the same
+    /// request, so the count is at most back where it started. It is
+    /// here so that the bucket still holds to [`RESIZE_BURST`] if a
+    /// later caller refunds without having taken; a mutation test
+    /// removing it survives, which is why it is said here rather than
+    /// asserted in a test.
+    fn refund(&mut self) {
+        self.tokens = self.tokens.saturating_add(1).min(RESIZE_BURST);
+    }
+}
+
+/// What came of a resize the client asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resized {
+    /// The desktop is now the size asked for, or the nearest it allows.
+    Applied,
+    /// The desktop was already that size. The client is told it
+    /// succeeded, as it has what it asked for, but it is charged no
+    /// resize budget.
+    Unchanged,
+    /// The desktop would not, or could not, and the client is told so.
+    Failed,
 }
 
 /// The client's agent window, as andris counts it.
@@ -618,7 +648,18 @@ impl Agent {
     async fn monitors_config(&mut self, body: &[u8]) -> Result<()> {
         let config = MonitorsConfig::decode(body).context("a malformed agent MONITORS_CONFIG")?;
         let applied = match requested_size(&config) {
-            Ok(size) if self.resizes.take(Instant::now()) => self.resize(size).await,
+            Ok(size) if self.resizes.take(Instant::now()) => {
+                let outcome = self.resize(size).await;
+                if outcome == Resized::Unchanged {
+                    // Several clients re-send their whole configuration
+                    // on every window event and on reconnect. Asking for
+                    // the size the desktop already has is a RandR query
+                    // and nothing else, so charging for it would refuse
+                    // such a client its fourth identical request.
+                    self.resizes.refund();
+                }
+                outcome != Resized::Failed
+            }
             Ok(size) => {
                 self.refuse_frequent_resize(size);
                 false
@@ -665,8 +706,8 @@ impl Agent {
         }
     }
 
-    /// Ask the desktop to be `size`; true if it now is.
-    async fn resize(&mut self, size: Size) -> bool {
+    /// Ask the desktop to be `size`, and say what came of it.
+    async fn resize(&mut self, size: Size) -> Resized {
         let control = self.display_control.clone();
         let outcome = tokio::task::spawn_blocking(move || control.set_size(size)).await;
         match outcome {
@@ -675,14 +716,14 @@ impl Agent {
                     session = self.session,
                     "resized the desktop to {size}, as the client asked"
                 );
-                true
+                Resized::Applied
             }
             Ok(Ok(Resize::Unchanged)) => {
                 debug!(
                     session = self.session,
                     "the desktop is already {size}, as the client asked"
                 );
-                true
+                Resized::Unchanged
             }
             Ok(Ok(Resize::Refused(why))) => {
                 if self.refusal_logged {
@@ -698,7 +739,7 @@ impl Agent {
                          it keeps its size (logged once per connection)"
                     );
                 }
-                false
+                Resized::Failed
             }
             Ok(Err(error)) => {
                 warn!(
@@ -706,7 +747,7 @@ impl Agent {
                     error = format!("{error:#}"),
                     "resizing the desktop to {size} failed"
                 );
-                false
+                Resized::Failed
             }
             Err(error) => {
                 warn!(
@@ -714,7 +755,7 @@ impl Agent {
                     error = %error,
                     "resizing the desktop to {size} failed"
                 );
-                false
+                Resized::Failed
             }
         }
     }
@@ -826,13 +867,10 @@ impl Agent {
         if data.is_empty() {
             return;
         }
-        // Checked before the conversion, which can only lengthen the text:
-        // replacing an invalid byte with U+FFFD costs three. So a body
-        // already over the limit would be dropped whatever it converts to,
-        // and checking first avoids building the conversion to find out.
-        // The order used to be the other way round, which meant an
-        // all-invalid 16 MiB body allocated about 48 MiB before being
-        // dropped.
+        // Both length checks happen before anything is allocated. The
+        // order used to be conversion first, which meant an all-invalid
+        // 16 MiB body built about 48 MiB of U+FFFD before anything looked
+        // at how long it was.
         if data.len() > MAX_CLIPBOARD_TEXT {
             warn!(
                 session = self.session,
@@ -843,18 +881,28 @@ impl Agent {
             return;
         }
         let text: Arc<str> = match String::from_utf8(data) {
+            // Valid UTF-8 keeps the bytes it arrived in; no copy.
             Ok(text) => Arc::from(text),
-            Err(error) => Arc::from(String::from_utf8_lossy(error.as_bytes())),
+            Err(error) => {
+                let bytes = error.as_bytes();
+                // Measured rather than converted-then-measured: the
+                // conversion is the allocation, so a body that is within
+                // the limit as bytes but over it as text has to be caught
+                // without building it. A body of nothing but invalid
+                // bytes triples.
+                let lossy = lossy_len(bytes);
+                if lossy > MAX_CLIPBOARD_TEXT {
+                    warn!(
+                        session = self.session,
+                        bytes = lossy,
+                        "dropping the client's clipboard text: replacing its invalid UTF-8 \
+                         would take it over the {MAX_CLIPBOARD_TEXT}-byte limit"
+                    );
+                    return;
+                }
+                Arc::from(String::from_utf8_lossy(bytes))
+            }
         };
-        if text.len() > MAX_CLIPBOARD_TEXT {
-            warn!(
-                session = self.session,
-                bytes = text.len(),
-                "dropping the client's clipboard text: replacing its invalid UTF-8 took it \
-                 over the {MAX_CLIPBOARD_TEXT}-byte limit"
-            );
-            return;
-        }
         // The client converts its text to the desktop's LF line ends, as
         // GUEST_LINEEND_LF asks, so the text goes on the desktop as it
         // came. But it is compared, and remembered, with LF line ends, as
@@ -974,6 +1022,34 @@ impl Agent {
 
 /// `text` with each CRLF made LF.
 ///
+/// How long [`String::from_utf8_lossy`] would make `bytes`, without
+/// building it, so that a conversion too long to keep can be refused
+/// before it is allocated.
+///
+/// The conversion replaces each maximal invalid sequence with one
+/// U+FFFD, three bytes, and that is what is counted here: a trailing
+/// incomplete sequence is one replacement, however many bytes it has, so
+/// the count matches the conversion rather than bounding it.
+fn lossy_len(bytes: &[u8]) -> usize {
+    const REPLACEMENT: usize = char::REPLACEMENT_CHARACTER.len_utf8();
+    let mut len = 0;
+    let mut rest = bytes;
+    loop {
+        let error = match std::str::from_utf8(rest) {
+            Ok(text) => return len + text.len(),
+            Err(error) => error,
+        };
+        len += error.valid_up_to() + REPLACEMENT;
+        // `None` is a sequence cut short by the end of the input, which
+        // the one replacement just counted stands for; there is no more
+        // to walk.
+        let Some(bad) = error.error_len() else {
+            return len;
+        };
+        rest = &rest[error.valid_up_to() + bad..];
+    }
+}
+
 /// Andris announces `GUEST_LINEEND_LF`, which tells the client that the
 /// desktop's text ends its lines in LF, and the client converts to and
 /// from its own line ends on that understanding. The desktop's text need
@@ -1204,5 +1280,42 @@ mod tests {
         }
         let set: u32 = caps.caps.iter().map(|word| word.count_ones()).sum();
         assert_eq!(set, 2, "resizing and replies, and nothing else");
+    }
+
+    /// `lossy_len` has to agree with the conversion it stands in for,
+    /// exactly: it is what decides whether that conversion is built at
+    /// all, so a count that is too low would let an over-long text
+    /// through, and one too high would drop a text that fits.
+    #[test]
+    fn lossy_len_counts_what_the_conversion_would_build() {
+        for bytes in [
+            b"".to_vec(),
+            b"plain".to_vec(),
+            // One invalid byte, alone and between valid text.
+            vec![0xff],
+            b"a\xffb".to_vec(),
+            // A run of invalid bytes is one replacement each.
+            vec![0xff; 32],
+            // 0xc3 opens a two-byte sequence. Cut short by the end of the
+            // input it is one replacement for the whole tail, which is
+            // the case `error_len()` reports as `None`.
+            vec![0xc3],
+            b"a\xc3".to_vec(),
+            // And cut short by the start of the next sequence.
+            b"a\xc3\xc3\xa9".to_vec(),
+            // Valid multi-byte sequences count as their own bytes.
+            "h\u{e9}llo".as_bytes().to_vec(),
+            "h\u{e9}llo\u{fffd}".as_bytes().to_vec(),
+            // An over-long encoding of NUL, which UTF-8 forbids.
+            vec![0xc0, 0x80],
+            // A lone surrogate's encoding, likewise.
+            vec![0xed, 0xa0, 0x80],
+        ] {
+            assert_eq!(
+                lossy_len(&bytes),
+                String::from_utf8_lossy(&bytes).len(),
+                "{bytes:02x?}"
+            );
+        }
     }
 }

@@ -370,12 +370,24 @@ The limits themselves:
   channel and then its display, cursor and inputs channels in
   parallel, as spice-gtk does. An IPv6 address counts by its /64, so
   one host with a routed /64 counts once;
-- at most 2 RSA keys for ticket encryption are generated at once.
+- at most 2 RSA keys for ticket encryption are generated at once. A
+  key takes about 20 ms, so a full handshake pool waits behind about
+  32 of them: of the order of a second, inside the 10 second limit on
+  that step. The limit stays at 2 as the pool grows, because what it
+  bounds is how much of the desktop's CPU a flood can take at once.
 
 A fixed cap per address would bound one address and nothing else,
 since an attacker chooses how many addresses to use. Letting the
 allowance fall as the pool fills makes the last permits cost one
 address each, which is where the thirty above comes from.
+
+A client whose main channel links and whose display, cursor or inputs
+channel is then refused does not come up without that channel: ryll
+fails the whole connection if any channel it planned cannot link, so
+the session ends with an error instead of running with no pointer or
+no keyboard. The connection is closed before any byte of its link
+reply, so the client has nothing from andris to report as the reason;
+andris's own log carries it.
 
 Connections past a limit are closed immediately, and the refusals
 are logged at most every 10 seconds. The first step of a handshake,

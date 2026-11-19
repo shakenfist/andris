@@ -450,11 +450,9 @@ impl fmt::Display for Report {
             ),
             TicketState::NotCreated { mode } => writeln!(
                 f,
-                "No ticket was written to {ticket}: {} is open to group or other (mode \
-                 {mode:04o}), where another user could replace a ticket andris wrote. Run \
-                 chmod 700 {}, then install again.",
-                self.config_dir.display(),
-                shell_quote(&self.config_dir.display().to_string())
+                "No ticket was written to {ticket}: the directory above is open to group \
+                 or other (mode {mode:04o}), where another user could replace a ticket \
+                 andris wrote."
             ),
         }
     }
@@ -574,8 +572,33 @@ pub fn run() -> Result<()> {
     )?;
     let report = install(&config_home, &exe)?;
     let display = std::env::var("DISPLAY").ok();
-    print!("{report}\n{}", next_steps(display.as_deref()));
+    let Some(steps) = steps_after(&report, display.as_deref()) else {
+        print!("{report}");
+        bail!(
+            "no ticket was written, so andris would refuse to start: run chmod 700 {}, \
+             then andris install-unit again",
+            shell_quote(&report.config_dir.display().to_string())
+        );
+    };
+    print!("{report}\n{steps}");
     Ok(())
+}
+
+/// The steps to print after `report`, or `None` when there is nothing to
+/// start.
+///
+/// Without a ticket andris refuses to start -- it reads `--ticket-file`
+/// before it serves anything, and the unit names a file that is not
+/// there -- so telling the operator to enable and start the unit would
+/// be telling them to start something that cannot come up. `run` fails
+/// instead, so that a script installing andris stops on it.
+fn steps_after(report: &Report, display: Option<&str>) -> Option<String> {
+    match report.ticket {
+        TicketState::NotCreated { .. } => None,
+        TicketState::Created | TicketState::Existing | TicketState::Refused(_) => {
+            Some(next_steps(display))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -844,7 +867,9 @@ mod tests {
         assert_eq!(mode(&config_dir), 0o755);
         let shown = report.to_string();
         assert!(shown.contains("mode 0755"), "{shown}");
-        assert!(shown.contains("chmod 700"), "{shown}");
+        // The remedy is given once, by the line about the directory, and
+        // not again by the line about the ticket.
+        assert_eq!(shown.matches("chmod 700").count(), 1, "{shown}");
 
         // And no ticket is written into it: the file would be 0600, but
         // anyone who can write the directory can replace it.
@@ -854,6 +879,38 @@ mod tests {
             "no ticket was left behind"
         );
         assert!(shown.contains("No ticket was written"), "{shown}");
+
+        // Without a ticket the unit cannot start, so the operator is not
+        // told to start it. `run` fails instead of printing these.
+        assert_eq!(steps_after(&report, Some(":10")), None);
+    }
+
+    /// The counterpart: an install that did leave a usable ticket says
+    /// how to start the unit.
+    #[test]
+    fn an_install_with_a_ticket_says_how_to_start_it() {
+        let (dir, exe) = home();
+        let report = install(dir.path(), &exe).unwrap();
+        assert_eq!(report.ticket, TicketState::Created);
+        let steps = steps_after(&report, Some(":10")).unwrap();
+        assert!(
+            steps.contains("systemctl --user enable andris@10"),
+            "{steps}"
+        );
+
+        // A ticket andris would refuse is still a ticket: the operator is
+        // told what is wrong with it and how to start the unit, because
+        // replacing the file is all that is left to do.
+        let refused = Report {
+            ticket: TicketState::Refused("too short".to_string()),
+            ..report.clone()
+        };
+        assert!(steps_after(&refused, Some(":10")).is_some());
+        let existing = Report {
+            ticket: TicketState::Existing,
+            ..report
+        };
+        assert!(steps_after(&existing, Some(":10")).is_some());
     }
 
     /// A ticket already in a loose directory is the operator's, and may

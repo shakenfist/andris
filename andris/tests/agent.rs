@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use andris::platform::{DisplayGeometry, MAX_CLIPBOARD_TEXT, Size};
-use andris::server::agent::{MAX_AGENT_MESSAGE, MAX_CHUNK};
+use andris::server::agent::{MAX_AGENT_MESSAGE, MAX_CHUNK, RESIZE_BURST};
 use shakenfist_spice_protocol::constants::vd_agent::{
     VD_AGENT_ANNOUNCE_CAPABILITIES, VD_AGENT_CAP_CLIPBOARD_BY_DEMAND,
     VD_AGENT_CAP_CLIPBOARD_GRAB_SERIAL, VD_AGENT_CAP_CLIPBOARD_SELECTION,
@@ -601,7 +601,22 @@ async fn invalid_clipboard_text_is_dropped_by_whichever_check_catches_it() {
     let text = logs.text();
     assert!(
         text.contains("replacing its invalid UTF-8"),
-        "the check after the conversion caught this one: {text}"
+        "the length the conversion would reach caught this one: {text}"
+    );
+
+    // The worst case: within the limit as bytes, so the first check
+    // passes it, and three times the limit once every byte becomes a
+    // U+FFFD. It is measured rather than converted, so the conversion is
+    // never built.
+    agent
+        .send_agent(VD_AGENT_CLIPBOARD, &clip(&invalid(MAX_CLIPBOARD_TEXT)))
+        .await;
+    agent.sync(&server).await;
+    assert_eq!(server.platform.clipboard_sets().unwrap(), 0);
+    let text = logs.text();
+    assert!(
+        text.contains("would take it over"),
+        "measured before converting: {text}"
     );
 
     // Short invalid text still crosses, with its bytes replaced.
@@ -685,7 +700,9 @@ async fn resizes_past_the_burst_are_refused_without_touching_the_desktop() {
     let mut agent = AgentClient::start(&server, u32::MAX).await;
     agent.expect(VD_AGENT_ANNOUNCE_CAPABILITIES).await;
 
-    // Each is a different size, so each spends one of the burst.
+    // Each is a different size, so each changes the desktop and spends
+    // one of the burst. Repeating a size does not; see
+    // `repeating_a_size_the_desktop_already_has_is_never_refused`.
     for width in [320, 400, 480] {
         assert!(
             agent.resize(width, 200).await,
@@ -701,6 +718,48 @@ async fn resizes_past_the_burst_are_refused_without_touching_the_desktop() {
         server.platform.size().unwrap(),
         settled,
         "the desktop was not asked for the refused size"
+    );
+}
+
+/// Several SPICE clients re-send their whole monitors configuration on
+/// every window event, and on reconnect. A request for the size the
+/// desktop already has reconfigures nothing and re-encodes nothing, so it
+/// is not what the resize budget is there to limit, and a client must not
+/// be refused its fourth identical request.
+#[tokio::test]
+async fn repeating_a_size_the_desktop_already_has_is_never_refused() {
+    let server = TestServer::start().await;
+    let mut agent = AgentClient::start(&server, u32::MAX).await;
+    agent.expect(VD_AGENT_ANNOUNCE_CAPABILITIES).await;
+
+    let settled = Size {
+        width: 320,
+        height: 200,
+    };
+    // The first one changes the desktop, so it spends a token.
+    assert!(agent.resize(settled.width, settled.height).await);
+
+    // Well past the burst: each of these finds the desktop already that
+    // size, so each is given its token back.
+    for attempt in 0..RESIZE_BURST * 4 {
+        assert!(
+            agent.resize(settled.width, settled.height).await,
+            "identical resize {attempt} was refused"
+        );
+        assert_eq!(server.platform.size().unwrap(), settled);
+    }
+
+    // And the budget is still there for a resize that does change
+    // something, which the refunds must not have banked beyond the burst.
+    for width in [400, 480] {
+        assert!(
+            agent.resize(width, 200).await,
+            "a {width} wide resize after the repeats"
+        );
+    }
+    assert!(
+        !agent.resize(560, 200).await,
+        "the burst is spent, so this one is refused"
     );
 }
 

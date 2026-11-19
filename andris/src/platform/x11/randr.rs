@@ -523,7 +523,11 @@ impl Randr {
     ///
     /// Returns how many steps could not be undone, which is how many ways
     /// the desktop may be left as the attempt left it rather than as it
-    /// was. The caller reports that to the client.
+    /// was. The caller reports that to the client. A mode andris added to
+    /// an output or created and could not take back counts too: it does
+    /// not change what is on the screen, but it leaves a mode the
+    /// operator did not make in the desktop's mode list, which is the
+    /// same kind of residue as a screen left the wrong size.
     fn undo(
         &self,
         conn: &RustConnection,
@@ -549,13 +553,17 @@ impl Randr {
             }
         }
         for &(output, mode) in attempt.added.iter().rev() {
-            carry_on(
+            if !carried_on(
                 delete_output_mode(conn, output, mode),
                 "removing a mode andris added",
-            )?;
+            )? {
+                stuck += 1;
+            }
         }
         for &mode in attempt.created.iter().rev() {
-            carry_on(destroy_mode(conn, mode), "destroying a mode andris created")?;
+            if !carried_on(destroy_mode(conn, mode), "destroying a mode andris created")? {
+                stuck += 1;
+            }
         }
         Ok(stuck)
     }

@@ -432,9 +432,12 @@ impl Randr {
             Err(Fault::Failed(e)) => {
                 let stuck = self.undo(conn, root, chosen.crtc, &old, &attempt)?;
                 if stuck > 0 {
-                    // Reaches the client as the reason for the refusal, so
-                    // that "it keeps its size" is not claimed when it may
-                    // not have.
+                    // Reaches the line `Agent::resize` logs for the
+                    // refusal, so that "it keeps its size" is not claimed
+                    // there when it may not have. Each step that failed
+                    // was warned of already, by `carried_on`. The client's
+                    // error reply carries no reason, so it is told nothing
+                    // more.
                     return Err(Fault::Failed(e.context(format!(
                         "and {stuck} step(s) of putting the desktop back failed, so it may be \
                          left part way"
@@ -1014,6 +1017,22 @@ mod tests {
             millimetres_to_restore(None, found),
             (millimetres(1024), millimetres(768))
         );
+    }
+
+    #[test]
+    fn a_step_that_fails_is_counted_and_a_lost_connection_stops_the_undo() {
+        assert!(matches!(carried_on(Ok(()), "a step"), Ok(true)));
+        // A refused step is reported as not done, for `undo` to count,
+        // and the undo carries on with the rest.
+        let refused = Err(Fault::Failed(anyhow!("refused")));
+        assert!(matches!(carried_on(refused, "a step"), Ok(false)));
+        assert!(matches!(
+            carry_on(Err(Fault::Failed(anyhow!("refused"))), "a step"),
+            Ok(())
+        ));
+        // A lost connection is not a step to count: it ends the undo.
+        let gone = Err(Fault::Gone(anyhow!("gone")));
+        assert!(matches!(carried_on(gone, "a step"), Err(Fault::Gone(_))));
     }
 
     /// Run `steps` from a screen of `screen` whose CRTC reaches `extent`,

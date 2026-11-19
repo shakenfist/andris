@@ -275,9 +275,11 @@ can start a daemon of its own, and ryll gets an unreachable one.
 
 Every clipboard check copies text not used before, because FreeRDP
 and xrdp keep what they last fetched. Andris runs there with debug
-logging for the clipboard, and both its log and the stand-in's carry a
-hash of each text that passes, so a failed check shows which text went
-where without the text itself.
+logging for the clipboard, so its log carries a fingerprint of each
+text that passes, and the stand-in's carries each text's length in the
+order it saw them. Andris keys its fingerprint afresh every run, so the
+two logs share no hash: a failed check is traced by order and length,
+without the text itself.
 
 The container has no network, and its own `/tmp`, so no X server or
 xrdp session on the host can be reached from it. Never aim a test that

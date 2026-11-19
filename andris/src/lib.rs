@@ -35,7 +35,7 @@ use tracing::{error, info, warn};
 use config::{AudioConfig, Config, PlatformConfig};
 use platform::pulse::{self, PulseSource};
 use platform::synthetic::{SyntheticPlatform, ToneSource};
-use platform::x11::X11Platform;
+use platform::x11::{X11Options, X11Platform};
 use platform::{AudioSource, GoneSignal, Platform};
 use server::{DisplayOptions, HandshakeTimeouts, STOP_GRACE, Server, ServerHandle, ServerOptions};
 
@@ -65,7 +65,11 @@ pub fn run(config: Config) -> Result<()> {
         }
         PlatformConfig::X11 { display: name } => {
             info!("exporting X display {name}");
-            X11Platform::connect(name)?.platform()
+            let options = X11Options {
+                clipboard: config.clipboard,
+                ..X11Options::default()
+            };
+            X11Platform::connect_with(name, options)?.platform()
         }
         #[cfg(feature = "qemu")]
         PlatformConfig::Qemu { qmp } => {
@@ -75,6 +79,9 @@ pub fn run(config: Config) -> Result<()> {
     };
     platform.audio = audio;
     if !config.clipboard {
+        // The X11 backend has not started its clipboard at all, so it
+        // offers none already. The others read nothing from a desktop's
+        // clipboard, so withholding theirs from the server is enough.
         info!("the clipboard is off");
         platform.clipboard = None;
     }

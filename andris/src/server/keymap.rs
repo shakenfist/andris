@@ -92,7 +92,6 @@ enum Prefix {
     E1(Option<u8>),
 }
 
-/// Decodes set-1 bytes into key strokes, keeping prefixes across calls.
 /// How many distinct unmapped codes one decoder reports at warning level
 /// before the rest go to debug.
 ///
@@ -103,11 +102,15 @@ enum Prefix {
 /// is for; the rest is noise a client can produce at will.
 const UNMAPPED_WARNINGS: usize = 8;
 
+/// Decodes set-1 bytes into key strokes, keeping prefixes across calls.
 #[derive(Debug)]
 pub struct KeyDecoder {
     prefix: Prefix,
     /// The unmapped codes already logged, as the prefix byte (or 0) in
-    /// the high byte and the code in the low.
+    /// the high byte and the code in the low. A client can fill it with
+    /// all 65,536, a few hundred KiB for the life of the inputs channel;
+    /// that is bounded by `u16` and small, so it is not capped, and it is
+    /// what keeps each code to one line at debug level too.
     logged: HashSet<u16>,
 }
 

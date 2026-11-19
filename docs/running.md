@@ -298,6 +298,14 @@ ticket is logged at `info` with the client's address, for tools such
 as fail2ban, at most once every 10 seconds with a count of those
 since the last.
 
+A client told that its ticket was refused, with no such line in the
+log, gave the right ticket for a channel of a session that had
+already ended: one that raced its own reconnect, say, or was replaced
+by another client. Andris refuses that the same way as a wrong
+ticket, so that a client which has not proved it holds the ticket
+learns nothing about which session is current, and logs it at
+`debug` with the session's connection id. Reconnecting fixes it.
+
 The `--tls-key` file is held to the same rules of ownership and mode.
 
 ## Listeners, TLS and the loopback rule
@@ -520,7 +528,10 @@ but the client already has the text. Connect only clients you would
 trust with the session's clipboard. Andris offers nothing to a client
 that does not announce clipboard sharing.
 
-`--no-clipboard` shares none, in either direction. Andris then
+`--no-clipboard` shares none, in either direction, and andris does
+not read the desktop's clipboard at all: under `--platform x11` it
+does not watch `CLIPBOARD` or fetch what is copied, so neither its
+memory nor its log ever holds a fingerprint of the text. Andris then
 announces no clipboard capability, so a client's "share clipboard"
 has nothing to act on rather than appearing to work while the text
 goes nowhere, and a clipboard message from a client that sends one
@@ -545,9 +556,10 @@ does, up to the size it started with. xorgxrdp does not (see
 [xrdp.md](xrdp.md#resizing)). Where it is refused, the client gets an
 error reply, the desktop keeps its size, and andris logs one warning
 for the connection, not one for each request. A resize that fails part
-way is undone, and where undoing it also fails the error reply says so
-rather than claiming the size was kept: the desktop can be left part
-way, which the log describes step by step. RandR is optional:
+way is undone. Where undoing it also fails, andris logs a warning for
+each step it could not put back, and the refusal's log line says the
+desktop may be left part way rather than that it kept its size. The
+client gets the same error reply either way. RandR is optional:
 without it, or without RandR 1.2, andris still serves the desktop and
 refuses every resize in the same way.
 
@@ -557,7 +569,10 @@ the whole desktop: three may be asked for at once, and one more
 becomes available every two seconds. A resize past that is refused
 before the X server is asked, so the screen is left alone; the client
 gets the same error reply as any other refusal, and one warning is
-logged for the connection. A client that sends a configuration more
+logged for the connection. The allowance belongs to the main channel's
+connection, so a client that relinks its main channel starts with a
+fresh three; a relink costs a full handshake, which is slower than the
+resizes it buys. A client that sends a configuration more
 than once as its window settles is unaffected. One that streams them
 while a window is dragged will have some refused, and the desktop
 then keeps the last size that was accepted rather than the last one

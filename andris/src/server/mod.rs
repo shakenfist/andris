@@ -87,6 +87,11 @@ use session::{Cancel, Session, SessionRegistry};
 /// [`MAX_HANDSHAKES_PER_PEER`] rather than at the smallest workable
 /// number: [`peer_allowance`] can only make slots expensive if one
 /// address's share of the pool is small.
+///
+/// Every handshake that reaches the link reply waits for one of
+/// [`MAX_KEY_GENERATIONS`] to make its ticket key, so a full pool queues
+/// there: at tens of milliseconds a key, the last of 64 waits a second or
+/// two, well inside the ten seconds [`HandshakeTimeouts::stage`] allows.
 pub const MAX_HANDSHAKES: usize = 64;
 
 /// The most handshakes one source address may have in progress at once,

@@ -991,6 +991,9 @@ fn lf_line_ends(text: Arc<str>) -> Arc<str> {
 
 #[cfg(test)]
 mod tests {
+    use shakenfist_spice_protocol::messages::vd_agent::MonConfig;
+
+    use super::*;
 
     #[test]
     fn a_resize_burst_is_allowed_and_then_throttled() {
@@ -1021,9 +1024,6 @@ mod tests {
         }
         assert!(!budget.take(later), "and no further than the burst");
     }
-    use shakenfist_spice_protocol::messages::vd_agent::MonConfig;
-
-    use super::*;
 
     fn header(chunk: &[u8]) -> VdAgentMessageHeader {
         VdAgentMessageHeader::decode(chunk).unwrap()

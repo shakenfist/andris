@@ -48,7 +48,7 @@ RUN mkdir -p /build && chmod 777 /build
 ENV CARGO_HOME=/build/.cargo
 ENV RUSTUP_HOME=/build/.rustup
 # renovate: datasource=github-releases depName=rust-lang/rust
-ARG RUST_VERSION=1.99.1
+ARG RUST_VERSION=1.100.0
 # rustup-init, at an exact rustup version and checked against a hash held
 # here rather than one fetched beside it. Renovate does not track these:
 # the version and both hashes move together, by hand, taken from

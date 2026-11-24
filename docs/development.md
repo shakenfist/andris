@@ -424,7 +424,7 @@ Runs on `pull_request` and on `workflow_dispatch`, and gates the
 |-----|--------------|
 | `Lint` | `pre-commit run --all-files`, so every hook above |
 | `Build and test` | `make build test`, then `make test FEATURES=qemu` |
-| `cargo audit` | RustSec advisory check |
+| `cargo audit` | RustSec advisory check with the `cargo audit` CLI: fails on a vulnerability, prints unmaintained and unsound warnings without failing. It does not use `rustsec/audit-check`, whose check-run update fails intermittently ([rustsec/audit-check#56](https://github.com/rustsec/audit-check/issues/56)) |
 | `cargo deny` | Licence, ban, source and advisory policy |
 
 An `Automated reviewer` job runs after these four through the shared

@@ -3,10 +3,9 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use tracing::{debug, warn};
 use x11rb::connection::Connection;
 use x11rb::errors::ConnectionError;
@@ -16,7 +15,7 @@ use x11rb::rust_connection::RustConnection;
 
 use super::keymap::{self, KeyName, Keymap, Unmapped};
 use super::{Fault, answer, connection_failed, lost, stopped};
-use crate::platform::{Button, GoneSender, InputEvent, LockState};
+use crate::platform::{Backlog, Button, GoneSender, InputEvent, LockState};
 
 /// A request to the input thread.
 pub(super) enum InputRequest {
@@ -28,9 +27,9 @@ pub(super) enum InputRequest {
 
 /// The sending end of the input thread's queue.
 ///
-/// One unbounded FIFO, bounded instead by counting the events in it: an
-/// event is counted when queued and uncounted when the input thread takes
-/// it. [`InputQueue::push`] refuses an event once `limit` are counted, so
+/// One unbounded FIFO, bounded instead by a [`Backlog`]: an event is
+/// counted when queued and uncounted when the input thread takes it.
+/// [`InputQueue::push`] refuses an event once `limit` are counted, so
 /// [`InputSink::inject`] and [`InputSink::inject_release`] differ only in
 /// the limit they pass. A second queue for releases, drained first, would
 /// let a release overtake its own press still waiting here, leaving the
@@ -38,50 +37,36 @@ pub(super) enum InputRequest {
 /// answer, so there are never more than there are callers.
 pub(super) struct InputQueue {
     pub(super) requests: Sender<InputRequest>,
-    queued: Arc<AtomicUsize>,
+    backlog: Arc<Backlog>,
 }
 
 /// The input thread's end of an [`InputQueue`].
 pub(super) struct InputReceiver {
     requests: Receiver<InputRequest>,
-    queued: Arc<AtomicUsize>,
+    backlog: Arc<Backlog>,
 }
 
 impl InputQueue {
     pub(super) fn new() -> (Self, InputReceiver) {
         let (requests, receiver) = mpsc::channel();
-        let queued = Arc::new(AtomicUsize::new(0));
+        let backlog = Arc::new(Backlog::new("X11"));
         (
             Self {
                 requests,
-                queued: queued.clone(),
+                backlog: backlog.clone(),
             },
             InputReceiver {
                 requests: receiver,
-                queued,
+                backlog,
             },
         )
     }
 
     /// Queue `event`, unless `limit` events are already queued.
     pub(super) fn push(&self, event: InputEvent, limit: usize) -> Result<()> {
-        let mut queued = self.queued.load(Ordering::Acquire);
-        loop {
-            if queued >= limit {
-                bail!("the X11 input queue is full: {limit} events are waiting to be injected");
-            }
-            match self.queued.compare_exchange_weak(
-                queued,
-                queued + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(now) => queued = now,
-            }
-        }
+        self.backlog.take(limit)?;
         if self.requests.send(InputRequest::Event(event)).is_err() {
-            self.queued.fetch_sub(1, Ordering::AcqRel);
+            self.backlog.done();
             return Err(stopped("input"));
         }
         Ok(())
@@ -92,7 +77,7 @@ impl InputReceiver {
     /// Uncount `request` if it is an event.
     fn taken(&self, request: InputRequest) -> InputRequest {
         if matches!(request, InputRequest::Event(_)) {
-            self.queued.fetch_sub(1, Ordering::AcqRel);
+            self.backlog.done();
         }
         request
     }
@@ -374,7 +359,7 @@ pub(super) fn serve_input(mut injector: Injector, requests: InputReceiver, gone:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::x11::{INPUT_QUEUE_LIMIT, RELEASE_RESERVE};
+    use crate::platform::{INPUT_QUEUE_LIMIT, RELEASE_RESERVE};
 
     const CAPS: Atom = 100;
     const NUM: Atom = 101;
@@ -519,6 +504,6 @@ mod tests {
         drop(receiver);
         let error = queue.push(key(30, true), 1).unwrap_err().to_string();
         assert!(error.contains("input thread has stopped"), "{error}");
-        assert_eq!(queue.queued.load(Ordering::Acquire), 0);
+        assert_eq!(queue.backlog.queued(), 0);
     }
 }

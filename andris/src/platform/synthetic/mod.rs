@@ -96,9 +96,11 @@ use anyhow::{Result, anyhow, bail};
 use tokio::sync::watch;
 
 use super::{
-    Capture, Clipboard, ClipboardReceiver, CursorReceiver, CursorShape, CursorSource, DamageHub,
-    DamageSubscription, DisplayControl, DisplayGeometry, EvdevCode, Frame, GoneSender, GoneSignal,
-    InputEvent, InputSink, LockState, Patch, Platform, Rectangle, Resize, ScreenSource, Size,
+    Backlog, Capture, Clipboard, ClipboardReceiver, CursorReceiver, CursorShape, CursorSource,
+    DamageHub, DamageSubscription, DisplayControl, DisplayGeometry, EvdevCode, Frame, Gone,
+    GoneSender, GoneSignal, INPUT_QUEUE_LIMIT, InputEvent, InputSink, LockState,
+    MAX_CLIPBOARD_TEXT, Patch, Platform, RELEASE_RESERVE, Rectangle, Resize, ScreenSource, Size,
+    SizeRange, Verdict, clamp, verdict,
 };
 pub use tone::{
     DEFAULT_TONE_OFF, DEFAULT_TONE_ON, TONE_AMPLITUDE, TONE_FREQUENCY, TonePattern, ToneSource,
@@ -168,6 +170,16 @@ struct State {
     failing_size_reads: u32,
     /// Whether [`DisplayControl::set_size`] refuses.
     refusing_resizes: bool,
+    /// The range [`DisplayControl::set_size`] clamps to, as a real
+    /// server's `GetScreenSizeRange` does. `None` accepts any size
+    /// [`Size::check`] allows, which is what a desktop with no range
+    /// does.
+    size_range: Option<SizeRange>,
+    /// Whether injected events stay counted in the backlog, as they do
+    /// on a real backend whose input thread is not keeping up. Off by
+    /// default: with nothing holding them, a synthetic desktop applies
+    /// each event as it is injected, so its queue is always empty.
+    holding_input: bool,
     /// The text the server last set on the clipboard, and how many times
     /// it has set any.
     clipboard_set: Option<Arc<str>>,
@@ -181,6 +193,8 @@ struct State {
 pub struct SyntheticPlatform {
     state: Mutex<State>,
     events: Mutex<VecDeque<InputEvent>>,
+    /// The bound on the input queue, as the real backends have.
+    backlog: Backlog,
     cursor: watch::Sender<Option<Arc<CursorShape>>>,
     /// The text other programs put on the clipboard.
     clipboard: watch::Sender<Option<Arc<str>>>,
@@ -217,10 +231,13 @@ impl SyntheticPlatform {
                 failing_captures: 0,
                 failing_size_reads: 0,
                 refusing_resizes: false,
+                size_range: None,
+                holding_input: false,
                 clipboard_set: None,
                 clipboard_sets: 0,
             }),
             events: Mutex::new(VecDeque::new()),
+            backlog: Backlog::new("synthetic"),
             cursor: watch::Sender::new(Some(Arc::new(default_cursor()))),
             clipboard: watch::Sender::new(None),
             damage: DamageHub::new(size),
@@ -368,6 +385,43 @@ impl SyntheticPlatform {
         Ok(())
     }
 
+    /// Clamp [`DisplayControl::set_size`] to `range`, as a real server's
+    /// `GetScreenSizeRange` does, or accept any size with `None`.
+    ///
+    /// With a range set, a size outside it is clamped and applied, and a
+    /// size that clamps to the one the desktop already has is refused:
+    /// the rule in [`resize`](super::resize), which the X11 backend
+    /// follows through RandR.
+    pub fn set_size_range(&self, range: Option<SizeRange>) -> Result<()> {
+        self.state()?.size_range = range;
+        Ok(())
+    }
+
+    /// Stop uncounting injected events, so that the input queue fills and
+    /// [`InputSink::inject`] starts refusing, as a real backend does when
+    /// its input thread cannot keep up; or start again, which uncounts
+    /// everything held.
+    ///
+    /// A synthetic desktop applies each event as it is injected, so
+    /// without this its queue is never anything but empty, and no test
+    /// through this backend could reach a full one.
+    pub fn hold_input(&self, hold: bool) -> Result<()> {
+        let mut state = self.state()?;
+        state.holding_input = hold;
+        if !hold {
+            drop(state);
+            while self.backlog.queued() > 0 {
+                self.backlog.done();
+            }
+        }
+        Ok(())
+    }
+
+    /// How many injected events are counted against the queue's bound.
+    pub fn queued_input(&self) -> usize {
+        self.backlog.queued()
+    }
+
     /// Put `text` on the clipboard, or empty it with `None`, as another
     /// program on the desktop would, and report it to
     /// [`Clipboard::changes`]. The same text again is reported again.
@@ -435,6 +489,19 @@ impl SyntheticPlatform {
             .map_err(|_| anyhow!("the synthetic platform's state lock is poisoned"))
     }
 
+    /// [`Gone`] once [`SyntheticPlatform::vanish`] has been called, as
+    /// every seam of a real backend reports once its desktop has gone.
+    ///
+    /// Without this the synthetic backend kept serving a desktop it had
+    /// been told was gone, so no test through it could exercise the
+    /// server's gone handling anywhere but a damage subscription.
+    fn still_here(&self) -> Result<()> {
+        match self.gone_signal.why() {
+            Some(why) => Err(anyhow::Error::new(Gone(why))),
+            None => Ok(()),
+        }
+    }
+
     /// A copy of what decides the pixels.
     fn scene(&self) -> Result<Scene> {
         let state = self.state()?;
@@ -463,45 +530,25 @@ impl SyntheticPlatform {
             .lock()
             .map_err(|_| anyhow!("the synthetic platform's event lock is poisoned"))
     }
-}
 
-impl DisplayGeometry for SyntheticPlatform {
-    fn size(&self) -> Result<Size> {
-        let mut state = self.state()?;
-        if state.failing_size_reads > 0 {
-            state.failing_size_reads -= 1;
-            bail!("a synthetic size read failure");
+    /// Count `event` against the queue's bound and apply it, giving the
+    /// count straight back unless [`SyntheticPlatform::hold_input`] is
+    /// holding it. The count is also given back if applying the event
+    /// fails, so a refusal never costs the queue a slot.
+    fn queue(&self, event: InputEvent, limit: usize) -> Result<()> {
+        self.still_here()?;
+        let holding = self.state()?.holding_input;
+        self.backlog.take(limit)?;
+        let applied = self.apply(event);
+        if !holding || applied.is_err() {
+            self.backlog.done();
         }
-        Ok(state.size)
-    }
-}
-
-impl ScreenSource for SyntheticPlatform {
-    fn subscribe_damage(&self) -> Result<DamageSubscription> {
-        self.damage.subscribe()
+        applied
     }
 
-    fn capture(&self, rects: &[Rectangle]) -> Result<Capture> {
-        let scene = self.scene_for_capture()?;
-        let patches = rects
-            .iter()
-            .filter_map(|rect| rect.clip(scene.size))
-            .map(|rect| Patch::new(rect, render(&scene, rect)?))
-            .collect::<Result<_>>()?;
-        Capture::new(scene.size, patches)
-    }
-
-    fn capture_all(&self) -> Result<Capture> {
-        let scene = self.scene_for_capture()?;
-        Capture::whole(render(&scene, Rectangle::full(scene.size))?)
-    }
-}
-
-impl InputSink for SyntheticPlatform {
-    /// Records the event, dropping the oldest once [`RECORDED_EVENTS`]
-    /// are kept. A press of a lock key toggles that lock, as an X server
-    /// does.
-    fn inject(&self, event: InputEvent) -> Result<()> {
+    /// Toggle the locks `event` toggles, and record it, dropping the
+    /// oldest once [`RECORDED_EVENTS`] are kept.
+    fn apply(&self, event: InputEvent) -> Result<()> {
         if let InputEvent::Key {
             code,
             pressed: true,
@@ -522,8 +569,64 @@ impl InputSink for SyntheticPlatform {
         events.push_back(event);
         Ok(())
     }
+}
+
+impl DisplayGeometry for SyntheticPlatform {
+    fn size(&self) -> Result<Size> {
+        self.still_here()?;
+        let mut state = self.state()?;
+        if state.failing_size_reads > 0 {
+            state.failing_size_reads -= 1;
+            bail!("a synthetic size read failure");
+        }
+        Ok(state.size)
+    }
+}
+
+impl ScreenSource for SyntheticPlatform {
+    fn subscribe_damage(&self) -> Result<DamageSubscription> {
+        self.damage.subscribe()
+    }
+
+    fn capture(&self, rects: &[Rectangle]) -> Result<Capture> {
+        self.still_here()?;
+        let scene = self.scene_for_capture()?;
+        let patches = rects
+            .iter()
+            .filter_map(|rect| rect.clip(scene.size))
+            .map(|rect| Patch::new(rect, render(&scene, rect)?))
+            .collect::<Result<_>>()?;
+        Capture::new(scene.size, patches)
+    }
+
+    fn capture_all(&self) -> Result<Capture> {
+        self.still_here()?;
+        let scene = self.scene_for_capture()?;
+        Capture::whole(render(&scene, Rectangle::full(scene.size))?)
+    }
+}
+
+impl InputSink for SyntheticPlatform {
+    /// Records the event, dropping the oldest once [`RECORDED_EVENTS`]
+    /// are kept. A press of a lock key toggles that lock, as an X server
+    /// does.
+    ///
+    /// Fails once the queue's bound is reached, as a real backend does,
+    /// which only happens under
+    /// [`SyntheticPlatform::hold_input`]: otherwise the event is applied
+    /// as it is injected, so nothing is ever waiting.
+    fn inject(&self, event: InputEvent) -> Result<()> {
+        self.queue(event, INPUT_QUEUE_LIMIT)
+    }
+
+    /// As [`InputSink::inject`], but drawing on [`RELEASE_RESERVE`], so
+    /// that a release andris owes the desktop gets through a full queue.
+    fn inject_release(&self, event: InputEvent) -> Result<()> {
+        self.queue(event, INPUT_QUEUE_LIMIT + RELEASE_RESERVE)
+    }
 
     fn lock_state(&self) -> Result<LockState> {
+        self.still_here()?;
         Ok(self.state()?.locks)
     }
 }
@@ -538,7 +641,14 @@ impl DisplayControl for SyntheticPlatform {
     /// Resizes the pattern, reporting the resize, unless
     /// [`SyntheticPlatform::refuse_resizes`] says to refuse. A size
     /// [`Size::check`] refuses is refused too.
+    ///
+    /// With a range set by [`SyntheticPlatform::set_size_range`], the
+    /// size is clamped to it first and the verdict follows the rule in
+    /// [`resize`](super::resize), so that clamping and at-the-limit
+    /// behaviour can be tested through this backend as well as through
+    /// RandR.
     fn set_size(&self, size: Size) -> Result<Resize> {
+        self.still_here()?;
         // Reported under the lock, as every change is: see the module.
         let mut state = self.state()?;
         if state.refusing_resizes {
@@ -546,14 +656,26 @@ impl DisplayControl for SyntheticPlatform {
                 "the synthetic desktop is set to refuse resizes".to_string(),
             ));
         }
-        if state.size == size {
-            return Ok(Resize::Unchanged);
+        let target = match state.size_range {
+            Some(range) => clamp(size, range),
+            None => size,
+        };
+        match verdict(size, target, state.size == target) {
+            Verdict::Unchanged => return Ok(Resize::Unchanged),
+            Verdict::AtLimit => {
+                let range = state.size_range.map(|range| range.to_string());
+                return Ok(Resize::Refused(format!(
+                    "the synthetic desktop is already {target}, the nearest it allows to {size}{}",
+                    range.map_or(String::new(), |range| format!(" (its range is {range})"))
+                )));
+            }
+            Verdict::Change => {}
         }
-        if let Err(error) = size.check() {
+        if let Err(error) = target.check() {
             return Ok(Resize::Refused(format!("{error:#}")));
         }
-        resize_state(&mut state, size);
-        self.damage.resize(size)?;
+        resize_state(&mut state, target);
+        self.damage.resize(target)?;
         Ok(Resize::Applied)
     }
 }
@@ -566,7 +688,19 @@ impl Clipboard for SyntheticPlatform {
     /// Keeps the text for [`SyntheticPlatform::clipboard_set`], and does
     /// not report it to [`Clipboard::changes`]; what another program
     /// copied is gone, so that is reported as `None`.
+    ///
+    /// Text over [`MAX_CLIPBOARD_TEXT`] is dropped with a warning and
+    /// not kept, as the X11 backend drops it.
     fn set(&self, text: Arc<str>) -> Result<()> {
+        self.still_here()?;
+        if text.len() > MAX_CLIPBOARD_TEXT {
+            tracing::warn!(
+                bytes = text.len(),
+                "not putting text on the synthetic clipboard: it is over the \
+                 {MAX_CLIPBOARD_TEXT}-byte limit"
+            );
+            return Ok(());
+        }
         let mut state = self.state()?;
         state.clipboard_set = Some(text);
         state.clipboard_sets = state.clipboard_sets.saturating_add(1);
@@ -1308,5 +1442,193 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(frame.peak() > 8000, "the pattern starts with the sound");
+    }
+
+    // The four contracts below are the ones the closing push audit found
+    // the synthetic backend had drifted away from: each is what a real
+    // backend already does, and none of them could be reached through
+    // this one before.
+
+    /// [`DisplayControl::set_size`], which the inherent `set_size`
+    /// would otherwise shadow.
+    fn resize(platform: &SyntheticPlatform, width: u32, height: u32) -> Resize {
+        DisplayControl::set_size(platform, Size { width, height }).unwrap()
+    }
+
+    #[test]
+    fn every_seam_is_gone_once_the_desktop_has_vanished() {
+        let platform = SyntheticPlatform::new(SIZE).unwrap();
+        let whole = Rectangle::full(SIZE);
+        // Each of these succeeds while the desktop is here.
+        platform.size().unwrap();
+        platform.capture(&[whole]).unwrap();
+        platform.capture_all().unwrap();
+        platform
+            .inject(InputEvent::Key {
+                code: EvdevCode(30),
+                pressed: true,
+            })
+            .unwrap();
+        platform.lock_state().unwrap();
+        resize(&platform, 800, 600);
+        Clipboard::set(&*platform, Arc::from("here")).unwrap();
+
+        platform.vanish("the X server exited").unwrap();
+
+        // And every one of them is Gone afterwards, as X11 reports
+        // through stopped(): a capture or a resize mid-session now
+        // reaches the server's gone handling.
+        let gone = |error: anyhow::Error| {
+            assert!(crate::platform::is_gone(&error), "{error:#}");
+            assert!(
+                error.to_string().contains("the X server exited"),
+                "{error:#}"
+            );
+        };
+        gone(platform.size().unwrap_err());
+        gone(platform.capture(&[whole]).unwrap_err());
+        gone(platform.capture_all().unwrap_err());
+        gone(platform.lock_state().unwrap_err());
+        gone(
+            platform
+                .inject(InputEvent::Key {
+                    code: EvdevCode(30),
+                    pressed: false,
+                })
+                .unwrap_err(),
+        );
+        gone(
+            DisplayControl::set_size(
+                &*platform,
+                Size {
+                    width: 640,
+                    height: 480,
+                },
+            )
+            .unwrap_err(),
+        );
+        gone(Clipboard::set(&*platform, Arc::from("gone")).unwrap_err());
+        gone(platform.subscribe_damage().unwrap_err());
+    }
+
+    #[test]
+    fn a_held_queue_fills_up_and_then_refuses_events() {
+        let platform = SyntheticPlatform::new(SIZE).unwrap();
+        let motion = InputEvent::PointerRelative { dx: 1, dy: 0 };
+        // Nothing waits while the desktop is applying events as they
+        // arrive, however many are injected.
+        for _ in 0..INPUT_QUEUE_LIMIT + 1 {
+            platform.inject(motion).unwrap();
+        }
+        assert_eq!(platform.queued_input(), 0);
+
+        // Held, the queue fills and then refuses, as a real backend's
+        // does when its input thread cannot keep up.
+        platform.hold_input(true).unwrap();
+        for _ in 0..INPUT_QUEUE_LIMIT {
+            platform.inject(motion).unwrap();
+        }
+        assert_eq!(platform.queued_input(), INPUT_QUEUE_LIMIT);
+        let error = platform.inject(motion).unwrap_err().to_string();
+        assert!(error.contains("input queue is full"), "{error}");
+        // A refusal costs the queue nothing.
+        assert_eq!(platform.queued_input(), INPUT_QUEUE_LIMIT);
+
+        // Released, it takes events again.
+        platform.hold_input(false).unwrap();
+        assert_eq!(platform.queued_input(), 0);
+        platform.inject(motion).unwrap();
+    }
+
+    #[test]
+    fn an_owed_release_survives_a_full_queue() {
+        let platform = SyntheticPlatform::new(SIZE).unwrap();
+        let press = InputEvent::Key {
+            code: EvdevCode(30),
+            pressed: true,
+        };
+        let release = InputEvent::Key {
+            code: EvdevCode(30),
+            pressed: false,
+        };
+        platform.hold_input(true).unwrap();
+        for _ in 0..INPUT_QUEUE_LIMIT {
+            platform.inject(press).unwrap();
+        }
+        // A client's own event is refused, but the release andris owes
+        // the desktop draws on the reserve and gets through.
+        assert!(platform.inject(release).is_err());
+        for _ in 0..RELEASE_RESERVE {
+            platform.inject_release(release).unwrap();
+        }
+        // The reserve is bounded in its turn.
+        assert!(platform.inject_release(release).is_err());
+        assert_eq!(platform.queued_input(), INPUT_QUEUE_LIMIT + RELEASE_RESERVE);
+    }
+
+    #[test]
+    fn clipboard_text_over_the_limit_is_dropped() {
+        let platform = SyntheticPlatform::new(SIZE).unwrap();
+        Clipboard::set(&*platform, Arc::from("small")).unwrap();
+        assert_eq!(
+            platform.clipboard_set().unwrap().as_deref(),
+            Some("small"),
+            "text within the limit is kept"
+        );
+        // Over the limit: dropped with a warning, as X11 drops it, and
+        // what was there is left alone.
+        let big: Arc<str> = Arc::from("x".repeat(MAX_CLIPBOARD_TEXT + 1));
+        Clipboard::set(&*platform, big).unwrap();
+        assert_eq!(
+            platform.clipboard_set().unwrap().as_deref(),
+            Some("small"),
+            "the oversize text was not kept"
+        );
+    }
+
+    #[test]
+    fn a_size_range_clamps_and_refuses_at_its_limit() {
+        let platform = SyntheticPlatform::new(SIZE).unwrap();
+        let range = SizeRange {
+            min: Size {
+                width: 320,
+                height: 200,
+            },
+            max: Size {
+                width: 1280,
+                height: 1024,
+            },
+        };
+        platform.set_size_range(Some(range)).unwrap();
+
+        // Outside the range: clamped, and applied at the clamp, so the
+        // client sees the new size as it sees any other.
+        assert_eq!(resize(&platform, 4000, 4000), Resize::Applied);
+        assert_eq!(
+            platform.size().unwrap(),
+            Size {
+                width: 1280,
+                height: 1024,
+            }
+        );
+
+        // Asked for more again, with nothing left to give: refused
+        // rather than Unchanged, because the client asked for a size it
+        // did not get and nothing else would tell it so.
+        let refused = resize(&platform, 4000, 4000);
+        match refused {
+            Resize::Refused(why) => {
+                assert!(why.contains("the nearest it allows"), "{why}");
+                assert!(why.contains("320x200 to 1280x1024"), "{why}");
+            }
+            other => panic!("expected a refusal at the limit, got {other:?}"),
+        }
+
+        // The size it already has is Unchanged, as ever.
+        assert_eq!(resize(&platform, 1280, 1024), Resize::Unchanged);
+
+        // And with no range, any size Size::check allows is applied.
+        platform.set_size_range(None).unwrap();
+        assert_eq!(resize(&platform, 4000, 4000), Resize::Applied);
     }
 }

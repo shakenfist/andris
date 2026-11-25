@@ -521,6 +521,29 @@ and the later ones cover tiles that did not change, which
 `updates/mod.rs` makes harmless. `changed()` is cancel-safe by
 `Notify`'s stored permit.
 
+### `andris/src/platform/input.rs`
+
+`Backlog`, the bound every backend's input queue shares, with
+`INPUT_QUEUE_LIMIT` and `RELEASE_RESERVE`. One FIFO carries the events
+and this counts them, rather than a bounded channel, so a release can
+never overtake the press it undoes. Look at `take()`: the caller passes
+the limit, which is the whole of the difference between
+`InputSink::inject` and `InputSink::inject_release`. The X11, qemu and
+synthetic backends all use it; before it was shared, two of them held a
+copy each and the third had no bound at all.
+
+### `andris/src/platform/resize.rs`
+
+`SizeRange`, `clamp()` and `verdict()`: what a display control decides
+about a size it is asked for, with nothing of any desktop in it. Look
+at `verdict()`'s three answers, and at the one that is easy to get
+wrong: a size that clamps to the size the desktop already has is
+`Refused`, not `Unchanged`, because the client asked for a size it did
+not get and nothing else would tell it so. The X11 backend reaches this
+through RandR and the synthetic one through
+`SyntheticPlatform::set_size_range`, so the rule is tested without an X
+server.
+
 ### `andris/src/platform/audio.rs`
 
 `AudioFrame` (10 ms of 48 kHz stereo S16) and `audio_queue()`, a queue
@@ -534,7 +557,12 @@ than time passes, so capture times are held from going backwards.
 A deterministic desktop for tests, load testing and `--platform
 synthetic`: colour bars, a moving square, paints, a panning "video", an
 input recorder, an in-memory clipboard, and switches to make captures,
-size reads or resizes fail. Look at how `paint_undamaged()`,
+size reads or resizes fail. It holds the seams to the same contracts the
+X11 backend does, so a test through it is worth what it looks like:
+every seam is `Gone` after `vanish()`, `inject()` refuses a full queue
+under `hold_input()` while `inject_release()` keeps its reserve, the
+clipboard drops text over `MAX_CLIPBOARD_TEXT`, and `set_size_range()`
+clamps as RandR does. Look at how `paint_undamaged()`,
 `report_damage()` and `set_size_unreported()` stage the faults the
 display channel must survive, and at "Reporting changes": every change
 is reported to the hub while the state lock is held, so damage and

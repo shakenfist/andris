@@ -57,9 +57,11 @@
 
 pub mod audio;
 pub mod damage;
+pub mod input;
 pub mod pulse;
 #[cfg(feature = "qemu")]
 pub mod qemu;
+pub mod resize;
 pub mod synthetic;
 pub mod x11;
 
@@ -80,6 +82,8 @@ pub use audio::{
     audio_queue,
 };
 pub use damage::{DamageHub, DamageSubscription, Rectangle, Region, TILE};
+pub use input::{Backlog, INPUT_QUEUE_LIMIT, RELEASE_RESERVE};
+pub use resize::{SizeRange, Verdict, clamp, verdict};
 
 /// The most clipboard text andris carries in either direction, in bytes.
 /// Larger text is dropped, with a warning, rather than copied.

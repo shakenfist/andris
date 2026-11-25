@@ -246,8 +246,15 @@ impl SyntheticPlatform {
         }))
     }
 
-    /// This platform as all seven seams, with a [`ToneSource`] of the
-    /// default pattern as its sound, and its gone signal.
+    /// This platform as its seams, and its gone signal, with no sound.
+    ///
+    /// Sound is the configuration's to decide, and `run` sets it on
+    /// whatever platform it opens, so a source installed here would be
+    /// replaced on every path that serves clients. It used to be a
+    /// [`ToneSource`] of the default pattern, which made this look like
+    /// where the synthetic desktop's sound comes from while being dead
+    /// code outside the tests. A test that wants the tone asks for it:
+    /// [`SyntheticPlatform::platform_with_tone`].
     pub fn platform(self: &Arc<Self>) -> Platform {
         Platform {
             geometry: self.clone(),
@@ -256,8 +263,18 @@ impl SyntheticPlatform {
             cursor: self.clone(),
             display_control: self.clone(),
             clipboard: Some(self.clone()),
-            audio: Some(Arc::new(ToneSource::default())),
+            audio: None,
             gone: self.gone_signal.clone(),
+        }
+    }
+
+    /// [`SyntheticPlatform::platform`] with a [`ToneSource`] of the
+    /// default pattern as its sound, for tests that want a desktop that
+    /// makes a noise.
+    pub fn platform_with_tone(self: &Arc<Self>) -> Platform {
+        Platform {
+            audio: Some(Arc::new(ToneSource::default())),
+            ..self.platform()
         }
     }
 
@@ -1435,7 +1452,11 @@ mod tests {
     #[tokio::test]
     async fn the_platform_sounds_the_default_tone() {
         let platform = SyntheticPlatform::new(SIZE).unwrap();
-        let audio = platform.platform().audio.unwrap();
+        assert!(
+            platform.platform().audio.is_none(),
+            "the plain platform has no sound: run decides it"
+        );
+        let audio = platform.platform_with_tone().audio.unwrap();
         let mut receiver = audio.open().unwrap();
         let frame = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
             .await

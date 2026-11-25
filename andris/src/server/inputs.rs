@@ -493,14 +493,15 @@ impl Inputs {
 
 #[cfg(test)]
 mod tests {
-    use shakenfist_spice_protocol::messages::{ReceiveBuffer, make_message};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use shakenfist_spice_protocol::messages::make_message;
+    use tokio::io::AsyncWriteExt;
 
     use super::*;
     use crate::platform::synthetic::SyntheticPlatform;
     use crate::server::channel::ClientCaps;
     use crate::server::display::DisplayOptions;
     use crate::server::session::SessionRegistry;
+    use crate::test_wire::WireReader;
 
     const WAIT: Duration = Duration::from_secs(5);
 
@@ -526,16 +527,8 @@ mod tests {
         let (server_end, mut client) = tokio::io::duplex(64 * 1024);
         let task = tokio::spawn(run(ctx, ChannelConn::new(server_end, session)));
 
-        let mut buf = ReceiveBuffer::new();
-        while buf.take_message(1 << 20).unwrap().is_none() {
-            let mut chunk = [0u8; 1024];
-            let read = tokio::time::timeout(WAIT, client.read(&mut chunk))
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(read > 0, "the channel closed before INIT");
-            buf.extend_from_slice(&chunk[..read]);
-        }
+        // Wait out INIT, which this test does not look at.
+        WireReader::new(WAIT).recv(&mut client).await;
         let key_down = |scancode| {
             let mut body = Vec::new();
             KeyEvent { scancode }.write(&mut body);

@@ -12,7 +12,7 @@ use x11rb::protocol::xfixes;
 use x11rb::protocol::xproto::Window;
 use x11rb::rust_connection::RustConnection;
 
-use super::{Fault, create_wake_window, is_wake, lost, x_error};
+use super::{Fault, WarnOnce, create_wake_window, is_wake, lost, x_error};
 use crate::platform::{CursorShape, GoneSender};
 
 /// Set up the cursor connection: make the XFixes handshake, create the
@@ -66,7 +66,7 @@ pub(super) fn serve_cursor(
     shapes: watch::Sender<Option<Arc<CursorShape>>>,
     gone: GoneSender,
 ) {
-    let mut warned = false;
+    let mut warn_once = WarnOnce::default();
     loop {
         let event = match conn.wait_for_event() {
             Ok(event) => event,
@@ -98,13 +98,10 @@ pub(super) fn serve_cursor(
             Event::Error(e) => Some(x_error(&e)),
             _ => None,
         };
-        if let Some(e) = failure
-            && !warned
-        {
-            warned = true;
-            warn!(
-                error = format!("{e:#}"),
-                "reading the X cursor failed; later failures are not logged"
+        if let Some(e) = failure {
+            warn_once.warn(
+                &e,
+                "reading the X cursor failed; later failures are not logged",
             );
         }
     }

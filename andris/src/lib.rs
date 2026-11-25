@@ -24,6 +24,8 @@ pub mod platform;
 pub mod server;
 #[cfg(test)]
 mod test_logs;
+#[cfg(test)]
+mod test_wire;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -94,6 +96,9 @@ fn open_platform(
             platform::qemu::QemuPlatform::connect(qmp)?.platform()
         }
     };
+    // The one place sound is decided: whatever the platform was built
+    // with is replaced, so --no-audio and a missing libpulse apply to
+    // every backend alike.
     platform.audio = audio;
     if !clipboard {
         // The X11 backend has not started its clipboard at all, so it

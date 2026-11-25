@@ -80,11 +80,10 @@ pub async fn run(ctx: ChannelContext, mut conn: ChannelConn<CursorOpcode>) -> Re
     let mut source_open = true;
     loop {
         tokio::select! {
-            message = conn.recv() => {
-                let Some(message) = message? else {
+            open = conn.recv_and_ignore() => {
+                if !open? {
                     return Ok(());
-                };
-                conn.ignore(&message);
+                }
             }
             changed = shapes.changed(), if source_open => {
                 if changed.is_err() {

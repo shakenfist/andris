@@ -11,14 +11,14 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 use x11rb::connection::Connection;
 use x11rb::protocol::Event;
 use x11rb::protocol::damage::{self as xdamage, ReportLevel};
 use x11rb::protocol::xproto::{self, ChangeWindowAttributesAux, EventMask, Window};
 use x11rb::rust_connection::RustConnection;
 
-use super::{create_wake_window, is_wake, lost, x_error};
+use super::{WarnOnce, create_wake_window, is_wake, lost, x_error};
 use crate::platform::{DamageHub, GoneSender, Rectangle, Size};
 
 /// The DAMAGE version andris asks for. Andris uses only what 1.0 has:
@@ -179,7 +179,7 @@ pub(super) fn serve_damage(mut thread: DamageThread) {
 /// Follow damage and resizes. Returns `None` once woken to stop, and
 /// otherwise why the thread cannot go on, having logged it.
 fn follow(thread: &mut DamageThread) -> Option<String> {
-    let mut warned = false;
+    let mut warn_once = WarnOnce::default();
     loop {
         let mut batch = Batch::default();
         let mut next = thread.conn.wait_for_event().map(Some);
@@ -188,14 +188,11 @@ fn follow(thread: &mut DamageThread) -> Option<String> {
             match next {
                 Ok(Some(event)) => {
                     events += 1;
-                    if let Some(e) = thread.add(event, &mut batch)
-                        && !warned
-                    {
-                        warned = true;
-                        warn!(
-                            error = format!("{e:#}"),
+                    if let Some(e) = thread.add(event, &mut batch) {
+                        warn_once.warn(
+                            &e,
                             "the X server reported an error to the damage thread; later errors \
-                             are not logged"
+                             are not logged",
                         );
                     }
                     if events == BATCH_LIMIT || batch.stop {

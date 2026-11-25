@@ -401,6 +401,24 @@ impl<O: ServerOpcode> ChannelConn<O> {
         }
     }
 
+    /// Read one message and ignore it, for a channel with nothing to
+    /// say back to its client. `false` once the channel has closed, when
+    /// the caller is done.
+    ///
+    /// The cursor and playback channels both sit in a `select!` whose
+    /// other arm does the channel's real work, and both treat everything
+    /// the client sends the same way: this is that arm, so the policy is
+    /// in one place rather than written out beside each of them.
+    pub async fn recv_and_ignore(&mut self) -> Result<bool> {
+        match self.recv().await? {
+            Some(message) => {
+                self.ignore(&message);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// Whether the client has sent anything this connection has read but
     /// [`ChannelConn::recv`] has not yet returned or handled: a message,
     /// or part of one. False once andris has caught up with everything

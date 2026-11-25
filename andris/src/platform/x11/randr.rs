@@ -50,7 +50,7 @@ use x11rb::rust_connection::RustConnection;
 
 use super::Fault;
 use super::capture::root_size;
-use crate::platform::{Resize, Size};
+use crate::platform::{Resize, Size, SizeRange, Verdict, clamp, verdict};
 
 /// The RandR version andris asks for. It needs 1.2, for CRTCs, outputs and
 /// user modes; with 1.3 it also reads the primary output, and reads the
@@ -68,27 +68,6 @@ fn mode_name(size: Size) -> String {
 /// Whether a mode named `name` is one andris created.
 fn is_andris_mode(name: &[u8]) -> bool {
     name.starts_with(MODE_PREFIX.as_bytes())
-}
-
-/// The smallest and largest screen the server allows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SizeRange {
-    min: Size,
-    max: Size,
-}
-
-impl std::fmt::Display for SizeRange {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} to {}", self.min, self.max)
-    }
-}
-
-/// `asked`, each side brought within `range`.
-fn clamp(asked: Size, range: SizeRange) -> Size {
-    Size {
-        width: asked.width.clamp(range.min.width, range.max.width),
-        height: asked.height.clamp(range.min.height, range.max.height),
-    }
 }
 
 /// `pixels` at 96 DPI, in whole millimetres, and never less than one:
@@ -201,28 +180,6 @@ fn choose_output(primary: Option<Output>, outputs: &[OutputState]) -> Option<Out
                 .find(|state| state.connected && state.crtc != 0)
         })
         .copied()
-}
-
-/// What to do before changing anything, given the size `asked`, the size
-/// `target` it clamped to, and whether the screen and CRTC already are
-/// `target`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Verdict {
-    /// The desktop is already the size asked for.
-    Unchanged,
-    /// The desktop is already as near the size asked for as the server
-    /// allows, and that is not the size asked for.
-    AtLimit,
-    /// Change the desktop to `target`.
-    Change,
-}
-
-fn verdict(asked: Size, target: Size, already: bool) -> Verdict {
-    match (already, asked == target) {
-        (true, true) => Verdict::Unchanged,
-        (true, false) => Verdict::AtLimit,
-        (false, _) => Verdict::Change,
-    }
 }
 
 /// A request's failure, with what was being asked for.

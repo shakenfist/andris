@@ -43,7 +43,9 @@
 //! events wait, and the inputs channel that called it closes. Releases
 //! andris owes the desktop go through [`InputSink::inject_release`], which
 //! may use [`RELEASE_RESERVE`] more. Both share one FIFO, so a release
-//! never overtakes the press it undoes; see [`InputQueue`].
+//! never overtakes the press it undoes; see [`InputQueue`]. The limits
+//! and the counting are [`super::input`]'s, shared with the other
+//! backends.
 //!
 //! [`InputQueue`]: input::InputQueue
 //!
@@ -115,8 +117,9 @@ use x11rb::x11_utils::X11Error;
 
 use super::{
     Capture, Clipboard, ClipboardReceiver, CursorReceiver, CursorSource, DamageHub,
-    DamageSubscription, DisplayControl, DisplayGeometry, Gone, GoneSender, GoneSignal, InputEvent,
-    InputSink, LockState, Platform, Rectangle, Resize, ScreenSource, Size,
+    DamageSubscription, DisplayControl, DisplayGeometry, Gone, GoneSender, GoneSignal,
+    INPUT_QUEUE_LIMIT, InputEvent, InputSink, LockState, Platform, RELEASE_RESERVE, Rectangle,
+    Resize, ScreenSource, Size,
 };
 use capture::{CaptureRequest, Capturer, serve_capture};
 use checks::ServerFacts;
@@ -126,16 +129,9 @@ use damage::{DamageThread, serve_damage, start_damage};
 use input::{Injector, InputQueue, InputRequest, serve_input};
 use randr::Randr;
 
-/// How many events [`InputSink::inject`] lets wait for the input thread.
-pub const INPUT_QUEUE_LIMIT: usize = 8192;
-
 /// How long a call to the capture or input thread waits for its answer
 /// before andris warns that the X server may be stalled.
 pub const STALL_WARNING: Duration = Duration::from_secs(5);
-
-/// How many more events [`InputSink::inject_release`] may queue beyond
-/// [`INPUT_QUEUE_LIMIT`]. Ample for every key and button held at once.
-pub const RELEASE_RESERVE: usize = 512;
 
 /// How [`X11Platform::connect_with`] sets the backend up. The default is
 /// what [`X11Platform::connect`] uses.
@@ -637,6 +633,28 @@ fn lost(gone: &GoneSender, thread: &str, consequence: &str, e: &dyn std::fmt::Di
 /// The error for a connection to the X display that has failed.
 fn connection_failed(e: ConnectionError) -> anyhow::Error {
     anyhow::Error::new(e).context("the connection to the X display failed")
+}
+
+/// Logs the first failure and then stays quiet.
+///
+/// The cursor and damage threads both meet failures worth one line and
+/// not worth a line per event: an X error for a request they will make
+/// again when the next event arrives. Sharing the flag keeps the
+/// "logged once" promise in their messages true of both.
+#[derive(Debug, Default)]
+struct WarnOnce {
+    warned: bool,
+}
+
+impl WarnOnce {
+    /// Log `message` with `error`, unless something already has.
+    fn warn(&mut self, error: &anyhow::Error, message: &str) {
+        if self.warned {
+            return;
+        }
+        self.warned = true;
+        warn!(error = format!("{error:#}"), "{message}");
+    }
 }
 
 /// The error for an error the X server returned for one request.

@@ -204,9 +204,11 @@ Loopback is not private to one user: every account on the host can
 reach `127.0.0.1`. Bear that in mind on a host with more than one
 user.
 
-- **Each user needs their own port.** Every instance listens on
-  `127.0.0.1:5900` unless told otherwise, so only one could start.
-  Give each user a distinct `--listen` port in their `andris.env`.
+- **Each user needs their own port.** Every instance listens on the
+  same default address and port unless told otherwise (the `--listen`
+  default in [running.md](running.md#options)), so only one could
+  start. Give each user a distinct `--listen` port in their
+  `andris.env`.
 - **A plain SPICE client cannot tell andris from an impostor.** If
   another local user binds the port first, while andris is not running
   (between sessions, or while systemd waits to restart it), a client

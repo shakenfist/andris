@@ -230,7 +230,9 @@ impl TestServer {
             display,
             timeouts,
         };
-        let mut seams = platform.platform();
+        // With the tone, so the playback channel is offered: these
+        // tests link every channel the server serves.
+        let mut seams = platform.platform_with_tone();
         customise(&mut seams);
         let handle = Server::bind(options, seams).await.unwrap().spawn().unwrap();
         Self {

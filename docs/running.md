@@ -289,8 +289,9 @@ Make the ticket long and random:
 writes 32 characters of base64 to a file only you can read. Length
 matters because andris only slows wrong guesses, and never locks a
 client out: a client whose ticket is wrong waits a second for its
-answer, and each address may have at most four handshakes in
-progress. A short ticket can still be guessed, so andris logs a
+answer, and how many handshakes one address may have in progress is
+capped, and falls further as the pool fills (see
+[Listeners, TLS and the loopback rule](#listeners-tls-and-the-loopback-rule)). A short ticket can still be guessed, so andris logs a
 warning at startup for one under 16 bytes, but accepts it.
 
 The ticket is read once at startup, and is never logged. Each wrong
@@ -311,7 +312,8 @@ The `--tls-key` file is held to the same rules of ownership and mode.
 
 ## Listeners, TLS and the loopback rule
 
-By default andris listens for plain TCP on `127.0.0.1:5900`. Because
+By default andris listens for plain TCP on loopback, at the address
+the [options](#options) table gives. Because
 SPICE sends the ticket over the connection, andris refuses to start
 with a `--listen` address that is not a loopback address (`127.0.0.0/8`
 or `::1`) unless a TLS listener is also configured.
@@ -438,7 +440,8 @@ captures only the parts of the desktop the platform reports as
 damaged, compares them, in tiles of 64x64 pixels, with what it last
 sent, and sends only the tiles whose pixels changed, merged into at
 most 32 rectangles a frame and followed by a `MARK`, which ryll counts
-as a frame. A desktop that does not change captures and sends no
+as a frame. A rectangle whose pixels come to more than 4 MiB is split
+by rows, so that one draw never exceeds what kerbside will carry. A desktop that does not change captures and sends no
 frames. Frames start at most once every `--frame-interval-ms`, and
 only when there is damage to send, so the option bounds the frame rate
 and the work a busy desktop costs; it does nothing for a still one.
@@ -670,6 +673,13 @@ Cisco's own binary downloaded onto the user's machine. The wheels on
 PyPI carry the encoder compiled from source, so the same holds for
 them. This is a statement of the position, not legal advice; if H.264
 patents matter to you, check them for your use.
+
+**Input reaches a locked screen.** Andris never consults the
+screensaver or the lock state: XTEST input from a client that has
+presented the ticket wakes a blanked screen, and reaches the grab a
+screen locker holds. That is what every remote-desktop server does,
+and it is the ticket, not the lock screen, that decides who may type
+on the desktop. Treat the ticket as granting unattended access.
 
 ### Not supported
 
@@ -942,9 +952,9 @@ Andris sends only message types that kerbside's allowlist accepts,
 so a session through kerbside needs no special configuration.
 Every connection through kerbside comes from kerbside's address, so
 one address's allowance of handshakes in progress applies to all of
-kerbside's clients together: 4 while andris's handshake pool is
-quiet, which is enough for one client linking its channels in
-parallel, and fewer as the pool fills. A connection past the
+kerbside's clients together: the whole per-address allowance above
+while andris's handshake pool is quiet, which is enough for one client
+linking its channels in parallel, and fewer as the pool fills. A connection past the
 allowance is closed rather than queued, so several clients linking
 through one kerbside at the same moment may have to reconnect.
 

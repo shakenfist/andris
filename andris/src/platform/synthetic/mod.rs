@@ -87,6 +87,8 @@
 //! then the hub's locks; the hub never calls back into the platform, so
 //! nothing takes them the other way round.
 
+#[cfg(test)]
+mod tests;
 mod tone;
 
 use std::collections::VecDeque;
@@ -96,9 +98,11 @@ use anyhow::{Result, anyhow, bail};
 use tokio::sync::watch;
 
 use super::{
-    Capture, Clipboard, ClipboardReceiver, CursorReceiver, CursorShape, CursorSource, DamageHub,
-    DamageSubscription, DisplayControl, DisplayGeometry, EvdevCode, Frame, GoneSender, GoneSignal,
-    InputEvent, InputSink, LockState, Patch, Platform, Rectangle, Resize, ScreenSource, Size,
+    Backlog, Capture, Clipboard, ClipboardReceiver, CursorReceiver, CursorShape, CursorSource,
+    DamageHub, DamageSubscription, DisplayControl, DisplayGeometry, EvdevCode, Frame, Gone,
+    GoneSender, GoneSignal, INPUT_QUEUE_LIMIT, InputEvent, InputSink, LockState,
+    MAX_CLIPBOARD_TEXT, Patch, Platform, RELEASE_RESERVE, Rectangle, Resize, ScreenSource, Size,
+    SizeRange, Verdict, clamp, verdict,
 };
 pub use tone::{
     DEFAULT_TONE_OFF, DEFAULT_TONE_ON, TONE_AMPLITUDE, TONE_FREQUENCY, TonePattern, ToneSource,
@@ -168,6 +172,16 @@ struct State {
     failing_size_reads: u32,
     /// Whether [`DisplayControl::set_size`] refuses.
     refusing_resizes: bool,
+    /// The range [`DisplayControl::set_size`] clamps to, as a real
+    /// server's `GetScreenSizeRange` does. `None` accepts any size
+    /// [`Size::check`] allows, which is what a desktop with no range
+    /// does.
+    size_range: Option<SizeRange>,
+    /// Whether injected events stay counted in the backlog, as they do
+    /// on a real backend whose input thread is not keeping up. Off by
+    /// default: with nothing holding them, a synthetic desktop applies
+    /// each event as it is injected, so its queue is always empty.
+    holding_input: bool,
     /// The text the server last set on the clipboard, and how many times
     /// it has set any.
     clipboard_set: Option<Arc<str>>,
@@ -181,6 +195,8 @@ struct State {
 pub struct SyntheticPlatform {
     state: Mutex<State>,
     events: Mutex<VecDeque<InputEvent>>,
+    /// The bound on the input queue, as the real backends have.
+    backlog: Backlog,
     cursor: watch::Sender<Option<Arc<CursorShape>>>,
     /// The text other programs put on the clipboard.
     clipboard: watch::Sender<Option<Arc<str>>>,
@@ -217,10 +233,13 @@ impl SyntheticPlatform {
                 failing_captures: 0,
                 failing_size_reads: 0,
                 refusing_resizes: false,
+                size_range: None,
+                holding_input: false,
                 clipboard_set: None,
                 clipboard_sets: 0,
             }),
             events: Mutex::new(VecDeque::new()),
+            backlog: Backlog::new("synthetic"),
             cursor: watch::Sender::new(Some(Arc::new(default_cursor()))),
             clipboard: watch::Sender::new(None),
             damage: DamageHub::new(size),
@@ -229,8 +248,13 @@ impl SyntheticPlatform {
         }))
     }
 
-    /// This platform as all seven seams, with a [`ToneSource`] of the
-    /// default pattern as its sound, and its gone signal.
+    /// This platform as its seams, and its gone signal, with no sound.
+    ///
+    /// Sound is the configuration's to decide, and `run` sets it on
+    /// whatever platform it opens, so a source installed here would be
+    /// replaced on every path that serves a client. A test that wants
+    /// the tone asks for
+    /// [`SyntheticPlatform::platform_with_tone`].
     pub fn platform(self: &Arc<Self>) -> Platform {
         Platform {
             geometry: self.clone(),
@@ -239,8 +263,18 @@ impl SyntheticPlatform {
             cursor: self.clone(),
             display_control: self.clone(),
             clipboard: Some(self.clone()),
-            audio: Some(Arc::new(ToneSource::default())),
+            audio: None,
             gone: self.gone_signal.clone(),
+        }
+    }
+
+    /// [`SyntheticPlatform::platform`] with a [`ToneSource`] of the
+    /// default pattern as its sound, for tests that want a desktop that
+    /// makes a noise.
+    pub fn platform_with_tone(self: &Arc<Self>) -> Platform {
+        Platform {
+            audio: Some(Arc::new(ToneSource::default())),
+            ..self.platform()
         }
     }
 
@@ -368,6 +402,47 @@ impl SyntheticPlatform {
         Ok(())
     }
 
+    /// Clamp [`DisplayControl::set_size`] to `range`, as a real server's
+    /// `GetScreenSizeRange` does, or accept any size with `None`.
+    ///
+    /// With a range set, a size outside it is clamped and applied, and a
+    /// size that clamps to the one the desktop already has is refused:
+    /// the rule in [`resize`](super::resize), which the X11 backend
+    /// follows through RandR.
+    pub fn set_size_range(&self, range: Option<SizeRange>) -> Result<()> {
+        self.state()?.size_range = range;
+        Ok(())
+    }
+
+    /// Stop uncounting injected events, so that the input queue fills and
+    /// [`InputSink::inject`] starts refusing, as a real backend does when
+    /// its input thread cannot keep up; or start again, which uncounts
+    /// everything held.
+    ///
+    /// A synthetic desktop applies each event as it is injected, so
+    /// without this its queue is never anything but empty, and no test
+    /// through this backend could reach a full one.
+    pub fn hold_input(&self, hold: bool) -> Result<()> {
+        // The drain runs under the lock [`SyntheticPlatform::queue`]
+        // holds, so the two cannot interleave. Draining with the lock
+        // dropped could consume a count that an injection in flight had
+        // taken and was about to give back, and that injection's
+        // `done()` would then uncount a queue already at zero.
+        let mut state = self.state()?;
+        state.holding_input = hold;
+        if !hold {
+            while self.backlog.queued() > 0 {
+                self.backlog.done();
+            }
+        }
+        Ok(())
+    }
+
+    /// How many injected events are counted against the queue's bound.
+    pub fn queued_input(&self) -> usize {
+        self.backlog.queued()
+    }
+
     /// Put `text` on the clipboard, or empty it with `None`, as another
     /// program on the desktop would, and report it to
     /// [`Clipboard::changes`]. The same text again is reported again.
@@ -435,6 +510,19 @@ impl SyntheticPlatform {
             .map_err(|_| anyhow!("the synthetic platform's state lock is poisoned"))
     }
 
+    /// [`Gone`] once [`SyntheticPlatform::vanish`] has been called, as
+    /// every seam of a real backend reports once its desktop has gone.
+    ///
+    /// Without this the synthetic backend kept serving a desktop it had
+    /// been told was gone, so no test through it could exercise the
+    /// server's gone handling anywhere but a damage subscription.
+    fn still_here(&self) -> Result<()> {
+        match self.gone_signal.why() {
+            Some(why) => Err(anyhow::Error::new(Gone(why))),
+            None => Ok(()),
+        }
+    }
+
     /// A copy of what decides the pixels.
     fn scene(&self) -> Result<Scene> {
         let state = self.state()?;
@@ -463,10 +551,53 @@ impl SyntheticPlatform {
             .lock()
             .map_err(|_| anyhow!("the synthetic platform's event lock is poisoned"))
     }
+
+    /// Count `event` against the queue's bound and apply it, giving the
+    /// count straight back unless [`SyntheticPlatform::hold_input`] is
+    /// holding it. The count is also given back if applying the event
+    /// fails, so a refusal never costs the queue a slot.
+    fn queue(&self, event: InputEvent, limit: usize) -> Result<()> {
+        self.still_here()?;
+        // The decision, the count and the event under one lock, which
+        // [`SyntheticPlatform::hold_input`] takes before it drains: see
+        // the comment there for what interleaving would cost.
+        let mut state = self.state()?;
+        self.backlog.take(limit)?;
+        let holding = state.holding_input;
+        let applied = self.apply(&mut state, event);
+        if !holding || applied.is_err() {
+            self.backlog.done();
+        }
+        applied
+    }
+
+    /// Toggle the locks `event` toggles, and record it, dropping the
+    /// oldest once [`RECORDED_EVENTS`] are kept.
+    fn apply(&self, state: &mut State, event: InputEvent) -> Result<()> {
+        if let InputEvent::Key {
+            code,
+            pressed: true,
+        } = event
+        {
+            match code {
+                EvdevCode::CAPSLOCK => state.locks.caps = !state.locks.caps,
+                EvdevCode::NUMLOCK => state.locks.num = !state.locks.num,
+                EvdevCode::SCROLLLOCK => state.locks.scroll = !state.locks.scroll,
+                _ => {}
+            }
+        }
+        let mut events = self.events()?;
+        if events.len() >= RECORDED_EVENTS {
+            events.pop_front();
+        }
+        events.push_back(event);
+        Ok(())
+    }
 }
 
 impl DisplayGeometry for SyntheticPlatform {
     fn size(&self) -> Result<Size> {
+        self.still_here()?;
         let mut state = self.state()?;
         if state.failing_size_reads > 0 {
             state.failing_size_reads -= 1;
@@ -482,6 +613,7 @@ impl ScreenSource for SyntheticPlatform {
     }
 
     fn capture(&self, rects: &[Rectangle]) -> Result<Capture> {
+        self.still_here()?;
         let scene = self.scene_for_capture()?;
         let patches = rects
             .iter()
@@ -492,6 +624,7 @@ impl ScreenSource for SyntheticPlatform {
     }
 
     fn capture_all(&self) -> Result<Capture> {
+        self.still_here()?;
         let scene = self.scene_for_capture()?;
         Capture::whole(render(&scene, Rectangle::full(scene.size))?)
     }
@@ -501,29 +634,23 @@ impl InputSink for SyntheticPlatform {
     /// Records the event, dropping the oldest once [`RECORDED_EVENTS`]
     /// are kept. A press of a lock key toggles that lock, as an X server
     /// does.
+    ///
+    /// Fails once the queue's bound is reached, as a real backend does,
+    /// which only happens under
+    /// [`SyntheticPlatform::hold_input`]: otherwise the event is applied
+    /// as it is injected, so nothing is ever waiting.
     fn inject(&self, event: InputEvent) -> Result<()> {
-        if let InputEvent::Key {
-            code,
-            pressed: true,
-        } = event
-        {
-            let mut state = self.state()?;
-            match code {
-                EvdevCode::CAPSLOCK => state.locks.caps = !state.locks.caps,
-                EvdevCode::NUMLOCK => state.locks.num = !state.locks.num,
-                EvdevCode::SCROLLLOCK => state.locks.scroll = !state.locks.scroll,
-                _ => {}
-            }
-        }
-        let mut events = self.events()?;
-        if events.len() >= RECORDED_EVENTS {
-            events.pop_front();
-        }
-        events.push_back(event);
-        Ok(())
+        self.queue(event, INPUT_QUEUE_LIMIT)
+    }
+
+    /// As [`InputSink::inject`], but drawing on [`RELEASE_RESERVE`], so
+    /// that a release andris owes the desktop gets through a full queue.
+    fn inject_release(&self, event: InputEvent) -> Result<()> {
+        self.queue(event, INPUT_QUEUE_LIMIT + RELEASE_RESERVE)
     }
 
     fn lock_state(&self) -> Result<LockState> {
+        self.still_here()?;
         Ok(self.state()?.locks)
     }
 }
@@ -538,7 +665,14 @@ impl DisplayControl for SyntheticPlatform {
     /// Resizes the pattern, reporting the resize, unless
     /// [`SyntheticPlatform::refuse_resizes`] says to refuse. A size
     /// [`Size::check`] refuses is refused too.
+    ///
+    /// With a range set by [`SyntheticPlatform::set_size_range`], the
+    /// size is clamped to it first and the verdict follows the rule in
+    /// [`resize`](super::resize), so that clamping and at-the-limit
+    /// behaviour can be tested through this backend as well as through
+    /// RandR.
     fn set_size(&self, size: Size) -> Result<Resize> {
+        self.still_here()?;
         // Reported under the lock, as every change is: see the module.
         let mut state = self.state()?;
         if state.refusing_resizes {
@@ -546,14 +680,26 @@ impl DisplayControl for SyntheticPlatform {
                 "the synthetic desktop is set to refuse resizes".to_string(),
             ));
         }
-        if state.size == size {
-            return Ok(Resize::Unchanged);
+        let target = match state.size_range {
+            Some(range) => clamp(size, range),
+            None => size,
+        };
+        match verdict(size, target, state.size == target) {
+            Verdict::Unchanged => return Ok(Resize::Unchanged),
+            Verdict::AtLimit => {
+                let range = state.size_range.map(|range| range.to_string());
+                return Ok(Resize::Refused(format!(
+                    "the synthetic desktop is already {target}, the nearest it allows to {size}{}",
+                    range.map_or(String::new(), |range| format!(" (its range is {range})"))
+                )));
+            }
+            Verdict::Change => {}
         }
-        if let Err(error) = size.check() {
+        if let Err(error) = target.check() {
             return Ok(Resize::Refused(format!("{error:#}")));
         }
-        resize_state(&mut state, size);
-        self.damage.resize(size)?;
+        resize_state(&mut state, target);
+        self.damage.resize(target)?;
         Ok(Resize::Applied)
     }
 }
@@ -566,7 +712,19 @@ impl Clipboard for SyntheticPlatform {
     /// Keeps the text for [`SyntheticPlatform::clipboard_set`], and does
     /// not report it to [`Clipboard::changes`]; what another program
     /// copied is gone, so that is reported as `None`.
+    ///
+    /// Text over [`MAX_CLIPBOARD_TEXT`] is dropped with a warning and
+    /// not kept, as the X11 backend drops it.
     fn set(&self, text: Arc<str>) -> Result<()> {
+        self.still_here()?;
+        if text.len() > MAX_CLIPBOARD_TEXT {
+            tracing::warn!(
+                bytes = text.len(),
+                "not putting text on the synthetic clipboard: it is over the \
+                 {MAX_CLIPBOARD_TEXT}-byte limit"
+            );
+            return Ok(());
+        }
         let mut state = self.state()?;
         state.clipboard_set = Some(text);
         state.clipboard_sets = state.clipboard_sets.saturating_add(1);
@@ -709,604 +867,5 @@ pub fn default_cursor() -> CursorShape {
         hot_x: 0,
         hot_y: 0,
         argb,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use super::*;
-    use crate::platform::Region;
-
-    const SIZE: Size = Size {
-        width: 1024,
-        height: 768,
-    };
-
-    fn pixel(frame: &Frame, x: u32, y: u32) -> [u8; 4] {
-        let row = frame.row(y).unwrap();
-        let at = x as usize * 4;
-        row[at..at + 4].try_into().unwrap()
-    }
-
-    #[test]
-    fn capture_has_the_size_and_a_padded_stride() {
-        let platform = SyntheticPlatform::new(SIZE).unwrap();
-        let frame = platform.capture_all().unwrap().into_whole().unwrap();
-        assert_eq!(frame.size(), SIZE);
-        assert_eq!(platform.size().unwrap(), SIZE);
-        assert_eq!(frame.stride(), 1024 * 4 + STRIDE_PADDING);
-        let row = frame.stride();
-        assert!(
-            frame.data()[row - STRIDE_PADDING..row]
-                .iter()
-                .all(|&b| b == PADDING_BYTE)
-        );
-    }
-
-    #[test]
-    fn capture_is_deterministic() {
-        let a = SyntheticPlatform::new(SIZE).unwrap();
-        let b = SyntheticPlatform::new(SIZE).unwrap();
-        assert_eq!(a.capture_all().unwrap(), b.capture_all().unwrap());
-        assert_eq!(a.desktop().unwrap(), b.desktop().unwrap());
-    }
-
-    #[test]
-    fn pattern_has_bars_and_the_square() {
-        let platform = SyntheticPlatform::new(SIZE).unwrap();
-        let frame = platform.desktop().unwrap();
-        // BGRX: white, then yellow in the second bar, black in the last.
-        assert_eq!(pixel(&frame, 0, 0), [255, 255, 255, 0]);
-        assert_eq!(pixel(&frame, 128, 0), [0, 255, 255, 0]);
-        assert_eq!(pixel(&frame, 1023, 767), [0, 0, 0, 0]);
-        // The square, orange, at (0, SQUARE_TOP).
-        assert_eq!(pixel(&frame, 0, SQUARE_TOP), [0, 128, 255, 0]);
-        assert_eq!(pixel(&frame, 63, SQUARE_TOP + 63), [0, 128, 255, 0]);
-        assert_eq!(pixel(&frame, 64, SQUARE_TOP), [255, 255, 255, 0]);
-        assert_eq!(pixel(&frame, 0, SQUARE_TOP - 1), [255, 255, 255, 0]);
-    }
-
-    #[test]
-    fn advance_changes_only_bands_one_and_two() {
-        let platform = SyntheticPlatform::new(SIZE).unwrap();
-        let before = platform.desktop().unwrap();
-        platform.advance().unwrap();
-        assert_eq!(platform.square_x().unwrap(), SQUARE_STEP);
-        let after = platform.desktop().unwrap();
-        let changed: Vec<u32> = (0..SIZE.height.div_ceil(64))
-            .filter(|band| {
-                let top = band * 64;
-                let rows = 64.min(SIZE.height - top);
-                before.band(top, rows) != after.band(top, rows)
-            })
-            .collect();
-        assert_eq!(changed, vec![1, 2]);
-    }
-
-    #[test]
-    fn advance_wraps_at_the_right_edge() {
-        let platform = SyntheticPlatform::new(Size {
-            width: 80,
-            height: 200,
-        })
-        .unwrap();
-        platform.advance().unwrap();
-        platform.advance().unwrap();
-        assert_eq!(platform.square_x().unwrap(), 16);
-        platform.advance().unwrap();
-        assert_eq!(platform.square_x().unwrap(), 0);
-    }
-
-    #[test]
-    fn small_desktop_has_no_square() {
-        let platform = SyntheticPlatform::new(Size {
-            width: 32,
-            height: 32,
-        })
-        .unwrap();
-        let frame = platform.desktop().unwrap();
-        assert_eq!(pixel(&frame, 0, 0), [255, 255, 255, 0]);
-        platform.advance().unwrap();
-        assert_eq!(platform.square_x().unwrap(), 0);
-    }
-
-    #[test]
-    fn set_size_changes_geometry_and_capture() {
-        let platform = SyntheticPlatform::new(SIZE).unwrap();
-        for _ in 0..10 {
-            platform.advance().unwrap();
-        }
-        let smaller = Size {
-            width: 100,
-            height: 200,
-        };
-        platform.set_size(smaller).unwrap();
-        assert_eq!(platform.size().unwrap(), smaller);
-        assert_eq!(platform.desktop().unwrap().size(), smaller);
-        assert_eq!(platform.square_x().unwrap(), 0, "the square moved back");
-        assert!(
-            platform
-                .set_size(Size {
-                    width: 0,
-                    height: 1
-                })
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn fail_captures_fails_that_many_of_either_kind() {
-        let platform = SyntheticPlatform::new(SIZE).unwrap();
-        platform.fail_captures(3).unwrap();
-        let rects = [Rectangle::new(0, 0, 8, 8)];
-        let errors = [
-            platform.capture_all().unwrap_err(),
-            platform.capture(&rects).unwrap_err(),
-            platform.capture_all().unwrap_err(),
-        ];
-        for error in errors {
-            assert!(!crate::platform::is_gone(&error));
-        }
-        assert!(platform.desktop().is_ok(), "desktop() is not a capture");
-        assert_eq!(platform.capture(&rects).unwrap().patches().len(), 1);
-        assert_eq!(platform.capture_all().unwrap().size(), SIZE);
-    }
-
-    /// The pending damage, as the tiles' merged rectangles.
-    fn damaged(subscription: &DamageSubscription) -> Vec<Rectangle> {
-        subscription.take().unwrap().rectangles(usize::MAX)
-    }
-
-    #[test]
-    fn advance_damages_the_old_and_new_squares() {
-        let platform = SyntheticPlatform::new(SIZE).unwrap();
-        let subscription = platform.subscribe_damage().unwrap();
-        assert_eq!(damaged(&subscription), vec![Rectangle::full(SIZE)]);
-        assert!(damaged(&subscription).is_empty(), "nothing yet");
-
-        // 0..64 and 8..72 across, rows 96..160: tile columns 0 and 1,
-        // tile rows 1 and 2.
-        platform.advance().unwrap();
-        let mut expected = Region::empty(SIZE);
-        expected.add(Rectangle::new(0, SQUARE_TOP, SQUARE_SIZE, SQUARE_SIZE));
-        expected.add(Rectangle::new(
-            SQUARE_STEP,
-            SQUARE_TOP,
-            SQUARE_SIZE,
-            SQUARE_SIZE,
-        ));
-        let region = subscription.take().unwrap();
-        assert_eq!(region, expected);
-        assert_eq!(region.rectangles(32), vec![Rectangle::new(0, 64, 128, 128)]);
-
-        // The wrap damages both ends.
-        let narrow = SyntheticPlatform::new(Size {
-            width: 200,
-            height: 200,
-        })
-        .unwrap();
-        let subscription = narrow.subscribe_damage().unwrap();
-        for _ in 0..17 {
-            narrow.advance().unwrap();
-        }
-        subscription.take().unwrap();
-        assert_eq!(narrow.square_x().unwrap(), 136);
-        narrow.advance().unwrap();
-        assert_eq!(narrow.square_x().unwrap(), 0);
-        assert_eq!(
-            damaged(&subscription),
-            vec![
-                Rectangle::new(0, 64, 64, 128),
-                Rectangle::new(128, 64, 72, 128)
-            ]
-        );
-    }
-
-    #[test]
-    fn advance_damages_nothing_without_a_square() {
-        let platform = SyntheticPlatform::new(Size {
-            width: 32,
-            height: 32,
-        })
-        .unwrap();
-        let subscription = platform.subscribe_damage().unwrap();
-        subscription.take().unwrap();
-        platform.advance().unwrap();
-        assert!(damaged(&subscription).is_empty());
-    }
-
-    #[test]
-    fn set_size_damages_the_whole_new_desktop() {
-        let platform = SyntheticPlatform::new(SIZE).unwrap();
-        let subscription = platform.subscribe_damage().unwrap();
-        subscription.take().unwrap();
-        let smaller = Size {
-            width: 100,
-            height: 200,
-        };
-        platform.set_size(smaller).unwrap();
-        assert_eq!(subscription.take().unwrap(), Region::full(smaller));
-    }
-
-    #[test]
-    fn set_size_unreported_changes_capture_and_reports_nothing() {
-        let platform = SyntheticPlatform::new(SIZE).unwrap();
-        let subscription = platform.subscribe_damage().unwrap();
-        subscription.take().unwrap();
-        let smaller = Size {
-            width: 100,
-            height: 200,
-        };
-        platform.set_size_unreported(smaller).unwrap();
-        assert_eq!(platform.capture_all().unwrap().size(), smaller);
-        assert!(damaged(&subscription).is_empty());
-    }
-
-    #[test]
-    fn paint_undamaged_changes_pixels_and_reports_nothing() {
-        let platform = SyntheticPlatform::new(SIZE).unwrap();
-        let subscription = platform.subscribe_damage().unwrap();
-        subscription.take().unwrap();
-        let before = platform.desktop().unwrap();
-        platform
-            .paint_undamaged(Rectangle::new(500, 500, 10, 10), (1, 2, 3))
-            .unwrap();
-        // Over the square too, and a later paint on top of an earlier.
-        platform
-            .paint_undamaged(Rectangle::new(0, SQUARE_TOP, 4, 4), (9, 9, 9))
-            .unwrap();
-        platform
-            .paint_undamaged(Rectangle::new(2, SQUARE_TOP, 4, 4), (7, 7, 7))
-            .unwrap();
-        let after = platform.desktop().unwrap();
-        assert_ne!(before, after);
-        assert_eq!(pixel(&after, 500, 500), [3, 2, 1, 0]);
-        assert_eq!(pixel(&after, 509, 509), [3, 2, 1, 0]);
-        assert_eq!(pixel(&after, 510, 509), pixel(&before, 510, 509));
-        assert_eq!(pixel(&after, 1, SQUARE_TOP), [9, 9, 9, 0]);
-        assert_eq!(pixel(&after, 2, SQUARE_TOP), [7, 7, 7, 0]);
-        assert_eq!(pixel(&after, 6, SQUARE_TOP + 4), [0, 128, 255, 0]);
-        assert!(damaged(&subscription).is_empty());
-    }
-
-    #[test]
-    fn paints_report_their_damage() {
-        let platform = SyntheticPlatform::new(SIZE).unwrap();
-        let subscription = platform.subscribe_damage().unwrap();
-        subscription.take().unwrap();
-        platform
-            .paint(Rectangle::new(10, 10, 4, 4), (1, 2, 3))
-            .unwrap();
-        assert_eq!(damaged(&subscription), vec![Rectangle::new(0, 0, 64, 64)]);
-        assert_eq!(pixel(&platform.desktop().unwrap(), 12, 12), [3, 2, 1, 0]);
-
-        let photo = Rectangle::new(128, 0, 128, 64);
-        platform.paint_photo(photo).unwrap();
-        assert_eq!(damaged(&subscription), vec![photo]);
-        let desktop = platform.desktop().unwrap();
-        // Not flat: neighbours differ.
-        assert_ne!(pixel(&desktop, 130, 5), pixel(&desktop, 131, 5));
-        // Painting it again changes no pixel.
-        platform.paint_photo(photo).unwrap();
-        assert_eq!(platform.desktop().unwrap(), desktop);
-    }
-
-    #[test]
-    fn animate_pans_a_photograph_and_moves_without_adding_overlays() {
-        let platform = SyntheticPlatform::new(SIZE).unwrap();
-        let subscription = platform.subscribe_damage().unwrap();
-        subscription.take().unwrap();
-        let pattern = platform.desktop().unwrap();
-        let first = Rectangle::new(128, 64, 128, 128);
-        platform.animate(first).unwrap();
-        assert_eq!(damaged(&subscription), vec![first]);
-        let one = platform.desktop().unwrap();
-        assert_ne!(pixel(&one, 130, 70), pixel(&one, 131, 70), "flat");
-
-        // The next frame changes nearly every pixel of it, and nothing
-        // else.
-        platform.animate(first).unwrap();
-        assert_eq!(damaged(&subscription), vec![first]);
-        let two = platform.desktop().unwrap();
-        let mut differ = 0;
-        for y in 64..192 {
-            for x in 128..256 {
-                differ += usize::from(pixel(&one, x, y) != pixel(&two, x, y));
-            }
-        }
-        assert!(differ > 128 * 128 * 9 / 10, "only {differ} pixels changed");
-        assert_eq!(pixel(&two, 10, 10), pixel(&pattern, 10, 10));
-
-        // Moving it reports both rectangles, and shows the pattern where
-        // it was.
-        let second = Rectangle::new(512, 384, 128, 128);
-        platform.animate(second).unwrap();
-        assert_eq!(damaged(&subscription), vec![first, second]);
-        let moved = platform.desktop().unwrap();
-        assert_eq!(pixel(&moved, 130, 70), pixel(&pattern, 130, 70));
-        assert_ne!(pixel(&moved, 520, 390), pixel(&pattern, 520, 390));
-        assert!(platform.state().unwrap().overlays.is_empty());
-    }
-
-    #[test]
-    fn report_damage_changes_nothing() {
-        let platform = SyntheticPlatform::new(SIZE).unwrap();
-        let subscription = platform.subscribe_damage().unwrap();
-        subscription.take().unwrap();
-        let before = platform.desktop().unwrap();
-        platform
-            .report_damage(Rectangle::new(300, 300, 1, 1))
-            .unwrap();
-        assert_eq!(platform.desktop().unwrap(), before);
-        assert_eq!(
-            damaged(&subscription),
-            vec![Rectangle::new(256, 256, 64, 64)]
-        );
-    }
-
-    #[test]
-    fn captured_patches_equal_the_desktop() {
-        let platform = SyntheticPlatform::new(SIZE).unwrap();
-        platform.advance().unwrap();
-        platform
-            .paint_undamaged(Rectangle::new(60, 100, 30, 30), (10, 20, 30))
-            .unwrap();
-        let desktop = platform.desktop().unwrap();
-        let rects = [
-            Rectangle::new(0, 64, 128, 128),
-            Rectangle::new(1000, 700, 100, 100),
-            Rectangle::new(5, 7, 1, 1),
-            Rectangle::new(2000, 0, 10, 10),
-        ];
-        let capture = platform.capture(&rects).unwrap();
-        assert_eq!(capture.size(), SIZE);
-        let got: Vec<Rectangle> = capture.patches().iter().map(Patch::rect).collect();
-        assert_eq!(
-            got,
-            vec![
-                Rectangle::new(0, 64, 128, 128),
-                Rectangle::new(1000, 700, 24, 68),
-                Rectangle::new(5, 7, 1, 1),
-            ],
-            "clipped, and the rectangle outside dropped"
-        );
-        for patch in capture.patches() {
-            let pixels = patch.pixels();
-            assert_eq!(
-                pixels.stride(),
-                pixels.width() as usize * 4 + STRIDE_PADDING
-            );
-            let expected = desktop.crop(patch.rect()).unwrap();
-            for y in 0..pixels.height() {
-                assert_eq!(pixels.row(y), expected.row(y), "{} row {y}", patch.rect());
-            }
-        }
-        assert_eq!(
-            platform.capture_all().unwrap().into_whole().unwrap(),
-            desktop
-        );
-    }
-
-    #[test]
-    fn fail_size_reads_fails_that_many() {
-        let platform = SyntheticPlatform::new(SIZE).unwrap();
-        platform.fail_size_reads(2).unwrap();
-        for _ in 0..2 {
-            let error = platform.size().unwrap_err();
-            assert!(!crate::platform::is_gone(&error));
-        }
-        assert_eq!(platform.size().unwrap(), SIZE);
-    }
-
-    #[test]
-    fn records_input_and_toggles_locks() {
-        let platform = SyntheticPlatform::new(SIZE).unwrap();
-        let seams = platform.platform();
-        let events = [
-            InputEvent::Key {
-                code: EvdevCode(30),
-                pressed: true,
-            },
-            InputEvent::PointerAbsolute { x: 5, y: 6 },
-            InputEvent::Key {
-                code: EvdevCode::CAPSLOCK,
-                pressed: true,
-            },
-            InputEvent::Key {
-                code: EvdevCode::CAPSLOCK,
-                pressed: false,
-            },
-        ];
-        for event in events {
-            seams.input.inject(event).unwrap();
-        }
-        assert_eq!(platform.input_events().unwrap(), events);
-        assert_eq!(
-            seams.input.lock_state().unwrap(),
-            LockState {
-                caps: true,
-                num: false,
-                scroll: false
-            }
-        );
-        assert_eq!(platform.take_input_events().unwrap(), events);
-        assert!(platform.input_events().unwrap().is_empty());
-    }
-
-    #[test]
-    fn only_the_most_recent_events_are_kept() {
-        let platform = SyntheticPlatform::new(SIZE).unwrap();
-        let extra = 10;
-        for x in 0..(RECORDED_EVENTS + extra) as u32 {
-            platform
-                .inject(InputEvent::PointerAbsolute { x, y: 0 })
-                .unwrap();
-        }
-        let events = platform.take_input_events().unwrap();
-        assert_eq!(events.len(), RECORDED_EVENTS);
-        assert_eq!(
-            events.first(),
-            Some(&InputEvent::PointerAbsolute {
-                x: extra as u32,
-                y: 0
-            })
-        );
-        assert_eq!(
-            events.last(),
-            Some(&InputEvent::PointerAbsolute {
-                x: (RECORDED_EVENTS + extra - 1) as u32,
-                y: 0
-            })
-        );
-    }
-
-    #[test]
-    fn set_lock_state_converges() {
-        let platform = SyntheticPlatform::new(SIZE).unwrap();
-        platform
-            .force_lock_state(LockState {
-                caps: true,
-                num: false,
-                scroll: true,
-            })
-            .unwrap();
-        let wanted = LockState {
-            caps: false,
-            num: true,
-            scroll: true,
-        };
-        platform.set_lock_state(wanted).unwrap();
-        assert_eq!(platform.lock_state().unwrap(), wanted);
-        assert_eq!(platform.take_input_events().unwrap().len(), 4);
-        platform.set_lock_state(wanted).unwrap();
-        assert!(platform.input_events().unwrap().is_empty());
-    }
-
-    #[test]
-    fn cursor_starts_with_the_arrow_and_follows_changes() {
-        let platform = SyntheticPlatform::new(SIZE).unwrap();
-        let mut cursor = platform.platform().cursor.subscribe();
-        let first = cursor.borrow_and_update().clone().unwrap();
-        assert_eq!(*first, default_cursor());
-        assert_eq!((first.width(), first.height()), (32, 32));
-        assert_eq!((first.hot_x(), first.hot_y()), (0, 0));
-        assert!(!cursor.has_changed().unwrap());
-
-        let dot = CursorShape::new(1, 1, 0, 0, vec![0xFF00_0000]).unwrap();
-        platform.set_cursor(Some(dot.clone()));
-        assert!(cursor.has_changed().unwrap());
-        assert_eq!(*cursor.borrow_and_update().clone().unwrap(), dot);
-        platform.set_cursor(None);
-        assert!(cursor.borrow_and_update().is_none());
-    }
-
-    #[test]
-    fn display_control_resizes_unless_refusing() {
-        let platform = SyntheticPlatform::new(SIZE).unwrap();
-        let control = platform.platform().display_control;
-        let subscription = platform.subscribe_damage().unwrap();
-        subscription.take().unwrap();
-        let smaller = Size {
-            width: 640,
-            height: 480,
-        };
-        assert_eq!(control.set_size(smaller).unwrap(), Resize::Applied);
-        assert_eq!(platform.size().unwrap(), smaller);
-        assert_eq!(subscription.take().unwrap(), Region::full(smaller));
-        assert_eq!(control.set_size(smaller).unwrap(), Resize::Unchanged);
-
-        let zero = Size {
-            width: 0,
-            height: 480,
-        };
-        assert!(matches!(
-            control.set_size(zero).unwrap(),
-            Resize::Refused(_)
-        ));
-
-        platform.refuse_resizes(true).unwrap();
-        assert!(matches!(
-            control.set_size(SIZE).unwrap(),
-            Resize::Refused(_)
-        ));
-        assert_eq!(
-            platform.size().unwrap(),
-            smaller,
-            "a refusal changes nothing"
-        );
-        assert!(damaged(&subscription).is_empty());
-        platform.refuse_resizes(false).unwrap();
-        assert_eq!(control.set_size(SIZE).unwrap(), Resize::Applied);
-    }
-
-    #[test]
-    fn the_clipboard_reports_copies_and_keeps_what_is_set() {
-        let platform = SyntheticPlatform::new(SIZE).unwrap();
-        let clipboard = platform
-            .platform()
-            .clipboard
-            .expect("the synthetic platform shares a clipboard");
-        let mut changes = clipboard.changes();
-        assert!(changes.borrow_and_update().is_none());
-
-        platform.copy_text(Some("copied"));
-        assert!(changes.has_changed().unwrap());
-        assert_eq!(changes.borrow_and_update().as_deref(), Some("copied"));
-        platform.copy_text(Some("copied"));
-        assert!(
-            changes.has_changed().unwrap(),
-            "the same text again is a change"
-        );
-        changes.mark_unchanged();
-
-        clipboard.set(Arc::from("pasted")).unwrap();
-        assert!(changes.has_changed().unwrap());
-        assert!(
-            changes.borrow_and_update().is_none(),
-            "the copied text is gone, and andris's own is not reported"
-        );
-        assert_eq!(platform.clipboard_set().unwrap().as_deref(), Some("pasted"));
-        assert_eq!(platform.clipboard_sets().unwrap(), 1);
-        clipboard.set(Arc::from("pasted again")).unwrap();
-        assert!(!changes.has_changed().unwrap(), "nothing more has gone");
-
-        platform.copy_text(None);
-        assert!(changes.borrow_and_update().is_none());
-    }
-
-    #[test]
-    fn default_cursor_passes_the_shape_checks() {
-        let cursor = default_cursor();
-        let checked = CursorShape::new(
-            cursor.width(),
-            cursor.height(),
-            cursor.hot_x(),
-            cursor.hot_y(),
-            cursor.argb().to_vec(),
-        )
-        .unwrap();
-        assert_eq!(checked, cursor);
-    }
-
-    #[test]
-    fn default_cursor_is_opaque_at_the_tip_and_clear_in_the_corner() {
-        let cursor = default_cursor();
-        assert_eq!(cursor.argb()[0], 0xFF00_0000);
-        assert_eq!(cursor.argb()[31], 0);
-        assert!(cursor.argb().contains(&0xFFFF_FFFF));
-    }
-
-    #[tokio::test]
-    async fn the_platform_sounds_the_default_tone() {
-        let platform = SyntheticPlatform::new(SIZE).unwrap();
-        let audio = platform.platform().audio.unwrap();
-        let mut receiver = audio.open().unwrap();
-        let frame = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(frame.peak() > 8000, "the pattern starts with the sound");
     }
 }

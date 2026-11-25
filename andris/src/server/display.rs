@@ -107,6 +107,7 @@ use tracing::{debug, info, warn};
 
 use super::channel::{ACK_WINDOW, ChannelConn, ChannelContext, ClientCaps};
 use super::opcodes::DisplayOpcode;
+use super::stats::Stats;
 use super::updates::{
     Choice, Draw, EncodeOptions, Encoded, HeatMap, JpegQuality, LossyTiles, RateChange, RateEvent,
     ReportVerdict, STREAM_QUIET, SURFACE_ID, Stream, StreamCaps, Streams, Update, UpdateEncoder,
@@ -507,6 +508,24 @@ impl Display {
         self.conn.send_msg(op, message).await
     }
 
+    /// End a frame: the `MARK` that tells ryll the frame is complete,
+    /// and the count of it. `refresh` says it was a lossless refresh
+    /// rather than a frame sent for damage.
+    ///
+    /// The two go together -- a `MARK` ryll does not count, or a count
+    /// with no `MARK`, is a frame rate that lies -- so they are sent
+    /// here rather than at each of the three places that end a frame.
+    async fn mark_frame(&mut self, refresh: bool) -> Result<()> {
+        self.send(DisplayOpcode::Mark, &[]).await?;
+        self.counters().frame_sent(refresh);
+        Ok(())
+    }
+
+    /// This session's metrics.
+    fn counters(&self) -> &Stats {
+        self.conn.session().counters()
+    }
+
     /// Capture `rects`, or the whole desktop if `None`. Captures may
     /// block, so this runs on the blocking pool. It borrows `self` only to
     /// start, so the future stays `Send` although the connection is not
@@ -535,10 +554,7 @@ impl Display {
         let started = Instant::now();
         match self.capture(rects).await {
             Ok(capture) => {
-                self.conn
-                    .session()
-                    .counters()
-                    .capture_done(started.elapsed());
+                self.counters().capture_done(started.elapsed());
                 if self.capture_failures > 0 {
                     info!(
                         session,
@@ -626,8 +642,7 @@ impl Display {
             }
             let update = self.send_update(capture).await?;
             if !update.draws.is_empty() {
-                self.send(DisplayOpcode::Mark, &[]).await?;
-                self.conn.session().counters().frame_sent(false);
+                self.mark_frame(false).await?;
             }
             for draw in update.draws.iter().filter(|draw| draw.is_lossy()) {
                 photographic.add(draw.rect);
@@ -655,7 +670,7 @@ impl Display {
             // Streams are drawn on the surface, so they end first. A
             // client never sent a stream is told nothing of them.
             if self.streams.live().is_some() {
-                self.conn.session().counters().stream_destroyed();
+                self.counters().stream_destroyed();
             }
             if self.streams.end_all() {
                 self.send(DisplayOpcode::StreamDestroyAll, &[]).await?;
@@ -719,8 +734,7 @@ impl Display {
             self.send_msg(DisplayOpcode::MonitorsConfig, &config)
                 .await?;
         }
-        self.send(DisplayOpcode::Mark, &[]).await?;
-        self.conn.session().counters().frame_sent(false);
+        self.mark_frame(false).await?;
         Ok(())
     }
 
@@ -758,7 +772,7 @@ impl Display {
             .with_encoder(move |encoder| encoder.update(&capture, options))
             .await?
             .context("encoding an update")?;
-        let counters = self.conn.session().counters();
+        let counters = self.counters();
         counters.encode_done(started.elapsed());
         counters.area_updated(update.captured_area, update.changed_area);
         self.send_draws(&update.draws).await?;
@@ -769,9 +783,7 @@ impl Display {
     async fn send_draws(&mut self, draws: &[Draw]) -> Result<()> {
         for draw in draws {
             self.send(DisplayOpcode::DrawCopy, &draw.body).await?;
-            self.conn
-                .session()
-                .counters()
+            self.counters()
                 .draw_sent(draw.encoding, draw.encoded_bytes());
         }
         self.lossy.record(draws, Instant::now());
@@ -796,10 +808,7 @@ impl Display {
             .await?
             .context("encoding a refresh")?
             .draws;
-        self.conn
-            .session()
-            .counters()
-            .encode_done(started.elapsed());
+        self.counters().encode_done(started.elapsed());
         debug!(
             session = self.conn.session().id(),
             tiles = due.tile_count(),
@@ -811,8 +820,7 @@ impl Display {
         // draw covered it wholly.
         self.lossy.clear(&due);
         if !draws.is_empty() {
-            self.send(DisplayOpcode::Mark, &[]).await?;
-            self.conn.session().counters().frame_sent(true);
+            self.mark_frame(true).await?;
         }
         Ok(())
     }
@@ -868,7 +876,7 @@ impl Display {
             target_kbps = target / 1000,
             "starting a video stream"
         );
-        self.conn.session().counters().stream_created(target);
+        self.counters().stream_created(target);
         self.send_msg(DisplayOpcode::StreamCreate, &create).await?;
         if let Some(activate) = activate {
             self.send_msg(DisplayOpcode::StreamActivateReport, &activate)
@@ -894,6 +902,8 @@ impl Display {
         let Some(stream) = self.streams.live_mut() else {
             return Ok(());
         };
+        // Through `conn` rather than `Display::counters`, which borrows
+        // all of `self` and so conflicts with the live stream above.
         self.conn.session().counters().stream_server_drop();
         let changed = stream.server_drop(now);
         self.rate_changed(changed).await
@@ -914,7 +924,7 @@ impl Display {
                     reason = ?change.reason,
                     "the stream's bitrate changed"
                 );
-                self.conn.session().counters().stream_target(change.to);
+                self.counters().stream_target(change.to);
                 Ok(())
             }
             Err(e) => {
@@ -997,7 +1007,7 @@ impl Display {
             self.streams.put_back(stream)?;
             return Ok(None);
         };
-        let counters = self.conn.session().counters();
+        let counters = self.counters();
         counters.stream_encode_done(started.elapsed());
         let held = now + STREAM_QUIET + self.ctx.display.lossless_delay;
         self.lossy.mark(&stream.tiles(size), held);
@@ -1018,10 +1028,7 @@ impl Display {
             Ok(Some(frame)) => {
                 let data = stream.data(frame, captured_at);
                 self.streams.put_back(stream)?;
-                self.conn
-                    .session()
-                    .counters()
-                    .stream_frame_sent(data.data.len() as u64);
+                self.counters().stream_frame_sent(data.data.len() as u64);
                 self.send_msg(DisplayOpcode::StreamData, &data).await?;
             }
             Ok(None) => {
@@ -1071,7 +1078,7 @@ impl Display {
             why,
             "ending a video stream"
         );
-        self.conn.session().counters().stream_destroyed();
+        self.counters().stream_destroyed();
         if let Some(size) = self.surface {
             let tiles = stream.tiles(size);
             self.lossy.make_due(&tiles, Instant::now());
@@ -1147,7 +1154,7 @@ impl Display {
         // Tiles already pending are not counted: damage reported them.
         let added = self.damage.add(&differences)?;
         if added > 0 {
-            let total = self.conn.session().counters().scrub_found(added as u64);
+            let total = self.counters().scrub_found(added as u64);
             debug!(
                 session = self.conn.session().id(),
                 slice = %slice,

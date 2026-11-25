@@ -68,11 +68,11 @@ use zbus::proxy::CacheProperties;
 
 use super::{
     Capture, CursorReceiver, CursorSource, DamageHub, DamageSubscription, DisplayControl,
-    DisplayGeometry, GoneSignal, InputEvent, InputSink, LockState, Platform, Rectangle, Resize,
-    ScreenSource, Size,
+    DisplayGeometry, GoneSignal, INPUT_QUEUE_LIMIT, InputEvent, InputSink, LockState, Platform,
+    RELEASE_RESERVE, Rectangle, Resize, ScreenSource, Size,
 };
 pub use framebuffer::{A8R8G8B8, Framebuffer, PixelFormat, Source, X8R8G8B8};
-use input::{Devices, INPUT_QUEUE_LIMIT, InputQueue, RELEASE_RESERVE};
+use input::{Devices, InputQueue};
 use listener::{LISTENER_PATH, Listener, MapListener, Shared};
 use qmp::Qmp;
 

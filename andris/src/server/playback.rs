@@ -485,11 +485,10 @@ pub async fn run(ctx: ChannelContext, mut conn: ChannelConn<PlaybackOpcode>) -> 
     };
     loop {
         tokio::select! {
-            message = conn.recv() => {
-                let Some(message) = message? else {
+            open = conn.recv_and_ignore() => {
+                if !open? {
                     return Ok(());
-                };
-                conn.ignore(&message);
+                }
             }
             frame = next_frame(capture.as_mut()), if capture.is_some() => {
                 if let Some(receiver) = &capture {

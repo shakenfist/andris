@@ -521,6 +521,29 @@ and the later ones cover tiles that did not change, which
 `updates/mod.rs` makes harmless. `changed()` is cancel-safe by
 `Notify`'s stored permit.
 
+### `andris/src/platform/input.rs`
+
+`Backlog`, the bound every backend's input queue shares, with
+`INPUT_QUEUE_LIMIT` and `RELEASE_RESERVE`. One FIFO carries the events
+and this counts them, rather than a bounded channel, so a release can
+never overtake the press it undoes. Look at `take()`: the caller passes
+the limit, which is the whole of the difference between
+`InputSink::inject` and `InputSink::inject_release`. The X11, qemu and
+synthetic backends all use it; before it was shared, two of them held a
+copy each and the third had no bound at all.
+
+### `andris/src/platform/resize.rs`
+
+`SizeRange`, `clamp()` and `verdict()`: what a display control decides
+about a size it is asked for, with nothing of any desktop in it. Look
+at `verdict()`'s three answers, and at the one that is easy to get
+wrong: a size that clamps to the size the desktop already has is
+`Refused`, not `Unchanged`, because the client asked for a size it did
+not get and nothing else would tell it so. The X11 backend reaches this
+through RandR and the synthetic one through
+`SyntheticPlatform::set_size_range`, so the rule is tested without an X
+server.
+
 ### `andris/src/platform/audio.rs`
 
 `AudioFrame` (10 ms of 48 kHz stereo S16) and `audio_queue()`, a queue
@@ -534,12 +557,26 @@ than time passes, so capture times are held from going backwards.
 A deterministic desktop for tests, load testing and `--platform
 synthetic`: colour bars, a moving square, paints, a panning "video", an
 input recorder, an in-memory clipboard, and switches to make captures,
-size reads or resizes fail. Look at how `paint_undamaged()`,
+size reads or resizes fail. It holds the seams to the same contracts the
+X11 backend does, so a test through it is worth what it looks like:
+every seam is `Gone` after `vanish()`, `inject()` refuses a full queue
+under `hold_input()` while `inject_release()` keeps its reserve, the
+clipboard drops text over `MAX_CLIPBOARD_TEXT`, and `set_size_range()`
+clamps as RandR does. Look at how `paint_undamaged()`,
 `report_damage()` and `set_size_unreported()` stage the faults the
 display channel must survive, and at "Reporting changes": every change
 is reported to the hub while the state lock is held, so damage and
 resizes arrive in the order they were made. Captured rows carry padding
 bytes so a stride bug shows.
+
+### `andris/src/platform/synthetic/tests.rs`
+
+The backend's tests, in a file of their own as the qemu platform's are.
+Look at the four that hold the backend to the X11 one's contracts --
+`Gone` from every fallible seam after `vanish()`, a full input queue
+under `hold_input()`, the clipboard cap, and clamping to a range: each
+exists because the stand-in had drifted and the tests using it were
+weaker than they looked.
 
 ### `andris/src/platform/synthetic/tone.rs`
 
@@ -837,15 +874,22 @@ Runs the built binary and checks what it prints and how it exits.
 
 The X11 backend against a real X server named by `ANDRIS_TEST_DISPLAY`,
 which `make e2e` sets: damage, capture by both means, recovery after
-another client detaches the MIT-SHM segment, RandR, and the clipboard.
-Without the variable it skips and passes.
+another client detaches the MIT-SHM segment, RandR, the clipboard, and
+the real input and cursor paths -- XTEST keys, pointer motion and
+buttons, the XKB lock state, and a root cursor read back through
+XFixes. Without the variable it skips and passes, so `make e2e` also
+sets `ANDRIS_TEST_REQUIRED`, which makes a missing display a failure
+rather than a skip. Look at the cursor test's wait: Xvfb's own root
+cursor is 16x16 as well, so the hot spot is part of what it waits for.
 
 ### `andris/tests/pulse.rs`
 
 PulseAudio capture against a real sound server, only when
-`ANDRIS_TEST_PULSE` is set; otherwise it skips and passes. With it set
-and `PULSE_SERVER` unset it fails, rather than play a tone into the
-desktop's own sound server.
+`ANDRIS_TEST_PULSE` is set; otherwise it skips and passes, unless
+`ANDRIS_TEST_REQUIRED` says this lane meant to run it, which makes the
+skip a failure. With `ANDRIS_TEST_PULSE` set and `PULSE_SERVER` unset
+it fails, rather than play a tone into the desktop's own sound
+server.
 
 ### `andris/tests/jpeg_corpus.rs`
 

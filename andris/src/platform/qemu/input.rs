@@ -5,9 +5,9 @@
 //! Events wait on one FIFO, which a thread of the platform's drains in
 //! order, making one D-Bus call for each and waiting for its reply, so
 //! that a press is never overtaken by its release. The FIFO is bounded
-//! as the X11 platform's is: [`InputSink::inject`] fails once
-//! [`INPUT_QUEUE_LIMIT`] events are waiting, and
-//! [`InputSink::inject_release`] may queue [`RELEASE_RESERVE`] more. A
+//! as the X11 platform's is, by the same [`Backlog`]: once
+//! [`INPUT_QUEUE_LIMIT`] events are waiting [`InputSink::inject`] fails,
+//! and [`InputSink::inject_release`] may queue [`RELEASE_RESERVE`] more. A
 //! call qemu refuses is logged and dropped; the next event is sent.
 //!
 //! - **Keys** go as qnums, the codes qemu's keyboard takes, through the
@@ -27,32 +27,23 @@
 //! - **The lock state** is the keyboard's `Modifiers` property, read in
 //!   turn on the same thread, so after every event queued before it.
 //!
+//! [`Backlog`]: crate::platform::Backlog
+//! [`INPUT_QUEUE_LIMIT`]: crate::platform::INPUT_QUEUE_LIMIT
 //! [`InputSink::inject`]: crate::platform::InputSink::inject
 //! [`InputSink::inject_release`]: crate::platform::InputSink::inject_release
+//! [`RELEASE_RESERVE`]: crate::platform::RELEASE_RESERVE
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender, SyncSender};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use qemu_display::{KeyboardModifiers, KeyboardProxy, MouseButton, MouseProxy};
 use tracing::{debug, warn};
 
 use super::listener::Shared;
 use super::qnums::QNUMS;
-use crate::platform::{Button, EvdevCode, Gone, InputEvent, LockState, Size};
-
-/// How many events [`InputSink::inject`] lets wait to be sent.
-///
-/// [`InputSink::inject`]: crate::platform::InputSink::inject
-pub const INPUT_QUEUE_LIMIT: usize = 8192;
-
-/// How many more events [`InputSink::inject_release`] may queue beyond
-/// [`INPUT_QUEUE_LIMIT`]. Ample for every key and button held at once.
-///
-/// [`InputSink::inject_release`]: crate::platform::InputSink::inject_release
-pub const RELEASE_RESERVE: usize = 512;
+use crate::platform::{Backlog, Button, EvdevCode, Gone, InputEvent, LockState, Size};
 
 /// The longest andris trusts what it last read of qemu's `IsAbsolute`.
 pub const ABSOLUTE_MAX_AGE: Duration = Duration::from_secs(1);
@@ -176,7 +167,7 @@ enum InputRequest {
 /// answer.
 pub struct InputQueue {
     requests: Sender<InputRequest>,
-    queued: Arc<AtomicUsize>,
+    backlog: Arc<Backlog>,
 }
 
 impl InputQueue {
@@ -188,7 +179,7 @@ impl InputQueue {
             .build()
             .context("starting the qemu input thread's runtime")?;
         let (requests, receiver) = mpsc::channel();
-        let queued = Arc::new(AtomicUsize::new(0));
+        let backlog = Arc::new(Backlog::new("qemu"));
         let mut injector = Injector {
             devices,
             shared,
@@ -196,14 +187,14 @@ impl InputQueue {
             absolute: None,
             last_failure: None,
         };
-        let thread_queued = queued.clone();
+        let thread_backlog = backlog.clone();
         std::thread::Builder::new()
             .name("andris-qemu-input".to_string())
             .spawn(move || {
                 while let Ok(request) = receiver.recv() {
                     match request {
                         InputRequest::Event(event) => {
-                            thread_queued.fetch_sub(1, Ordering::AcqRel);
+                            thread_backlog.done();
                             let result = runtime.block_on(injector.send(event));
                             injector.report(event, result);
                         }
@@ -214,28 +205,14 @@ impl InputQueue {
                 }
             })
             .context("starting the qemu input thread")?;
-        Ok(Self { requests, queued })
+        Ok(Self { requests, backlog })
     }
 
     /// Queue `event`, unless `limit` events are already queued.
     pub fn push(&self, event: InputEvent, limit: usize) -> Result<()> {
-        let mut queued = self.queued.load(Ordering::Acquire);
-        loop {
-            if queued >= limit {
-                bail!("the qemu input queue is full: {limit} events are waiting to be sent");
-            }
-            match self.queued.compare_exchange_weak(
-                queued,
-                queued + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(now) => queued = now,
-            }
-        }
+        self.backlog.take(limit)?;
         if self.requests.send(InputRequest::Event(event)).is_err() {
-            self.queued.fetch_sub(1, Ordering::AcqRel);
+            self.backlog.done();
             return Err(stopped());
         }
         Ok(())
@@ -382,6 +359,7 @@ impl Injector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::{INPUT_QUEUE_LIMIT, RELEASE_RESERVE};
 
     const SCREEN: Size = Size {
         width: 800,
@@ -433,7 +411,7 @@ mod tests {
         let (requests, receiver) = mpsc::channel();
         let queue = InputQueue {
             requests,
-            queued: Arc::new(AtomicUsize::new(0)),
+            backlog: Arc::new(Backlog::new("qemu")),
         };
         let key = |pressed| InputEvent::Key {
             code: EvdevCode(30),
@@ -457,10 +435,12 @@ mod tests {
         // Once the thread has gone, pushing fails as gone, and the count
         // is put back.
         drop(receiver);
-        queue.queued.store(0, Ordering::Release);
+        while queue.backlog.queued() > 0 {
+            queue.backlog.done();
+        }
         let error = queue.push(key(true), INPUT_QUEUE_LIMIT).unwrap_err();
         assert!(crate::platform::is_gone(&error));
-        assert_eq!(queue.queued.load(Ordering::Acquire), 0);
+        assert_eq!(queue.backlog.queued(), 0);
         assert!(crate::platform::is_gone(&queue.lock_state().unwrap_err()));
     }
 

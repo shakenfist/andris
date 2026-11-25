@@ -253,8 +253,8 @@ wait_until "$XVFB_BOUND" xvfb "Xvfb answering on $X_DISPLAY" xdpyinfo -display "
 # it, as it does the capture's test below.
 if [ "$VIA" = direct ]; then
     say "running the X11 backend's test"
-    if ! ANDRIS_TEST_DISPLAY=$X_DISPLAY "$CARGO" test --frozen --quiet --test x11 \
-        >"$work/x11-test.log" 2>&1; then
+    if ! ANDRIS_TEST_REQUIRED=1 ANDRIS_TEST_DISPLAY=$X_DISPLAY "$CARGO" test --frozen \
+        --quiet --test x11 >"$work/x11-test.log" 2>&1; then
         say "FAIL: the X11 backend's test failed"
         exit 1
     fi
@@ -291,7 +291,8 @@ no_sound_server=unix:$work/ryll-has-no-sound-server
 # tones into the default sink, so before anything else listens to it.
 if [ "$VIA" = direct ]; then
     say "running the PulseAudio capture's test"
-    if ! ANDRIS_TEST_PULSE=1 "$CARGO" test --frozen --quiet --test pulse >"$work/pulse-test.log" 2>&1; then
+    if ! ANDRIS_TEST_REQUIRED=1 ANDRIS_TEST_PULSE=1 "$CARGO" test --frozen --quiet \
+        --test pulse >"$work/pulse-test.log" 2>&1; then
         say "FAIL: the PulseAudio capture's test failed"
         exit 1
     fi

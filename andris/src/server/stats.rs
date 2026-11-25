@@ -589,6 +589,176 @@ impl Reporter {
 mod tests {
     use super::*;
 
+    /// Every field of [`StatsSnapshot`], taken from its `Debug`, which
+    /// names each top-level field exactly once.
+    ///
+    /// The field list is written out five times in this module -- the
+    /// struct, `snapshot()`, [`StatsSnapshot`], the `since!` invocation
+    /// and `summary()` -- and only `since!` makes a missing field a
+    /// compile error. This reads the list at run time so that the two
+    /// tests below can hold `summary()` to it as well.
+    fn snapshot_fields() -> Vec<String> {
+        format!("{:#?}", StatsSnapshot::default())
+            .lines()
+            .filter_map(|line| {
+                // Top-level fields are indented once; a nested
+                // TimingSnapshot's are indented further.
+                let field = line.strip_prefix("    ")?;
+                if field.starts_with(' ') {
+                    return None;
+                }
+                let (name, _) = field.split_once(':')?;
+                name.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    .then(|| name.to_string())
+            })
+            .collect()
+    }
+
+    /// The fields the one-line summary reports.
+    const SUMMARISED: &[&str] = &[
+        "frames",
+        "refreshes",
+        "lz4_draws",
+        "bitmap_draws",
+        "jpeg_draws",
+        "display_bytes",
+        "capture",
+        "encode",
+        "captured_area",
+        "changed_area",
+        "scrub_tiles",
+        "ack_lag",
+        "ping",
+        "streams_created",
+        "streams_destroyed",
+        "stream_frames",
+        "stream_bytes",
+        "stream_encode",
+        "stream_server_drops",
+        "stream_target_bps",
+        "audio_frames",
+        "audio_encode",
+        "audio_drops",
+        "audio_starts",
+        "audio_stops",
+        "playback_bytes",
+    ];
+
+    /// The fields it deliberately leaves out: the per-encoding and
+    /// per-channel byte counters, which the Prometheus metrics carry.
+    /// The summary gives the display and playback bytes as rates, and
+    /// six more numbers would not earn their width.
+    const LEFT_OUT: &[&str] = &[
+        "lz4_bytes",
+        "bitmap_bytes",
+        "jpeg_bytes",
+        "main_bytes",
+        "inputs_bytes",
+        "cursor_bytes",
+    ];
+
+    #[test]
+    fn every_snapshot_field_is_classified_for_the_summary() {
+        let fields = snapshot_fields();
+        assert_eq!(
+            fields.len(),
+            SUMMARISED.len() + LEFT_OUT.len(),
+            "StatsSnapshot has {} fields, and {} are classified: {fields:?}",
+            fields.len(),
+            SUMMARISED.len() + LEFT_OUT.len(),
+        );
+        for field in &fields {
+            let summarised = SUMMARISED.contains(&field.as_str());
+            let left_out = LEFT_OUT.contains(&field.as_str());
+            assert!(
+                summarised ^ left_out,
+                "StatsSnapshot::{field} is in neither SUMMARISED nor LEFT_OUT (or in both): a \
+                 field added to the struct has to be either reported by summary() or recorded \
+                 here as deliberately left out of it"
+            );
+        }
+    }
+
+    #[test]
+    fn every_summarised_field_changes_the_summary() {
+        // A baseline with the fields the summary's conditionals look at
+        // already non-zero, so that changing any one field is visible:
+        // with no captured area the changed percentage stays '-'.
+        fn base() -> StatsSnapshot {
+            StatsSnapshot {
+                captured_area: 1000,
+                changed_area: 100,
+                ..StatsSnapshot::default()
+            }
+        }
+        fn timing(ms: u64) -> TimingSnapshot {
+            TimingSnapshot {
+                total: Duration::from_millis(ms),
+                count: 1,
+                last: Duration::from_millis(ms),
+            }
+        }
+        // Each field, set to something the baseline does not have. A
+        // field named here that summary() never reads leaves the line
+        // unchanged, and is reported below.
+        macro_rules! changes_the_summary {
+            ($($field:ident = $value:expr),* $(,)?) => {{
+                let mut named = Vec::new();
+                let mut silent = Vec::new();
+                $(
+                    named.push(stringify!($field));
+                    let mut snapshot = base();
+                    snapshot.$field = $value;
+                    if snapshot.summary(SECOND) == base().summary(SECOND) {
+                        silent.push(stringify!($field));
+                    }
+                )*
+                (named, silent)
+            }};
+        }
+        const SECOND: Duration = Duration::from_secs(1);
+        let (named, silent) = changes_the_summary!(
+            frames = 7,
+            refreshes = 7,
+            lz4_draws = 7,
+            bitmap_draws = 7,
+            jpeg_draws = 7,
+            display_bytes = 7000,
+            capture = timing(3),
+            encode = timing(3),
+            captured_area = 2000,
+            changed_area = 300,
+            scrub_tiles = 7,
+            ack_lag = timing(3),
+            ping = timing(3),
+            streams_created = 7,
+            streams_destroyed = 7,
+            stream_frames = 7,
+            stream_bytes = 7000,
+            stream_encode = timing(3),
+            stream_server_drops = 7,
+            stream_target_bps = 2_000_000,
+            audio_frames = 7,
+            audio_encode = timing(3),
+            audio_drops = 7,
+            audio_starts = 7,
+            audio_stops = 7,
+            playback_bytes = 7000,
+        );
+        assert!(
+            silent.is_empty(),
+            "these fields are listed as summarised but do not change the summary line: {silent:?}"
+        );
+        // And the macro covers exactly what SUMMARISED claims, so the
+        // two lists cannot drift apart.
+        let mut named = named;
+        named.sort_unstable();
+        let mut expected = SUMMARISED.to_vec();
+        expected.sort_unstable();
+        assert_eq!(named, expected);
+    }
+
     fn busy() -> StatsSnapshot {
         let stats = Stats::default();
         stats.frame_sent(false);

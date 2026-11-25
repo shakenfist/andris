@@ -303,8 +303,8 @@ async fn send_ping(
 
 #[cfg(test)]
 mod tests {
-    use shakenfist_spice_protocol::messages::{ReceiveBuffer, ReceivedMessage, make_message};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+    use shakenfist_spice_protocol::messages::{ReceivedMessage, make_message};
+    use tokio::io::{AsyncWriteExt, DuplexStream};
     use tokio::task::JoinHandle;
 
     use super::*;
@@ -314,6 +314,7 @@ mod tests {
     use crate::server::display::DisplayOptions;
     use crate::server::opcodes::ServerOpcode;
     use crate::server::session::SessionRegistry;
+    use crate::test_wire::WireReader;
 
     #[test]
     fn playback_is_offered_before_inputs_and_only_with_audio() {
@@ -354,23 +355,11 @@ mod tests {
         let conn = ChannelConn::<MainOpcode>::new(server_end, session);
         let task = tokio::spawn(serve(ctx, conn, Duration::from_millis(20)));
 
-        let mut buf = ReceiveBuffer::new();
+        let mut wire = WireReader::new(WAIT);
         let mut ping_ids = Vec::new();
         let mut last_timestamp = 0;
         while ping_ids.len() < 4 {
-            let message = loop {
-                if let Some(message) = buf.take_message(1 << 20).unwrap() {
-                    break message;
-                }
-                let mut chunk = [0u8; 4096];
-                let read =
-                    tokio::time::timeout(Duration::from_secs(10), client_end.read(&mut chunk))
-                        .await
-                        .unwrap()
-                        .unwrap();
-                assert!(read > 0, "the channel closed");
-                buf.extend_from_slice(&chunk[..read]);
-            };
+            let message = wire.recv(&mut client_end).await;
             if message.header.message_type == MainOpcode::Ping.code() {
                 let ping = Ping::decode(message.payload()).unwrap();
                 assert!(ping.timestamp >= last_timestamp);
@@ -390,7 +379,7 @@ mod tests {
         registry: SessionRegistry,
         session: Arc<Session>,
         client: DuplexStream,
-        buf: ReceiveBuffer,
+        wire: WireReader,
         task: JoinHandle<Result<()>>,
     }
 
@@ -418,24 +407,13 @@ mod tests {
                 registry,
                 session,
                 client,
-                buf: ReceiveBuffer::new(),
+                wire: WireReader::new(WAIT),
                 task,
             }
         }
 
         async fn recv(&mut self) -> ReceivedMessage {
-            loop {
-                if let Some(message) = self.buf.take_message(1 << 20).unwrap() {
-                    return message;
-                }
-                let mut chunk = [0u8; 4096];
-                let read = tokio::time::timeout(WAIT, self.client.read(&mut chunk))
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert!(read > 0, "the channel closed");
-                self.buf.extend_from_slice(&chunk[..read]);
-            }
+            self.wire.recv(&mut self.client).await
         }
 
         /// Read `INIT` and the first `PING`.

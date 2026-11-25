@@ -2,10 +2,9 @@
 //!
 //! A channel writes mini-header framing into a stream, so a test that
 //! wants one message has to read chunks until the buffer can reassemble
-//! one. Three of them wrote that loop out: `main_channel`'s pings test
-//! and its served-channel harness, and `inputs`'s wait for `INIT`, each
-//! with a chunk size of its own and the same four lines of
-//! timeout-read-assert-extend. This is that loop, once.
+//! one. This is that loop, in one place: reassembly makes the chunk size
+//! invisible, so a message split across reads is put back together and a
+//! read holding several is taken apart.
 
 use std::time::Duration;
 
@@ -56,6 +55,73 @@ impl WireReader {
                 .expect("reading from the channel failed");
             assert!(read > 0, "the channel closed");
             self.buf.extend_from_slice(&chunk[..read]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use shakenfist_spice_protocol::messages::make_message;
+
+    use super::*;
+
+    /// A reader whose reads are at most `most` bytes, so that the chunk
+    /// boundaries fall inside messages rather than between them.
+    struct Dribble {
+        bytes: Vec<u8>,
+        at: usize,
+        most: usize,
+    }
+
+    impl AsyncRead for Dribble {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let left = &self.bytes[self.at..];
+            let take = left.len().min(self.most).min(buf.remaining());
+            buf.put_slice(&left[..take]);
+            self.at += take;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Three messages, in one buffer.
+    fn three() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for (opcode, body) in [(101u16, &b"first"[..]), (102, b"second"), (103, b"third")] {
+            bytes.extend_from_slice(&make_message(opcode, body));
+        }
+        bytes
+    }
+
+    /// The claim the module is for: the chunk size is invisible. One byte
+    /// at a time splits every message across reads; a large read holds
+    /// all three at once. Either way the same three come back.
+    #[tokio::test]
+    async fn reassembles_whatever_the_reads_divide() {
+        for most in [1, 7, 4096] {
+            let mut stream = Dribble {
+                bytes: three(),
+                at: 0,
+                most,
+            };
+            let mut wire = WireReader::new(Duration::from_secs(5));
+            let mut got = Vec::new();
+            for _ in 0..3 {
+                let message = wire.recv(&mut stream).await;
+                got.push((message.header.message_type, message.payload().to_vec()));
+            }
+            assert_eq!(
+                got,
+                vec![
+                    (101, b"first".to_vec()),
+                    (102, b"second".to_vec()),
+                    (103, b"third".to_vec()),
+                ],
+                "reads of at most {most} bytes"
+            );
         }
     }
 }

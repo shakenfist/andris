@@ -440,7 +440,8 @@ captures only the parts of the desktop the platform reports as
 damaged, compares them, in tiles of 64x64 pixels, with what it last
 sent, and sends only the tiles whose pixels changed, merged into at
 most 32 rectangles a frame and followed by a `MARK`, which ryll counts
-as a frame. A desktop that does not change captures and sends no
+as a frame. A rectangle whose pixels come to more than 4 MiB is split
+by rows, so that one draw never exceeds what kerbside will carry. A desktop that does not change captures and sends no
 frames. Frames start at most once every `--frame-interval-ms`, and
 only when there is damage to send, so the option bounds the frame rate
 and the work a busy desktop costs; it does nothing for a still one.
@@ -951,9 +952,9 @@ Andris sends only message types that kerbside's allowlist accepts,
 so a session through kerbside needs no special configuration.
 Every connection through kerbside comes from kerbside's address, so
 one address's allowance of handshakes in progress applies to all of
-kerbside's clients together: 4 while andris's handshake pool is
-quiet, which is enough for one client linking its channels in
-parallel, and fewer as the pool fills. A connection past the
+kerbside's clients together: the whole per-address allowance above
+while andris's handshake pool is quiet, which is enough for one client
+linking its channels in parallel, and fewer as the pool fills. A connection past the
 allowance is closed rather than queued, so several clients linking
 through one kerbside at the same moment may have to reconnect.
 

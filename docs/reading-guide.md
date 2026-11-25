@@ -569,6 +569,15 @@ is reported to the hub while the state lock is held, so damage and
 resizes arrive in the order they were made. Captured rows carry padding
 bytes so a stride bug shows.
 
+### `andris/src/platform/synthetic/tests.rs`
+
+The backend's tests, in a file of their own as the qemu platform's are.
+Look at the four that hold the backend to the X11 one's contracts --
+`Gone` from every fallible seam after `vanish()`, a full input queue
+under `hold_input()`, the clipboard cap, and clamping to a range: each
+exists because the stand-in had drifted and the tests using it were
+weaker than they looked.
+
 ### `andris/src/platform/synthetic/tone.rs`
 
 `ToneSource`, a 440 Hz sine that sounds and falls silent in turn, paced

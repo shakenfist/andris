@@ -53,8 +53,8 @@ planning template and the pre-push audit runbook.
 
 1. **Damage.** The X11 platform subscribes to XDamage on the root
    window. Each subscriber (the display channel is one) is handed the
-   damage reported since it last took some, as a region of 64x64
-   tiles. Damage that arrives while a frame cannot start merges into
+   damage reported since it last took some, as a region of tiles.
+   Damage that arrives while a frame cannot start merges into
    the pending region; pixels are never queued.
 2. **When to capture.** The display channel starts a frame only when
    damage is pending, at least `--frame-interval-ms` has passed since
@@ -67,8 +67,8 @@ planning template and the pre-push audit runbook.
 4. **Shadow comparison.** The update encoder compares the capture,
    one tile at a time, with its shadow of what the client was last
    sent, and copies the changed tiles into the shadow.
-5. **Rectangles and encoding.** It merges the changed tiles into at
-   most 32 rectangles. Each becomes one `DRAW_COPY` drawn from the
+5. **Rectangles and encoding.** It merges the changed tiles into a
+   capped number of rectangles. Each becomes one `DRAW_COPY` from the
    shadow, as JPEG when it looks photographic and the client leaves
    compression to the server, otherwise as LZ4, or as an uncompressed
    bitmap when LZ4 would not help or the client asked for none.

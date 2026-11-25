@@ -12,12 +12,10 @@
 //! blocks for its answer, so there are never more than there are
 //! callers.
 //!
-//! [`Backlog`] is that count. The X11, qemu and synthetic backends share
-//! it and the two limits; each keeps its own channel and request type,
-//! because what they send to their thread differs. Before this was
-//! shared, the X11 and qemu backends held a copy each, with the same
-//! constants and the same compare-exchange loop, and the synthetic
-//! backend had neither, so no test through it could reach a full queue.
+//! [`Backlog`] is that count, shared by the X11, qemu and synthetic
+//! backends along with the two limits. Each keeps its own channel and
+//! request type, because what they send to their thread differs; only
+//! the bound is common.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -86,8 +84,33 @@ impl Backlog {
     }
 
     /// Uncount one event.
+    ///
+    /// Saturating, and asserted in debug builds: a bare `fetch_sub` on a
+    /// count of zero wraps to `usize::MAX`, after which every
+    /// [`Backlog::take`] sees a full queue and the backend refuses input
+    /// for the life of the process. An accounting slip should loosen the
+    /// bound, not shut the desktop's input off.
     pub fn done(&self) {
-        self.queued.fetch_sub(1, Ordering::AcqRel);
+        let mut queued = self.queued.load(Ordering::Acquire);
+        loop {
+            debug_assert_ne!(
+                queued, 0,
+                "the {} input backlog was uncounted more often than it was taken",
+                self.what
+            );
+            if queued == 0 {
+                return;
+            }
+            match self.queued.compare_exchange_weak(
+                queued,
+                queued - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(now) => queued = now,
+            }
+        }
     }
 
     /// How many events are counted.
@@ -109,7 +132,6 @@ mod tests {
         assert_eq!(backlog.queued(), INPUT_QUEUE_LIMIT);
         let error = backlog.take(INPUT_QUEUE_LIMIT).unwrap_err().to_string();
         assert!(error.contains("test input queue is full"), "{error}");
-        assert!(error.contains("input queue is full"), "{error}");
     }
 
     #[test]

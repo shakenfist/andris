@@ -9,9 +9,9 @@
 //! without doing anything. That is a pass that tested nothing, so the
 //! lane that is meant to run these tests sets `ANDRIS_TEST_REQUIRED`,
 //! and then a missing display fails instead of skipping: CI cannot go
-//! green on these tests without having run them. The display must be one
-//! nothing else draws on
-//! or attaches MIT-SHM segments to while the test runs, and needs the
+//! green on these tests without having run them. The display must be
+//! one nothing else draws on or attaches MIT-SHM segments to while the
+//! test runs, and needs the
 //! X-Resource extension, 1.2 or later. The tests take turns with the
 //! display, and leave a filled rectangle on its root window.
 //!
@@ -1042,6 +1042,40 @@ async fn an_owner_that_never_answers_times_out_and_stalls_nothing() {
 // server-side tests all use the synthetic backend, so nothing exercised
 // the code that turns a client's bytes into events on the real desktop.
 
+/// The backend, a connection of the test's own and the root window: what
+/// each of the input and cursor tests needs before it starts.
+fn rig(display: &str) -> (Arc<X11Platform>, RustConnection, Window) {
+    let platform = X11Platform::connect(display).unwrap();
+    let (conn, screen_num) = x11rb::connect(Some(display)).unwrap();
+    let root = conn.setup().roots[screen_num].root;
+    (platform, conn, root)
+}
+
+/// Releases a key or button the test pressed, however the test ends, so
+/// that a failure does not leave the display holding it down and spoil
+/// every test that runs after.
+struct Held<'a> {
+    platform: &'a Arc<X11Platform>,
+    event: InputEvent,
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        let release = match self.event {
+            InputEvent::Key { code, .. } => InputEvent::Key {
+                code,
+                pressed: false,
+            },
+            InputEvent::Button { button, .. } => InputEvent::Button {
+                button,
+                pressed: false,
+            },
+            other => other,
+        };
+        let _ = self.platform.inject_release(release);
+    }
+}
+
 /// The keyboard state as the X server holds it: 256 bits, one a keycode.
 fn pressed_keys(conn: &RustConnection) -> Vec<u8> {
     let keys = conn.query_keymap().unwrap().reply().unwrap().keys;
@@ -1075,8 +1109,7 @@ async fn xtest_presses_and_releases_a_key_on_the_server() {
         return;
     };
     let _turn = DISPLAY_TURN.lock().await;
-    let platform = X11Platform::connect(&display).unwrap();
-    let (conn, _screen) = x11rb::connect(Some(&display)).unwrap();
+    let (platform, conn, _root) = rig(&display);
 
     // Nothing of ours is held to begin with; another client's key would
     // make this test meaningless, so it is asserted rather than assumed.
@@ -1090,12 +1123,16 @@ async fn xtest_presses_and_releases_a_key_on_the_server() {
     // so which keycode it lands on is the layout's business: what matters
     // is that exactly one key goes down, and that it is released again.
     let a = EvdevCode(30);
-    platform
-        .inject(InputEvent::Key {
-            code: a,
-            pressed: true,
-        })
-        .unwrap();
+    let press = InputEvent::Key {
+        code: a,
+        pressed: true,
+    };
+    platform.inject(press).unwrap();
+    // So a failure below does not leave the key held for later tests.
+    let held = Held {
+        platform: &platform,
+        event: press,
+    };
     let down = until(
         "the key to go down",
         || pressed_keys(&conn),
@@ -1115,6 +1152,7 @@ async fn xtest_presses_and_releases_a_key_on_the_server() {
         |down| down.is_empty(),
     );
     assert!(up.is_empty(), "the key was released: {up:?}");
+    drop(held);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1123,9 +1161,7 @@ async fn xtest_moves_the_pointer_absolutely_and_relatively() {
         return;
     };
     let _turn = DISPLAY_TURN.lock().await;
-    let platform = X11Platform::connect(&display).unwrap();
-    let (conn, screen_num) = x11rb::connect(Some(&display)).unwrap();
-    let root = conn.setup().roots[screen_num].root;
+    let (platform, conn, root) = rig(&display);
     let position = || {
         let at = conn.query_pointer(root).unwrap().reply().unwrap();
         (at.root_x, at.root_y)
@@ -1156,19 +1192,21 @@ async fn xtest_presses_a_button_the_server_reports() {
         return;
     };
     let _turn = DISPLAY_TURN.lock().await;
-    let platform = X11Platform::connect(&display).unwrap();
-    let (conn, screen_num) = x11rb::connect(Some(&display)).unwrap();
-    let root = conn.setup().roots[screen_num].root;
+    let (platform, conn, root) = rig(&display);
     let buttons = || u16::from(conn.query_pointer(root).unwrap().reply().unwrap().mask);
     const BUTTON_1: u16 = 0x0100;
 
     assert_eq!(buttons() & BUTTON_1, 0, "button 1 starts up");
-    platform
-        .inject(InputEvent::Button {
-            button: Button::Left,
-            pressed: true,
-        })
-        .unwrap();
+    let press = InputEvent::Button {
+        button: Button::Left,
+        pressed: true,
+    };
+    platform.inject(press).unwrap();
+    // As above: a failure must not leave the button down.
+    let held = Held {
+        platform: &platform,
+        event: press,
+    };
     until("button 1 to go down", buttons, |mask| mask & BUTTON_1 != 0);
     platform
         .inject(InputEvent::Button {
@@ -1177,6 +1215,7 @@ async fn xtest_presses_a_button_the_server_reports() {
         })
         .unwrap();
     until("button 1 to come up", buttons, |mask| mask & BUTTON_1 == 0);
+    drop(held);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1218,11 +1257,12 @@ async fn xfixes_reports_the_root_cursor_and_its_changes() {
         return;
     };
     let _turn = DISPLAY_TURN.lock().await;
-    let platform = X11Platform::connect(&display).unwrap();
+    let (platform, conn, root) = rig(&display);
     let mut cursors = platform.subscribe();
-    let (conn, screen_num) = x11rb::connect(Some(&display)).unwrap();
-    let screen = &conn.setup().roots[screen_num];
-    let root = screen.root;
+
+    // What XFixes reported when the thread started, so that what this
+    // waits for below is a change rather than the initial read.
+    let first = cursors.borrow_and_update().clone();
 
     // A 16x16 core cursor with a hot spot nothing else would have, built
     // from two depth-1 pixmaps, so no Render extension is needed.
@@ -1283,6 +1323,11 @@ async fn xfixes_reports_the_root_cursor_and_its_changes() {
             .await
             .ok();
     };
+    assert_ne!(
+        Some(&shape),
+        first.as_ref(),
+        "the shape waited for is a change, not the one already reported"
+    );
     assert_eq!(
         shape.argb().len(),
         SIDE as usize * SIDE as usize,

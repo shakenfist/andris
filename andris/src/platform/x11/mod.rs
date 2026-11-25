@@ -635,14 +635,12 @@ fn connection_failed(e: ConnectionError) -> anyhow::Error {
     anyhow::Error::new(e).context("the connection to the X display failed")
 }
 
-/// The error for an error the X server returned for one request.
 /// Logs the first failure and then stays quiet.
 ///
 /// The cursor and damage threads both meet failures worth one line and
 /// not worth a line per event: an X error for a request they will make
-/// again when the next event arrives. Each kept a `warned` flag beside
-/// the same `if let Some(e) = .. && !warned` dance; this is that flag,
-/// so neither can lose the "logged once" part of its message.
+/// again when the next event arrives. Sharing the flag keeps the
+/// "logged once" promise in their messages true of both.
 #[derive(Debug, Default)]
 struct WarnOnce {
     warned: bool,
@@ -659,6 +657,7 @@ impl WarnOnce {
     }
 }
 
+/// The error for an error the X server returned for one request.
 fn x_error(e: &X11Error) -> anyhow::Error {
     anyhow!(
         "the X server returned {:?} for request {}.{}",

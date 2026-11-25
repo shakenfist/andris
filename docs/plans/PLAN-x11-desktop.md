@@ -733,12 +733,22 @@ because the following statements will be true:
 Phase 12 ran `PUSH-AUDIT.md` over this plan's accumulated diff --
 63,239 insertions across 149 files in 16 landings -- in two mechanical
 waves and six judgment reviews. **Wave 1 passed and there was no
-blocking finding.** Thirty-two findings were recorded and every one is tracked. None is
-declined: each became a GitHub issue, or sharpened one that already
-existed. Eleven of them, the security ones, have since been fixed --
-#87, #88, #91 and #92, in the pull request that filled phase 12's
-`Merged` cell above. The twenty-one in #89, #90, #93 and #94, and in
-#13, #14 and #15, are still present on `develop`.
+blocking finding.** Thirty-two findings were recorded and every one
+is tracked. None is declined: each became a GitHub issue, or sharpened
+one that already existed. Twenty-eight have since been fixed, in two
+follow-up pull requests: the eleven security findings -- #87, #88, #91
+and #92 -- in #96 (`9a3b9f9`), which also filled phase 12's `Merged`
+cell above, and the seventeen quality findings -- #89, #90, #93 and
+#94 -- in #110 (`ae7d03a`). Four are still present on `develop`: T1,
+T2 and T3, the adversarial agent-protocol cases in #13, and X1, the
+eager pre-ticket clipboard fetch in #14. #15 stays open and carries no
+numbered finding of its own -- the audit refined it with the named
+follow/serve seam, and `platform/x11/clipboard.rs` is still 1,362
+lines. One finding was resolved by judgement rather than by code: P6
+claimed three near-identical thread skeletons in `x11/cursor.rs`,
+`damage.rs` and `clipboard.rs`, and #110 found the claim did not hold,
+extracted the warn-once duplication that was real, and recorded the
+disproof in its pull request body.
 The finding detail and the clean areas are in
 [PLAN-x11-desktop-phase-12-push-audit.md](PLAN-x11-desktop-phase-12-push-audit.md);
 this is the disposition.
@@ -780,13 +790,14 @@ as they are met, so that a reader can see what the status waited on.
 1. **Findings remain unresolved.** `PLAN-TEMPLATE.md`'s
    `plan-push-audit-phase` block and `PUSH-AUDIT.md` both say the plan
    is not complete until every finding is resolved or explicitly
-   declined. Eleven are now fixed and none is declined, which leaves
-   twenty-one filed -- and filing is tracking, not resolution. This
-   alone settles the status; the one below is why it would not be
-   `Complete` even if the rest were fixed tomorrow. The first version
-   of this paragraph named only the unmeasured criteria and called #87
-   "a third reason to hesitate", which read as optional weighing of
-   something that is actually the governing condition.
+   declined. Twenty-eight are now fixed and none is declined, which
+   leaves four filed -- T1, T2 and T3 in #13, and X1 in #14 -- and
+   filing is tracking, not resolution. This alone settles the status;
+   the one below is why it would not be `Complete` even if the rest
+   were fixed tomorrow. The first version of this paragraph named only
+   the unmeasured criteria and called #87 "a third reason to
+   hesitate", which read as optional weighing of something that is
+   actually the governing condition.
 2. **Three success criteria are short, not two.** The 2% idle CPU
    figure and the 30 fps scrolling figure were never measured. The
    first criterion -- ryll through kerbside as the daily connection
@@ -835,6 +846,18 @@ file) and keep its status in step with the Execution table.
   deliberately not a phase: it is open-ended work with no end date,
   and the only thing a plan could add is a deadline that would be
   missed.
+- **The test rig's display gate (#111).** `scripts/e2e.sh` waits for
+  `xdpyinfo` to answer on `:99` rather than proving the Xvfb it just
+  started is the server answering, so a failed start can be masked and
+  the suite can run against a display it does not control. Deferred
+  from the pre-push audit on #110, and more consequential since that
+  pull request: `andris/tests/x11.rs` now injects real XTEST input.
+- **The reading order's qemu gap (#112).** `.vscode/review-scope.toml`
+  undertakes to list the files `docs/reading-guide.md` names, in the
+  guide's order, and skips the guide's whole `## The qemu platform`
+  section. Nothing falls out of scope -- the trailing `*.rs` glob
+  catches it -- but `next` offers the qemu backend after the CI
+  workflows. Also deferred from #110's audit.
 - Templatising ryll's `tools/audit/` harness in
   shakenfist/development, so that running a push audit is scripted
   rather than a runbook followed by hand. Ryll has 1,546 lines of it

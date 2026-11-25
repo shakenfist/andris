@@ -973,9 +973,10 @@ version of this Result said 29, counted from the grouping rather than
 the finding tables, and so dropped T4 and S6; the per-finding table in
 the triage section is now the authority and reconciles to 32.
 
-"All still present" was true on the day. Eleven of the thirty-two --
-#87, #88, #91 and #92, the security ones -- were fixed after this
-phase merged, in the follow-up that filled its `Merged` cell. The
+"All still present" was true on the day. Twenty-eight of the
+thirty-two were fixed after this phase merged: #87, #88, #91 and #92,
+the security ones, in the follow-up that filled its `Merged` cell, and
+#89, #90, #93 and #94, the quality ones, in #110. The
 master plan's deferred-items section tracks what is left and is the
 place to read for the current state; this Result is left as the
 record of what the audit found.

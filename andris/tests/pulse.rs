@@ -7,7 +7,10 @@
 //! with `PULSE_SERVER` naming a sound server whose default sink is one
 //! nothing else plays into: a PulseAudio null sink at 48 kHz, say. With
 //! `ANDRIS_TEST_PULSE` unset, as under `make test`, the test says on
-//! stderr that it is skipping, and passes without doing anything. With it
+//! stderr that it is skipping, and passes without doing anything. The
+//! lane that is meant to run it sets `ANDRIS_TEST_REQUIRED`, which turns
+//! that skip into a failure, so CI cannot report success for a capture
+//! path it never exercised. With it
 //! set and `PULSE_SERVER` unset or empty, the test fails rather than let
 //! libpulse find a server through `XDG_RUNTIME_DIR`, which would be the
 //! desktop's own: it plays a tone there.
@@ -39,10 +42,17 @@ const ARRIVAL: Duration = Duration::from_secs(10);
 static SERVER_TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Whether to run, saying so on stderr when not. Panics when asked to run
-/// without an explicit `PULSE_SERVER`.
+/// without an explicit `PULSE_SERVER`, and when `ANDRIS_TEST_REQUIRED`
+/// says this lane must run it rather than skip.
 fn enabled() -> bool {
     let set = |name: &str| std::env::var(name).is_ok_and(|value| !value.is_empty());
     if !set("ANDRIS_TEST_PULSE") {
+        assert!(
+            !set("ANDRIS_TEST_REQUIRED"),
+            "ANDRIS_TEST_REQUIRED is set but ANDRIS_TEST_PULSE is not: this lane is meant to \
+             run the PulseAudio capture's tests against a real sound server, and skipping them \
+             here would report success for code that never ran"
+        );
         // Straight to stderr: libtest captures eprintln!, which would
         // hide that this passed without testing anything.
         let _ = writeln!(

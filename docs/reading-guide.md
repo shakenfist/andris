@@ -865,15 +865,22 @@ Runs the built binary and checks what it prints and how it exits.
 
 The X11 backend against a real X server named by `ANDRIS_TEST_DISPLAY`,
 which `make e2e` sets: damage, capture by both means, recovery after
-another client detaches the MIT-SHM segment, RandR, and the clipboard.
-Without the variable it skips and passes.
+another client detaches the MIT-SHM segment, RandR, the clipboard, and
+the real input and cursor paths -- XTEST keys, pointer motion and
+buttons, the XKB lock state, and a root cursor read back through
+XFixes. Without the variable it skips and passes, so `make e2e` also
+sets `ANDRIS_TEST_REQUIRED`, which makes a missing display a failure
+rather than a skip. Look at the cursor test's wait: Xvfb's own root
+cursor is 16x16 as well, so the hot spot is part of what it waits for.
 
 ### `andris/tests/pulse.rs`
 
 PulseAudio capture against a real sound server, only when
-`ANDRIS_TEST_PULSE` is set; otherwise it skips and passes. With it set
-and `PULSE_SERVER` unset it fails, rather than play a tone into the
-desktop's own sound server.
+`ANDRIS_TEST_PULSE` is set; otherwise it skips and passes, unless
+`ANDRIS_TEST_REQUIRED` says this lane meant to run it, which makes the
+skip a failure. With `ANDRIS_TEST_PULSE` set and `PULSE_SERVER` unset
+it fails, rather than play a tone into the desktop's own sound
+server.
 
 ### `andris/tests/jpeg_corpus.rs`
 

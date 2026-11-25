@@ -6,7 +6,11 @@
 //! The X server is named by `ANDRIS_TEST_DISPLAY`. `make e2e` sets it to
 //! its Xvfb, before any window is mapped; with it unset, as under
 //! `make test`, the test says on stderr that it is skipping, and passes
-//! without doing anything. The display must be one nothing else draws on
+//! without doing anything. That is a pass that tested nothing, so the
+//! lane that is meant to run these tests sets `ANDRIS_TEST_REQUIRED`,
+//! and then a missing display fails instead of skipping: CI cannot go
+//! green on these tests without having run them. The display must be one
+//! nothing else draws on
 //! or attaches MIT-SHM segments to while the test runs, and needs the
 //! X-Resource extension, 1.2 or later. The tests take turns with the
 //! display, and leave a filled rectangle on its root window.
@@ -18,6 +22,13 @@
 //! The clipboard tests copy and paste with `xclip`, which must be on the
 //! `PATH`, and leave `CLIPBOARD` with no owner. One waits out andris's
 //! 10-second conversion timeout.
+//!
+//! The input and cursor tests drive the real XTEST and XFixes paths: keys,
+//! pointer motion, buttons and the XKB lock state injected and read back
+//! through the X server, and a cursor set on the root window reported by
+//! the cursor thread. They need a display no one else is typing at or
+//! moving the pointer on, and they put back what they change: the keys
+//! they press, the lock state and the root window's cursor.
 
 // Test helpers, where a failed unwrap is a failed test. clippy's
 // allow-unwrap-in-tests covers only #[test] functions themselves.
@@ -30,8 +41,9 @@ use std::time::{Duration, Instant};
 
 use andris::platform::x11::{CaptureMethod, X11Options, X11Platform};
 use andris::platform::{
-    Capture, Clipboard, ClipboardReceiver, DamageSubscription, DisplayControl, DisplayGeometry,
-    Frame, Rectangle, Region, Resize, ScreenSource, Size, TILE, is_gone,
+    Button, Capture, Clipboard, ClipboardReceiver, CursorSource, DamageSubscription,
+    DisplayControl, DisplayGeometry, EvdevCode, Frame, InputEvent, InputSink, LockState, Rectangle,
+    Region, Resize, ScreenSource, Size, TILE, is_gone,
 };
 use x11rb::connection::Connection;
 use x11rb::protocol::Event;
@@ -71,6 +83,9 @@ const DAMAGE_BOUND: Duration = Duration::from_secs(5);
 const SETTLED: Duration = Duration::from_millis(200);
 
 /// The display to test against, or `None` to skip, saying so.
+///
+/// Panics instead of skipping when `ANDRIS_TEST_REQUIRED` is set, so a
+/// lane that means to run these tests cannot pass by skipping them.
 fn display() -> Option<String> {
     let display = std::env::var("ANDRIS_TEST_DISPLAY")
         .ok()
@@ -78,6 +93,12 @@ fn display() -> Option<String> {
     if let Some(name) = &display {
         KEEP_OPEN.get_or_init(|| x11rb::connect(Some(name)).unwrap().0);
     } else {
+        assert!(
+            !required(),
+            "ANDRIS_TEST_REQUIRED is set but ANDRIS_TEST_DISPLAY is not: this lane is meant to \
+             run the X11 backend's tests against a real X server, and skipping them here would \
+             report success for code that never ran"
+        );
         // Straight to stderr: libtest captures eprintln!, which would
         // hide that this passed without testing anything.
         let _ = writeln!(
@@ -86,6 +107,11 @@ fn display() -> Option<String> {
         );
     }
     display
+}
+
+/// Whether the environment says these tests must run rather than skip.
+fn required() -> bool {
+    std::env::var("ANDRIS_TEST_REQUIRED").is_ok_and(|value| !value.is_empty())
 }
 
 /// Fill `rect` of `display`'s root window with `pixel`, through a
@@ -1008,4 +1034,274 @@ async fn an_owner_that_never_answers_times_out_and_stalls_nothing() {
     assert_eq!(*changes.borrow_and_update(), None);
     drop((first, second));
     eprintln!("andris gave up on an owner that never answered after {waited:?}");
+}
+
+// The real input and cursor paths. Until these, `tests/x11.rs` drove only
+// capture, damage, resize and the clipboard: XTEST injection and the
+// XFixes cursor source had no test anywhere, though Xvfb serves both. The
+// server-side tests all use the synthetic backend, so nothing exercised
+// the code that turns a client's bytes into events on the real desktop.
+
+/// The keyboard state as the X server holds it: 256 bits, one a keycode.
+fn pressed_keys(conn: &RustConnection) -> Vec<u8> {
+    let keys = conn.query_keymap().unwrap().reply().unwrap().keys;
+    let mut down = Vec::new();
+    for (byte, bits) in keys.iter().enumerate() {
+        for bit in 0..8 {
+            if bits & (1 << bit) != 0 {
+                down.push((byte * 8 + bit) as u8);
+            }
+        }
+    }
+    down
+}
+
+/// Wait until `read` returns a value `done` accepts, and return it.
+fn until<T>(what: &str, read: impl Fn() -> T, done: impl Fn(&T) -> bool) -> T {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let value = read();
+        if done(&value) {
+            return value;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn xtest_presses_and_releases_a_key_on_the_server() {
+    let Some(display) = display() else {
+        return;
+    };
+    let _turn = DISPLAY_TURN.lock().await;
+    let platform = X11Platform::connect(&display).unwrap();
+    let (conn, _screen) = x11rb::connect(Some(&display)).unwrap();
+
+    // Nothing of ours is held to begin with; another client's key would
+    // make this test meaningless, so it is asserted rather than assumed.
+    let before = pressed_keys(&conn);
+    assert!(
+        before.is_empty(),
+        "another client is holding keys down: {before:?}"
+    );
+
+    // KEY_A. The evdev code becomes an XKB key name and then a keycode,
+    // so which keycode it lands on is the layout's business: what matters
+    // is that exactly one key goes down, and that it is released again.
+    let a = EvdevCode(30);
+    platform
+        .inject(InputEvent::Key {
+            code: a,
+            pressed: true,
+        })
+        .unwrap();
+    let down = until(
+        "the key to go down",
+        || pressed_keys(&conn),
+        |down| !down.is_empty(),
+    );
+    assert_eq!(down.len(), 1, "exactly one key is down: {down:?}");
+
+    platform
+        .inject(InputEvent::Key {
+            code: a,
+            pressed: false,
+        })
+        .unwrap();
+    let up = until(
+        "the key to come up",
+        || pressed_keys(&conn),
+        |down| down.is_empty(),
+    );
+    assert!(up.is_empty(), "the key was released: {up:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn xtest_moves_the_pointer_absolutely_and_relatively() {
+    let Some(display) = display() else {
+        return;
+    };
+    let _turn = DISPLAY_TURN.lock().await;
+    let platform = X11Platform::connect(&display).unwrap();
+    let (conn, screen_num) = x11rb::connect(Some(&display)).unwrap();
+    let root = conn.setup().roots[screen_num].root;
+    let position = || {
+        let at = conn.query_pointer(root).unwrap().reply().unwrap();
+        (at.root_x, at.root_y)
+    };
+
+    platform
+        .inject(InputEvent::PointerAbsolute { x: 120, y: 80 })
+        .unwrap();
+    assert_eq!(
+        until("the pointer to arrive", position, |at| *at == (120, 80)),
+        (120, 80)
+    );
+
+    // A relative move is applied from where the pointer is, which is the
+    // path a client in server mouse mode drives.
+    platform
+        .inject(InputEvent::PointerRelative { dx: 10, dy: -20 })
+        .unwrap();
+    assert_eq!(
+        until("the relative move", position, |at| *at == (130, 60)),
+        (130, 60)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn xtest_presses_a_button_the_server_reports() {
+    let Some(display) = display() else {
+        return;
+    };
+    let _turn = DISPLAY_TURN.lock().await;
+    let platform = X11Platform::connect(&display).unwrap();
+    let (conn, screen_num) = x11rb::connect(Some(&display)).unwrap();
+    let root = conn.setup().roots[screen_num].root;
+    let buttons = || u16::from(conn.query_pointer(root).unwrap().reply().unwrap().mask);
+    const BUTTON_1: u16 = 0x0100;
+
+    assert_eq!(buttons() & BUTTON_1, 0, "button 1 starts up");
+    platform
+        .inject(InputEvent::Button {
+            button: Button::Left,
+            pressed: true,
+        })
+        .unwrap();
+    until("button 1 to go down", buttons, |mask| mask & BUTTON_1 != 0);
+    platform
+        .inject(InputEvent::Button {
+            button: Button::Left,
+            pressed: false,
+        })
+        .unwrap();
+    until("button 1 to come up", buttons, |mask| mask & BUTTON_1 == 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn xkb_reports_the_lock_state_andris_sets() {
+    let Some(display) = display() else {
+        return;
+    };
+    let _turn = DISPLAY_TURN.lock().await;
+    let platform = X11Platform::connect(&display).unwrap();
+
+    // set_lock_state presses and releases each lock key that differs,
+    // through XTEST, and lock_state reads XKB's indicators back.
+    let was = platform.lock_state().unwrap();
+    let wanted = LockState {
+        caps: !was.caps,
+        num: was.num,
+        scroll: was.scroll,
+    };
+    platform.set_lock_state(wanted).unwrap();
+    let now = until(
+        "caps lock to change",
+        || platform.lock_state().unwrap(),
+        |now| now.caps == wanted.caps,
+    );
+    assert_eq!(now.caps, wanted.caps);
+
+    // Put it back, so the display is left as it was found.
+    platform.set_lock_state(was).unwrap();
+    until(
+        "caps lock to go back",
+        || platform.lock_state().unwrap(),
+        |now| now.caps == was.caps,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn xfixes_reports_the_root_cursor_and_its_changes() {
+    let Some(display) = display() else {
+        return;
+    };
+    let _turn = DISPLAY_TURN.lock().await;
+    let platform = X11Platform::connect(&display).unwrap();
+    let mut cursors = platform.subscribe();
+    let (conn, screen_num) = x11rb::connect(Some(&display)).unwrap();
+    let screen = &conn.setup().roots[screen_num];
+    let root = screen.root;
+
+    // A 16x16 core cursor with a hot spot nothing else would have, built
+    // from two depth-1 pixmaps, so no Render extension is needed.
+    const SIDE: u16 = 16;
+    const XHOT: u16 = 3;
+    const YHOT: u16 = 5;
+    let source = conn.generate_id().unwrap();
+    let mask = conn.generate_id().unwrap();
+    conn.create_pixmap(1, source, root, SIDE, SIDE).unwrap();
+    conn.create_pixmap(1, mask, root, SIDE, SIDE).unwrap();
+    // Fill the mask so every pixel of the cursor is opaque, and leave the
+    // source clear, which makes a solid block of the background colour.
+    let gc = conn.generate_id().unwrap();
+    conn.create_gc(gc, mask, &CreateGCAux::new().foreground(1))
+        .unwrap();
+    conn.poly_fill_rectangle(
+        mask,
+        gc,
+        &[xproto::Rectangle {
+            x: 0,
+            y: 0,
+            width: SIDE,
+            height: SIDE,
+        }],
+    )
+    .unwrap();
+    let cursor = conn.generate_id().unwrap();
+    conn.create_cursor(
+        cursor, source, mask, 0xFFFF, 0xFFFF, 0xFFFF, 0, 0, 0, XHOT, YHOT,
+    )
+    .unwrap();
+    conn.change_window_attributes(
+        root,
+        &xproto::ChangeWindowAttributesAux::new().cursor(cursor),
+    )
+    .unwrap();
+    conn.flush().unwrap();
+
+    // The cursor thread reports it through the watch channel. The hot
+    // spot is part of what is waited for, not just asserted afterwards:
+    // Xvfb's own root cursor is 16x16 too, with its hot spot at (7, 7),
+    // so a wait on the size alone finishes before ours has arrived.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let shape = loop {
+        if let Some(shape) = cursors.borrow_and_update().clone()
+            && shape.width() == SIDE
+            && shape.height() == SIDE
+            && shape.hot_x() == XHOT
+            && shape.hot_y() == YHOT
+        {
+            break shape;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "XFixes never reported the {SIDE}x{SIDE} cursor with its hot spot at ({XHOT}, {YHOT})"
+        );
+        tokio::time::timeout(Duration::from_millis(200), cursors.changed())
+            .await
+            .ok();
+    };
+    assert_eq!(
+        shape.argb().len(),
+        SIDE as usize * SIDE as usize,
+        "one ARGB word a pixel"
+    );
+    assert!(
+        shape.argb().iter().all(|pixel| pixel >> 24 == 0xFF),
+        "the mask was filled, so every pixel is opaque"
+    );
+
+    // Leave the root window without our cursor, and free it.
+    conn.change_window_attributes(
+        root,
+        &xproto::ChangeWindowAttributesAux::new().cursor(x11rb::NONE),
+    )
+    .unwrap();
+    conn.free_cursor(cursor).unwrap();
+    conn.free_gc(gc).unwrap();
+    conn.free_pixmap(source).unwrap();
+    conn.free_pixmap(mask).unwrap();
+    conn.flush().unwrap();
 }

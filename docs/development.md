@@ -72,7 +72,11 @@ followed, and andris stops serving; and an owner that never answers is
 given up on after andris's 10-second timeout, while andris still takes
 and serves text meanwhile. The tests take turns with the display, which
 they read from `ANDRIS_TEST_DISPLAY`. When the variable is unset, as
-under `make test`, each prints that it is skipping and passes. The
+under `make test`, each prints that it is skipping and passes. A pass
+that tested nothing is only safe where nothing meant to run, so the
+script also sets `ANDRIS_TEST_REQUIRED`, which turns that skip into a
+failure: this lane cannot go green without having run these tests
+against a real X server. The
 script then starts a full-screen window that logs the keys it
 receives, starts the debug andris against that display, and connects
 ryll's headless client through a `.vv` file. Last, it asserts, over
@@ -122,7 +126,9 @@ host. With it up, the PulseAudio capture's integration test
 (`andris/tests/pulse.rs`) runs there too, gated by
 `ANDRIS_TEST_PULSE`: it plays tones into the sink and reads them back
 through andris's capture. Under `make test` the variable is unset, so
-the test skips and passes. The driver then plays a 440 Hz tone for five
+the test skips and passes; here `ANDRIS_TEST_REQUIRED` is set as well,
+so a skip would fail the lane instead. The driver then plays a 440 Hz
+tone for five
 seconds with `pacat` and checks, through ryll's `stats` `playback`
 section, that ryll saw one start and Opus at 48 kHz in two channels,
 decoded at least 400 packets with no failure, and saw a stop within two

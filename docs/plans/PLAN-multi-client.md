@@ -253,7 +253,7 @@ as each phase comes up.
 
 | Phase | Plan | Status | Merged |
 |-------|------|--------|--------|
-| 1. A registry of N sessions | PLAN-multi-client-phase-01-registry.md | Not started | |
+| 1. A registry of N sessions | PLAN-multi-client-phase-01-registry.md | In progress | |
 | 2. Liveness and eviction | PLAN-multi-client-phase-02-liveness.md | Not started | |
 | 3. Arbitrating the unshareable | PLAN-multi-client-phase-03-arbitration.md | Not started | |
 | 4. The cost of a second client | PLAN-multi-client-phase-04-cost.md | Not started | |

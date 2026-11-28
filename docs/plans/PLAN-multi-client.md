@@ -53,7 +53,7 @@ as a commitment in seven places:
 | `README.md:34` | "It exports an X display to one client at a time" |
 | `AGENTS.md:12` | "…to one client at a time" |
 | `docs/index.md:13` | "channels to one client at a time" |
-| `docs/running.md:364` | "Andris serves one client at a time. A client that authenticates replaces the one before it." |
+| `docs/running.md:402-403` | "Andris serves one client at a time. A client that authenticates replaces the one before it." |
 | `docs/reading-guide.md:82` | "…serves one client at a time" |
 
 ### What went wrong in practice
@@ -189,6 +189,15 @@ is planned. Each carries a recommendation.
    for this, makes the feature opt-in, and means phase 1 can land
    without changing what any existing deployment does. The
    operator sets 2 or 3 in `~/.config/andris/andris.env`.
+
+   **Answered 2026-11-26: 3**, against the recommendation. The
+   feature is therefore on by default, which has two consequences
+   the phase plans carry. The documentation cannot lag behind the
+   code until phase 5, because every page that promises one client
+   is wrong the moment phase 1 lands, so phase 1 makes those
+   sentences true. And the test rig pins the cap at 1 so that the
+   suite which proves today's behaviour keeps proving it, with a
+   test asserting that the shipped default is 3.
 2. **At capacity, evict or refuse?** *Recommendation: evict the
    longest-quiet session*, with the `42ef302` farewell. It
    composes: at `--max-clients 1` the only session is always the
@@ -196,6 +205,7 @@ is planned. Each carries a recommendation.
    falls out of the general rule rather than being a special case.
    Refusing instead would let one half-open session lock a
    legitimate client out until the liveness deadline fires.
+   **Answered 2026-11-26: evict the longest-quiet session.**
 3. **How is a resize arbitrated between clients of different
    sizes?** The candidates are last-asker-wins (today's behaviour,
    extended), first-client-owns-the-size, the largest bounding box,
@@ -218,10 +228,23 @@ is planned. Each carries a recommendation.
    speculatively.
 5. **Does kerbside need to know?** Each kerbside connection to
    andris would be one more session, and kerbside's own limits on
-   concurrent clients per console source are not yet read. Phase 1
-   should read them and record the answer, because "two clients"
-   through the intended deployment path may mean something
-   different from two direct connections.
+   concurrent clients per console source are not yet read.
+
+   **Answered 2026-11-26 while planning phase 1: no, and it needs
+   no change.** Kerbside imposes no per-console client cap. Its
+   only cap is `MAX_CONCURRENT_SESSIONS = 1000`, a coarse global
+   semaphore on concurrently-handled secure connections
+   (`rust/kerbside-proxy/src/main.rs:74-79`). Every "one client at
+   a time" in its documentation describes the *backend* SPICE
+   server's behaviour rather than a rule kerbside enforces --
+   `docs/console-sources.md:256-258` and
+   `docs/proxy-architecture.md:501-504` -- which is exactly the
+   property this plan removes from andris. What that leaves is a
+   cross-repository documentation debt for phase 5:
+   `docs/console-sources.md:256` and `:367`,
+   `docs/proxy-architecture.md:502` and `docs/testing.md:1148`
+   state the limit as general to SPICE backends, and will be wrong
+   for an andris backend.
 
 ## Execution
 
@@ -230,7 +253,7 @@ as each phase comes up.
 
 | Phase | Plan | Status | Merged |
 |-------|------|--------|--------|
-| 1. A registry of N sessions | PLAN-multi-client-phase-01-registry.md | Not started | |
+| 1. A registry of N sessions | PLAN-multi-client-phase-01-registry.md | In progress | |
 | 2. Liveness and eviction | PLAN-multi-client-phase-02-liveness.md | Not started | |
 | 3. Arbitrating the unshareable | PLAN-multi-client-phase-03-arbitration.md | Not started | |
 | 4. The cost of a second client | PLAN-multi-client-phase-04-cost.md | Not started | |
@@ -256,18 +279,31 @@ The session-replacement machinery is kept, not deleted: `replaced`,
 become the at-capacity path rather than the every-connection path.
 
 `ServerHandle` grows a `sessions()` accessor; `session()` and
-`session_id()` either stay as "the only session, or panic if there
-are several" for the existing tests, or are replaced at their ~65
-call sites. The phase plan decides which, and the decision is
-worth making deliberately: the first is a smaller diff, the second
-leaves no helper that is wrong by construction once the cap is
-raised.
+`session_id()` stay as "the only session, or panic if there are
+several". The phase plan settled this once the count was checked:
+there are 32 such call sites, not the ~65 first written here, and
+**every one is in `andris/tests/`** -- `andris/src/` has none, so
+there is no production helper to leave wrong by construction. The
+22 further `conn.session()` calls are
+`ChannelContext::session()`, a different method that this plan
+does not touch.
 
 Tests cover two sessions coexisting, each with its own channel of
 a given type, each seeing damage; a secondary channel naming the
 wrong session; and the at-capacity eviction choosing the right
-victim. This phase also reads kerbside's per-console client limits
-and records the answer to open question 5.
+victim. Open question 5's reading of kerbside was done while
+planning the phase rather than in it, and is answered above.
+
+Two things this section did not know, found by the phase's survey.
+**Nothing records when a session last heard from its client**, so
+the longest-quiet rule has no quantity to compare: the `PONG`
+handler records a round-trip duration, not an instant
+(`server/channel.rs:483-499` into `server/stats.rs:117-131`). The
+phase adds that stamp, which is the one piece of phase 2's
+mechanism it needs. And **session ids are unique only against the
+session being replaced** (`server/session.rs:392-400`), which with
+N live sessions would let `lookup` hand a secondary channel the
+wrong session.
 
 Definition of done includes: at `--max-clients 1`, the existing
 test suite passes unchanged.
@@ -326,10 +362,12 @@ Future work. A deferral with measurements behind it is a result.
 
 ### Phase 5: The documentation reversal
 
-Change the seven places in the table above, plus
-`docs/running.md`'s connection-limits section, so that none of them
-contradicts another. The design commitment becomes a bounded number
-of clients, one by default, rather than one client. Add a
+Phase 1 already made the seven places in the table above say
+something true, because a default of 3 left them wrong the moment
+it landed: the design commitment is now a bounded number of
+clients, three by default, rather than one client. What this phase
+owes is the rest -- check that none of them contradicts another
+after phases 2 to 4 have changed behaviour again, and add a
 `docs/` page on sharing a desktop between clients that states the
 arbitration rules in one place. The cross-reference at
 `PLAN-x11-desktop.md:125` was added when this plan was created;
@@ -422,8 +460,9 @@ and every finding it raises.
 
 ### Bugs fixed during this work
 
-To be filed before phase 1 is planned, both found while diagnosing
-the 2026-11-17 incident:
+Both were found while diagnosing the 2026-11-17 incident, and both
+were filed on 2026-11-26 while phase 1 was planned, as this section
+asked:
 
 - **ryll connects twice per reconnect attempt.** Each attempt in
   the journal arrives as two connections about 1.0–1.1 s apart; the
@@ -431,13 +470,16 @@ the 2026-11-17 incident:
   by the second. Under one-client-at-a-time this is invisible
   noise. With a cap it is not: a client that takes two slots per
   attempt would fill `--max-clients 2` by itself and lock the
-  other machine out. A ryll issue, and a prerequisite for raising
-  the cap in anger rather than for phase 1's code.
+  other machine out. Filed as ryll#810, with the 1 s first
+  backoff step in `ryll/src/reconnect_policy.rs:22` offered as a
+  lead. A prerequisite for trusting a raised cap rather than for
+  phase 1's code -- and live from phase 1, since the default is 3.
 - **`v0.1.0` predates the farewell.** The only release was built
   2026-10-19 and `42ef302` landed 2026-10-25, so every
   `pipx install andris` has the behaviour that caused the incident.
-  A release, or a note in `docs/running.md`, so that the next
-  person to install it does not debug what is already fixed.
+  Filed as #116: a release, or a note in `docs/running.md`, so
+  that the next person to install it does not debug what is
+  already fixed.
 
 ### Back brief
 
